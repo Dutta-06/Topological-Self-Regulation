@@ -1,0 +1,99 @@
+# TSR Default Configuration
+# Override any value via command line: python scripts/train.py model.seed_channels=[16,32]
+
+# ─── Model ───────────────────────────────────────────────────────────────────
+model:
+  name: tsr
+  # Minimal seed architecture (VGG-style: stack of conv → linear classifier)
+  # Each entry is the initial channel count for one conv layer
+  seed_channels: [8, 8]
+  num_classes: 10
+  # Gate initialization: sigmoid(gate_init) = initial gate openness
+  gate_init: 3.0   # sigmoid(3.0) ≈ 0.95
+  # Initial dominant activation function per layer
+  act_init: relu    # one of: relu, tanh, gelu, silu
+  # Normalization: target channels per group in GroupNorm
+  norm_group_size: 8
+
+# ─── Regulation (Structural Plasticity) ──────────────────────────────────────
+regulation:
+  # How often to evaluate structural changes (training steps)
+  update_interval: 200
+  # Monitoring window: number of forward passes to average over
+  monitor_window: 100
+  # ── Death signal ──
+  death_threshold: 0.01      # gate activation below this → neuron is dead
+  min_neurons_per_layer: 4   # never prune below this count
+  # ── Growth signal ──
+  growth_enabled: true
+  growth_signal: gradient_magnitude  # one of: gradient_magnitude, loss_plateau
+  growth_rate: 0.1           # fraction of current width to add (rounded up)
+  max_neurons_per_layer: 512 # hard cap on layer width
+  bottleneck_threshold: 0.1  # gradient-based score above this triggers growth
+  # ── Rewiring ──
+  rewire_enabled: false       # disabled for v1; enable for edge-level adaptation
+  rewire_fraction: 0.1        # fraction of connections to consider per update
+  # ── Layer insertion ──
+  layer_insertion_enabled: false  # disabled for v1
+  # ── Scheduling ──
+  cooldown_steps: 50          # min steps between structural changes per layer
+  anneal_structural_rate: true  # reduce structural change rate over training
+  anneal_start_step: 5000     # when to start annealing
+  anneal_factor: 0.95         # multiplicative decay per update_interval
+
+# ─── Training ────────────────────────────────────────────────────────────────
+training:
+  dataset: cifar10
+  batch_size: 128
+  max_epochs: 200
+  max_steps: null   # if set, overrides max_epochs
+  # Optimizer
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  # LR schedule
+  lr_scheduler: cosine
+  warmup_steps: 500
+  min_lr: 0.00001
+  # Gate/activation learning rates (can differ from weight LR)
+  gate_lr_multiplier: 1.0
+  act_lr_multiplier: 0.1   # activation weights learn slower for stability
+  # Evaluation
+  eval_interval: 500        # steps between evaluations
+  # Checkpointing
+  checkpoint_interval: 2000 # steps between checkpoints
+  checkpoint_dir: checkpoints/
+
+# ─── Data ────────────────────────────────────────────────────────────────────
+data:
+  root: ./data
+  num_workers: 4
+  pin_memory: true
+  # Augmentation
+  augmentation: standard    # one of: none, standard, cutmix, randaugment, full
+  # CIFAR-10-C (Benchmark 2)
+  cifar10c_path: null       # auto-downloaded if null
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+logging:
+  use_wandb: false
+  wandb_project: tsr-aaai
+  wandb_entity: null
+  use_tensorboard: true
+  tensorboard_dir: runs/
+  log_interval: 50          # steps between metric logs
+  log_topology: true        # log topology stats (width, gates, activations)
+  log_flops: true           # log FLOPs per step
+
+# ─── FLOPs ───────────────────────────────────────────────────────────────────
+flops:
+  track_cumulative: true    # accumulate training FLOPs over all steps
+  report_theoretical: true  # report sparse FLOPs (what proper sparse impl would use)
+
+# ─── Experiment ──────────────────────────────────────────────────────────────
+experiment:
+  seed: 42
+  seeds: [42, 123, 456, 789, 1024]  # for multi-seed runs
+  device: auto              # auto, cuda, cpu
+  precision: fp32           # fp32, fp16, bf16
+  deterministic: true       # set torch deterministic mode

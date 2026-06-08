@@ -1,0 +1,42 @@
+model:
+  name: tsr
+  seed_channels: [64, 64, 128, 128, 256, 256, 256]
+  num_classes: 10
+  gate_init: 3.0
+  act_init: relu
+  norm_group_size: 8
+
+regulation:
+  update_interval: 200
+  monitor_window: 100
+  death_threshold: 0.01
+  min_neurons_per_layer: 16
+  growth_enabled: true
+  growth_signal: gradient_magnitude
+  growth_rate: 0.1
+  max_neurons_per_layer: 1024
+  bottleneck_threshold: 0.05
+  cooldown_steps: 50
+  anneal_structural_rate: true
+  anneal_start_step: 10000
+  anneal_factor: 0.95
+
+training:
+  dataset: cifar10
+  batch_size: 128
+  max_epochs: 100
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.01
+  lr_scheduler: cosine
+  warmup_steps: 1000
+  min_lr: 0.00001
+  eval_interval: 500
+
+data:
+  root: ./data
+  num_workers: 4
+  augmentation: randaugment
+
+logging:
+  use_tensorboard: true
