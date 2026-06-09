@@ -17,6 +17,7 @@ import torch.nn as nn
 from tsr.layers.tsr_linear import TSRLinear, ACTIVATION_NAMES
 from tsr.layers.tsr_conv import TSRConv2d
 from tsr.layers.tsr_norm import TSRGroupNorm
+from tsr.layers.tsr_lstm import TSRLSTMCell, TSRLSTM
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -401,6 +402,54 @@ class TestLayerNormIntegration:
         h = linear(x)
         out = norm(h)
         assert out.shape == (4, 32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TSRLSTM Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTSRLSTMCell:
+    """Test structural modifications and shapes for TSRLSTMCell."""
+    def test_forward_shape(self):
+        cell = TSRLSTMCell(16, 8)
+        x = torch.randn(4, 16)
+        h, c = cell(x)
+        assert h.shape == (4, 8)
+        assert c.shape == (4, 8)
+
+    def test_prune_neurons(self):
+        cell = TSRLSTMCell(16, 8)
+        cell.prune_neurons(torch.tensor([1, 3, 5]))
+        assert cell.hidden_size == 5
+        assert cell.weight_ih.shape == (20, 16)
+        assert cell.weight_hh.shape == (20, 5)
+
+        x = torch.randn(4, 16)
+        h, c = cell(x)
+        assert h.shape == (4, 5)
+        assert c.shape == (4, 5)
+
+    def test_grow_neurons(self):
+        cell = TSRLSTMCell(16, 8)
+        cell.grow_neurons(4)
+        assert cell.hidden_size == 12
+        assert cell.weight_ih.shape == (48, 16)
+        assert cell.weight_hh.shape == (48, 12)
+
+        x = torch.randn(4, 16)
+        h, c = cell(x)
+        assert h.shape == (4, 12)
+        assert c.shape == (4, 12)
+
+class TestTSRLSTMSequence:
+    """Test TSRLSTM sequence wrapper."""
+    def test_forward_batch_first(self):
+        lstm = TSRLSTM(16, 8, batch_first=True)
+        x = torch.randn(4, 10, 16) # batch, seq, feature
+        out, (h, c) = lstm(x)
+        assert out.shape == (4, 10, 8)
+        assert h.shape == (4, 8)
+        assert c.shape == (4, 8)
 
 
 if __name__ == "__main__":
