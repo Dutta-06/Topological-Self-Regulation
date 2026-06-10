@@ -5,6 +5,7 @@ from tsr.regulation.signals import (
     compute_death_signal,
     compute_bottleneck_signal,
     compute_layer_insertion_signal,
+    gate_sparsity_penalty,
 )
 from tsr.regulation.actions import (
     prune_neurons_paired,
@@ -18,6 +19,7 @@ __all__ = [
     "compute_death_signal",
     "compute_bottleneck_signal",
     "compute_layer_insertion_signal",
+    "gate_sparsity_penalty",
     "prune_neurons_paired",
     "grow_neurons_paired",
     "apply_structural_update",

@@ -21,10 +21,48 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tsr.regulation.monitor import LayerStats, StructuralPlasticityMonitor
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
+
+
+def gate_sparsity_penalty(model: nn.Module) -> torch.Tensor:
+    """Differentiable L1 penalty on open gates across all TSR layers.
+
+    Without this term, the only force acting on a gate logit is the task
+    loss, which rarely drives a gate down the ~7.6 logits needed to cross
+    the death threshold (sigmoid(gate) < 0.01). Adding a small multiple of
+    this penalty to the training loss applies steady downward pressure on
+    every gate, so that neurons the task does not actively need decay toward
+    closed and become prunable. Useful neurons resist the pressure because
+    the task gradient holds their gate open — this is the mechanism that
+    makes pruning (and thus *bidirectional* structural change) actually work.
+
+    The penalty is the mean of sigmoid(gate) over every gated neuron/channel
+    in the network, so its scale is independent of network size.
+
+    Args:
+        model: A model containing TSRLinear / TSRConv2d layers.
+
+    Returns:
+        Scalar tensor (mean open-gate value). Zero if the model has no gates.
+    """
+    gate_sums = []
+    gate_counts = 0
+    for module in model.modules():
+        if isinstance(module, (TSRLinear, TSRConv2d)):
+            # Differentiable: sigmoid of the raw gate logits (not gate_values(),
+            # which detaches). Summing keeps a single graph across layers.
+            open_frac = torch.sigmoid(module.gate)
+            gate_sums.append(open_frac.sum())
+            gate_counts += open_frac.numel()
+
+    if gate_counts == 0:
+        return torch.zeros((), device=next(model.parameters()).device)
+
+    return torch.stack(gate_sums).sum() / gate_counts
 
 
 def compute_death_signal(
@@ -170,7 +208,7 @@ def compute_growth_neurons(
     bottleneck_score: float,
     current_width: int,
     growth_rate: float = 0.1,
-    bottleneck_threshold: float = 1.5,
+    bottleneck_threshold: float = 0.1,
     max_neurons: int = 512,
 ) -> int:
     """Compute how many neurons to add based on bottleneck score.

@@ -34,6 +34,7 @@ from tsr.regulation.signals import (
     compute_death_signal,
     compute_bottleneck_signal,
     compute_growth_neurons,
+    compute_layer_insertion_signal,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,68 @@ def _get_layer_pair(
                 break  # Hit next TSR layer without finding norm
 
     return target_layer, next_layer, norm_between
+
+
+def _block_index_from_layer_name(layer_name: Optional[str]) -> Optional[int]:
+    """Extract the conv-block index from a TSR layer name.
+
+    The TSRNetwork names its conv layers ``blocks.{i}.conv``. The layer
+    insertion signal returns such a name; ``insert_block`` needs the integer
+    ``{i}``. Returns None for names that don't refer to a conv block
+    (e.g. classifier layers), since depth insertion only applies to blocks.
+
+    Args:
+        layer_name: A module name from ``model.named_modules()``, or None.
+
+    Returns:
+        The block index, or None if the name is not a conv block.
+    """
+    if not layer_name:
+        return None
+    parts = layer_name.split(".")
+    if len(parts) >= 2 and parts[0] == "blocks":
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _seed_grown_from_phantom(
+    model: nn.Module,
+    layer_name: str,
+    phantom_manager: nn.Module,
+) -> None:
+    """Overwrite the just-grown neuron's weights with the winning phantom's.
+
+    ``grow_neurons``/``grow_channels`` append new units with random-small
+    weights. When the phantom signal drove the growth, we instead initialize
+    the newest unit from the phantom that earned it — the direction the sensor
+    measured as useful. The gate stays at its 'asleep' init so the unit still
+    has to wake up, but it wakes up pointed somewhere useful.
+
+    Only the single newest row is seeded (the one phantom that won); any other
+    units added in the same step keep their random init.
+    """
+    mw = phantom_manager.materialize_weights(layer_name)
+    if mw is None:
+        return
+    weight_row, bias_val = mw
+
+    target = None
+    for name, module in model.named_modules():
+        if name == layer_name and isinstance(module, (TSRLinear, TSRConv2d)):
+            target = module
+            break
+    if target is None:
+        return
+
+    with torch.no_grad():
+        # The newest output unit is the last row of the weight tensor.
+        if target.weight.data[-1].shape == weight_row.shape:
+            target.weight.data[-1].copy_(weight_row.to(target.weight.device))
+            if target.bias is not None and bias_val.numel() == 1:
+                target.bias.data[-1] = bias_val.item()
 
 
 def prune_neurons_paired(
@@ -293,9 +356,16 @@ def apply_structural_update(
     growth_enabled: bool = True,
     growth_rate: float = 0.1,
     max_neurons: int = 512,
-    bottleneck_threshold: float = 1.5,
+    bottleneck_threshold: float = 0.1,
     init_scale: float = 0.001,
-    depth_adaptation_enabled: bool = True,
+    # Growth-signal selection: "phantom" (measured) or "heuristic" (bottleneck score)
+    growth_signal_mode: str = "phantom",
+    phantom_manager: Optional[nn.Module] = None,
+    phantom_threshold: float = 0.05,
+    # Depth adaptation params
+    depth_adaptation_enabled: bool = False,
+    layer_insertion_threshold: float = 5.0,
+    max_blocks: int = 16,
 ) -> List[StructuralEvent]:
     """Execute one full structural update cycle across all layers.
 
@@ -336,10 +406,18 @@ def apply_structural_update(
         if isinstance(module, (TSRLinear, TSRConv2d)):
             tsr_layers[name] = module
 
+    # The final TSR layer is the output head: its width IS the number of task
+    # outputs (num_classes / forecast dim) and must never be grown or pruned,
+    # or the model stops matching its targets. named_modules() preserves order,
+    # so the last entry is the head.
+    terminal_layer = next(reversed(tsr_layers)) if tsr_layers else None
+
     modified_layers = set()
 
     # ── Phase 1: Pruning ──
     for layer_name, layer in tsr_layers.items():
+        if layer_name == terminal_layer:
+            continue  # never resize the output head
         stats = monitor.get_layer_stats(layer_name)
         if stats is None or not stats.is_ready:
             continue
@@ -354,12 +432,55 @@ def apply_structural_update(
                 modified_layers.add(layer_name)
 
     # ── Phase 2: Growth ──
-    if growth_enabled:
+    # Two interchangeable growth signals (selected by growth_signal_mode):
+    #   "phantom"   — measured marginal utility of capacity from dormant phantom
+    #                 sensors (the novel signal). Grows when a layer's strongest
+    #                 phantom gate-gradient exceeds phantom_threshold, and
+    #                 initializes the new neuron from that phantom's weights.
+    #   "heuristic" — the original utilization×uniformity×saturation score.
+    if growth_enabled and growth_signal_mode == "phantom" and phantom_manager is not None:
+        signals = phantom_manager.growth_signals()
+        if signals:
+            sig_str = ", ".join(f"{n}={s:.4f}" for n, s in signals.items())
+            logger.info(
+                f"Step {step}: Phantom growth signals: [{sig_str}], "
+                f"threshold={phantom_threshold:.4f}"
+            )
+        for layer_name, signal in signals.items():
+            if layer_name == terminal_layer:
+                continue  # never grow the output head
+            layer = tsr_layers.get(layer_name)
+            if layer is None or signal < phantom_threshold:
+                continue
+            width = (
+                layer.out_features if isinstance(layer, TSRLinear) else layer.out_channels
+            )
+            n_grow = compute_growth_neurons(
+                signal, width, growth_rate=growth_rate,
+                bottleneck_threshold=phantom_threshold, max_neurons=max_neurons,
+            )
+            if n_grow <= 0:
+                continue
+            event = grow_neurons_paired(
+                model, layer_name, n_grow, step, init_scale=init_scale
+            )
+            if event is not None:
+                # Initialize the first grown neuron from the winning phantom's
+                # learned weights (better than random-small), then reset the
+                # probe so it senses for the next unit of capacity.
+                _seed_grown_from_phantom(model, layer_name, phantom_manager)
+                phantom_manager.reset_layer(layer_name)
+                events.append(event)
+                modified_layers.add(layer_name)
+
+    elif growth_enabled:
         # Collect bottleneck scores for all layers
         layer_scores = {}
         layer_widths = {}
 
         for layer_name, layer in tsr_layers.items():
+            if layer_name == terminal_layer:
+                continue  # never grow the output head
             stats = monitor.get_layer_stats(layer_name)
             if stats is None or not stats.is_ready:
                 continue
@@ -429,6 +550,41 @@ def apply_structural_update(
                     if event is not None:
                         events.append(event)
                         modified_layers.add(best_layer)
+
+    # ── Phase 4: Depth adaptation (layer insertion) ──
+    # Insert a new conv block where the inter-layer gradient-norm ratio is
+    # largest — i.e. where the representational gap between adjacent layers
+    # is widest. The new block is Dirac-initialized (identity) by the model
+    # so the network's function is unchanged at the moment of insertion.
+    if depth_adaptation_enabled and hasattr(model, "insert_block"):
+        if len(getattr(model, "blocks", [])) < max_blocks:
+            after_name, ratio = compute_layer_insertion_signal(monitor)
+            after_index = _block_index_from_layer_name(after_name)
+            if after_index is not None and ratio >= layer_insertion_threshold:
+                old_depth = len(model.blocks)
+                model.insert_block(after_index)
+                new_depth = len(model.blocks)
+                if new_depth > old_depth:
+                    event = StructuralEvent(
+                        step=step,
+                        layer_name=after_name,
+                        action="insert_layer",
+                        details={
+                            "after_index": after_index,
+                            "gradient_ratio": ratio,
+                            "old_depth": old_depth,
+                            "new_depth": new_depth,
+                        },
+                    )
+                    events.append(event)
+                    # The new block changes the meaning of downstream stats;
+                    # clear everything so signals re-accumulate on the new graph.
+                    for name in list(monitor.layer_stats.keys()):
+                        monitor.reset_layer(name)
+                    logger.info(
+                        f"Step {step}: Inserted block after index {after_index} "
+                        f"(gradient ratio {ratio:.2f}), depth {old_depth} → {new_depth}"
+                    )
 
     # ── Phase 3: Reset statistics for modified layers ──
     for layer_name in modified_layers:

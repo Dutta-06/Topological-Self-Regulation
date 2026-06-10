@@ -2,8 +2,23 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+# Checkpoint .pt files are large binaries — ignore them everywhere.
+# (The gate_experiment harness keeps only the 2 most-recent anyway.)
 checkpoints/
-results/
-data/
+**/*.pt
+# Ignore PNG/PDF outputs produced by analysis scripts — they're derived from
+# the JSON results and easy to regenerate.
+**/*.png
+**/*.pdf
+# Track results/ text outputs (jsonl, json, csv, tex) but not binaries.
+# No blanket 'results/' ignore.
 *.log
+
+# Raw datasets live under data/ but the loader *source* (data/*.py) is tracked.
+# Ignore downloaded dataset files, keep the Python loaders.
+data/cifar-10-batches-py/
+data/cifar-100-python/
+data/*.tar.gz
+data/*.csv
+data/*.npz
 .DS_Store

@@ -272,6 +272,34 @@ class StructuralPlasticityMonitor:
         if layer_name in self.layer_stats:
             self.layer_stats[layer_name].clear()
 
+    def refresh_hooks(self) -> None:
+        """Re-discover TSR layers and re-register hooks.
+
+        Width changes resize parameters in place, so the module objects (and
+        their hooks) survive. Depth changes (inserting a new block) add brand
+        new modules that have no hooks and no LayerStats entry, and may shift
+        the names of existing layers. After any such change, call this to
+        rebuild the hook set against the current module tree. Statistics for
+        layers that still exist by name are preserved; new layers start empty
+        and removed layers are dropped.
+        """
+        self.remove_hooks()
+
+        old_stats = self.layer_stats
+        self.layer_stats = {}
+        self._tsr_layers = {}
+
+        for name, module in self.model.named_modules():
+            if isinstance(module, (TSRLinear, TSRConv2d)):
+                # Preserve accumulated stats if this name persists, else fresh.
+                self.layer_stats[name] = old_stats.get(name, LayerStats(self.window))
+                self._tsr_layers[name] = module
+
+                fh = module.register_forward_hook(self._make_forward_hook(name))
+                self._hooks.append(fh)
+                bh = module.register_full_backward_hook(self._make_backward_hook(name))
+                self._hooks.append(bh)
+
     def remove_hooks(self) -> None:
         """Remove all registered hooks."""
         for hook in self._hooks:

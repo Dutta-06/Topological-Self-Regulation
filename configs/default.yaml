@@ -24,17 +24,37 @@ regulation:
   # ── Death signal ──
   death_threshold: 0.01      # gate activation below this → neuron is dead
   min_neurons_per_layer: 4   # never prune below this count
+  # L1 pressure on open gates added to the training loss. This is what makes
+  # pruning happen: without it, gates rarely decay far enough to be pruned.
+  # Set to 0.0 for growth-only (ablation) behavior.
+  gate_sparsity_coeff: 0.0001
   # ── Growth signal ──
   growth_enabled: true
-  growth_signal: gradient_magnitude  # one of: gradient_magnitude, loss_plateau
+  # Which growth signal to use:
+  #   phantom   — measured marginal utility of capacity from dormant phantom
+  #               sensors (the novel signal; default).
+  #   heuristic — the original utilization×uniformity×saturation bottleneck score.
+  growth_signal_mode: phantom
   growth_rate: 0.1           # fraction of current width to add (rounded up)
   max_neurons_per_layer: 512 # hard cap on layer width
-  bottleneck_threshold: 0.1  # gradient-based score above this triggers growth
+  bottleneck_threshold: 0.1  # heuristic-mode score above this triggers growth
+  # ── Phantom sensor params (growth_signal_mode: phantom) ──
+  phantom_k: 4               # candidate phantom neurons per layer
+  phantom_threshold: 0.05    # mean |phantom gate-grad| above this triggers growth
+  # ── Compute price (lambda) ──
+  # Coefficient on the differentiable effective-FLOPs penalty. >0 makes the
+  # network size itself to the budget implied by the price. 0.0 disables.
+  flops_price: 0.0
   # ── Rewiring ──
   rewire_enabled: false       # disabled for v1; enable for edge-level adaptation
   rewire_fraction: 0.1        # fraction of connections to consider per update
-  # ── Layer insertion ──
-  layer_insertion_enabled: false  # disabled for v1
+  # ── Layer insertion (depth adaptation) ──
+  layer_insertion_enabled: false  # set true to enable organic depth growth
+  # Insert a new block when the max adjacent-layer gradient-norm ratio exceeds
+  # this. The ratio is grad_norm(next) / grad_norm(prev); a large value means
+  # the representational gap between two layers is too wide.
+  layer_insertion_threshold: 5.0
+  max_blocks: 16                  # hard cap on network depth
   # ── Scheduling ──
   cooldown_steps: 50          # min steps between structural changes per layer
   anneal_structural_rate: true  # reduce structural change rate over training
