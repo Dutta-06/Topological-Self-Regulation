@@ -34,8 +34,9 @@ from tsr.model import TSRNetwork
 from tsr.regulation.monitor import StructuralPlasticityMonitor
 from tsr.regulation.actions import apply_structural_update, StructuralEvent
 from tsr.regulation.scheduler import StructuralUpdateScheduler
+from tsr.regulation.signals import gate_sparsity_penalty
 from tsr.topology import capture_topology, TopologyState
-from tsr.flops import compute_model_flops, CumulativeFLOPsTracker
+from tsr.flops import compute_model_flops, CumulativeFLOPsTracker, differentiable_effective_flops
 from tsr.utils import rebuild_optimizer, count_parameters, count_effective_parameters
 
 logger = logging.getLogger(__name__)
@@ -95,11 +96,25 @@ class TSRTrainer:
         self.gate_lr_mult = gate_lr_mult
         self.act_lr_mult = act_lr_mult
 
+        # ── Phantom sensors (measured growth signal) ──
+        # Built BEFORE the optimizer so its probe params can be added to it.
+        # Only constructed in phantom mode; probes are optimized alongside the model.
+        self.growth_signal_mode = reg_cfg.get("growth_signal_mode", "phantom")
+        self.phantom_manager = None
+        if self.growth_signal_mode == "phantom":
+            from tsr.regulation.phantom import PhantomManager
+            self.phantom_manager = PhantomManager(
+                model,
+                k=reg_cfg.get("phantom_k", 4),
+                window=reg_cfg.get("monitor_window", 100),
+            ).to(device)
+
         self.optimizer = rebuild_optimizer(
             model, optimizer_cls, self.optimizer_kwargs,
             gate_lr_multiplier=gate_lr_mult,
             act_lr_multiplier=act_lr_mult,
         )
+        self._add_phantom_param_group()
 
         # ── LR Scheduler ──
         warmup_steps = train_cfg.get("warmup_steps", 500)
@@ -135,9 +150,24 @@ class TSRTrainer:
             "growth_enabled": reg_cfg.get("growth_enabled", True),
             "growth_rate": reg_cfg.get("growth_rate", 0.1),
             "max_neurons": reg_cfg.get("max_neurons_per_layer", 512),
-            "bottleneck_threshold": reg_cfg.get("bottleneck_threshold", 1.5),
-            "depth_adaptation_enabled": reg_cfg.get("depth_adaptation_enabled", True),
+            "bottleneck_threshold": reg_cfg.get("bottleneck_threshold", 0.1),
+            "depth_adaptation_enabled": reg_cfg.get("layer_insertion_enabled", False),
+            "layer_insertion_threshold": reg_cfg.get("layer_insertion_threshold", 5.0),
+            "max_blocks": reg_cfg.get("max_blocks", 16),
+            "growth_signal_mode": reg_cfg.get("growth_signal_mode", "phantom"),
+            "phantom_threshold": reg_cfg.get("phantom_threshold", 0.05),
         }
+
+        # Coefficient for the gate sparsity penalty added to the training loss.
+        # This is what gives pruning teeth: it applies steady downward pressure
+        # on every gate so that task-irrelevant neurons decay toward closed and
+        # become prunable. 0.0 disables it (growth-only behavior).
+        self.gate_sparsity_coeff = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+
+        # Fixed compute price (lambda): coefficient on the differentiable
+        # effective-FLOPs term added to the loss. Prices the compute the
+        # network actually uses so it sizes itself. 0.0 disables it.
+        self.flops_price = reg_cfg.get("flops_price", 0.0)
 
         # ── FLOPs Tracking ──
         self.flops_tracker = CumulativeFLOPsTracker()
@@ -204,12 +234,40 @@ class TSRTrainer:
             # ── Fast timescale: gradient step ──
             self.optimizer.zero_grad()
             output = self.model(data)
-            loss = F.cross_entropy(output, target)
+            task_loss = F.cross_entropy(output, target)
+            loss = task_loss
+
+            # Gate sparsity penalty drives unused gates toward closed so that
+            # the slow-timescale death signal can actually fire (makes pruning
+            # work). Useful neurons resist via the task gradient.
+            if self.gate_sparsity_coeff > 0:
+                loss = loss + self.gate_sparsity_coeff * gate_sparsity_penalty(self.model)
+
+            # Compute price: penalize the effective (gated) FLOPs the network
+            # uses, so it sizes itself to the budget implied by lambda.
+            if self.flops_price > 0:
+                loss = loss + self.flops_price * differentiable_effective_flops(
+                    self.model, self.input_shape
+                )
+
+            # Phantom sensors: hard-zero in value, but routes gradient to the
+            # phantom gates so we can MEASURE the marginal value of capacity.
+            if self.phantom_manager is not None:
+                loss = loss + self.phantom_manager.aux_loss()
+
             loss.backward()
+
+            # Snapshot phantom gate gradients (the measured growth signal)
+            # before the optimizer zeroes them next step.
+            if self.phantom_manager is not None:
+                self.phantom_manager.record_gradients()
+
             self.optimizer.step()
             self.lr_scheduler.step()
 
-            loss_val = loss.item()
+            # Record the task loss (not the regularized loss) for plateau
+            # detection, so the growth signal tracks real task progress.
+            loss_val = task_loss.item()
             epoch_loss += loss_val
             num_batches += 1
             
@@ -247,6 +305,24 @@ class TSRTrainer:
 
         return epoch_loss / max(num_batches, 1)
 
+    def _add_phantom_param_group(self) -> None:
+        """Add the phantom probe parameters to the optimizer as a group.
+
+        Phantom params live on a separate module (not model.named_parameters),
+        so rebuild_optimizer doesn't see them. They must be optimized so the
+        probes learn useful candidate features. Called after every optimizer
+        (re)build.
+        """
+        if self.phantom_manager is None:
+            return
+        phantom_params = [p for p in self.phantom_manager.parameters() if p.requires_grad]
+        if phantom_params:
+            self.optimizer.add_param_group({
+                "params": phantom_params,
+                "lr": self.optimizer_kwargs.get("lr", 0.001),
+                "group_name": "phantom",
+            })
+
     def _structural_update_step(self) -> None:
         """Execute one slow-timescale structural update."""
         t0 = time.time()
@@ -255,11 +331,26 @@ class TSRTrainer:
             model=self.model,
             monitor=self.monitor,
             step=self.global_step,
+            phantom_manager=self.phantom_manager,
             **self.reg_config,
         )
 
         if events:
             self.structural_events.extend(events)
+
+            # If a new block was inserted, the monitor's hooks don't cover it
+            # (and layer names may have shifted). Re-register hooks against the
+            # current module tree before rebuilding the optimizer so the new
+            # block is both monitored and optimized.
+            if any(e.action == "insert_layer" for e in events):
+                self.monitor.refresh_hooks()
+
+            # Any structural change (width or depth) can alter a probe's input
+            # dimension (e.g. an upstream layer grew its channels), so rebuild
+            # probes against the current shapes. refresh() reuses probes whose
+            # input shape is unchanged and only re-creates the stale ones.
+            if self.phantom_manager is not None:
+                self.phantom_manager.refresh()
 
             # Rebuild optimizer with new parameter references
             self.optimizer = rebuild_optimizer(
@@ -270,6 +361,7 @@ class TSRTrainer:
                 gate_lr_multiplier=self.gate_lr_mult,
                 act_lr_multiplier=self.act_lr_mult,
             )
+            self._add_phantom_param_group()
 
             # Re-create LR scheduler to match new optimizer
             # (preserves current step)

@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -69,16 +70,68 @@ class TSRSeqModel(nn.Module):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :])
 
+def tsr_lstm_growth_signal(cell, val_loss_history, growth_rate=0.25,
+                           saturation_frac=0.75, plateau_tol=0.01, max_hidden=128):
+    """Decide how many hidden units to add to a TSRLSTMCell from its own state.
+
+    Mirrors the main TSR engine's bottleneck+plateau logic, adapted to the
+    recurrent cell, so growth is driven by intrinsic signals rather than a
+    hardcoded schedule:
+
+      - Saturation: a large fraction of gates are near their ceiling (> 0.9),
+        i.e. the cell is using essentially all of its current capacity.
+      - Plateau: validation loss has stopped improving, so more capacity
+        (rather than more training of the current capacity) is warranted.
+
+    Growth fires only when both hold, and is proportional to current width.
+
+    Args:
+        cell: The TSRLSTMCell to inspect.
+        val_loss_history: List of validation losses, most recent last.
+        growth_rate: Fraction of current hidden size to add when growing.
+        saturation_frac: Fraction of gates that must be > 0.9 to count as
+            "at capacity".
+        plateau_tol: Relative improvement below this counts as a plateau.
+        max_hidden: Hard cap on hidden size.
+
+    Returns:
+        Number of units to add (0 if no growth is warranted).
+    """
+    if cell.hidden_size >= max_hidden:
+        return 0
+
+    # ── Saturation signal ──
+    gate_vals = cell.gate_values()
+    saturation = (gate_vals > 0.9).float().mean().item()
+    if saturation < saturation_frac:
+        return 0
+
+    # ── Plateau signal ── need at least a few epochs to judge a trend.
+    if len(val_loss_history) < 4:
+        return 0
+    prev = sum(val_loss_history[-4:-2]) / 2
+    recent = sum(val_loss_history[-2:]) / 2
+    if prev <= 0:
+        return 0
+    rel_improvement = (prev - recent) / abs(prev)
+    if rel_improvement >= plateau_tol:
+        return 0  # still improving — don't grow yet
+
+    n = max(1, math.ceil(cell.hidden_size * growth_rate))
+    return min(n, max_hidden - cell.hidden_size)
+
+
 def train_eval_loop(model_name, model, train_loader, val_loader, test_loader, device, epochs=10, is_tsr=False):
     model = model.to(device)
     optimizer = Adam(model.parameters(), lr=0.001)
-    
+
     print(f"\nTraining {model_name}...")
     best_val_loss = float('inf')
     test_mse = float('inf')
-    
+
     history = []
-    
+    val_loss_history = []
+
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -104,18 +157,25 @@ def train_eval_loop(model_name, model, train_loader, val_loader, test_loader, de
                 pred = model(x)
                 val_loss += F.mse_loss(pred.squeeze(), y).item()
         val_loss /= len(val_loader)
-        
-        # TSR specific structural plasticity simulation (grow if we are not improving much)
-        # For simplicity, we grow 4 neurons at epoch 5 to see if it escapes local minima
-        if is_tsr and epoch == 4:
-            print("--- Triggering Growth in TSRLSTM ---")
-            model.lstm.cell.grow_neurons(4, init_scale=0.01)
-            fc_weight = model.fc.weight.data
-            new_cols = torch.zeros(model.fc.out_features, 4, device=device)
-            model.fc.weight = nn.Parameter(torch.cat([fc_weight, new_cols], dim=1))
-            model.fc.in_features += 4
-            optimizer = Adam(model.parameters(), lr=0.001) # Reinit optimizer for new params
-            
+        val_loss_history.append(val_loss)
+
+        # TSR structural plasticity: grow the hidden state only when the cell's
+        # OWN signals call for it (gates saturated + validation loss plateaued),
+        # not on a fixed schedule. This makes the LSTM genuinely self-regulating.
+        if is_tsr:
+            n_grow = tsr_lstm_growth_signal(model.lstm.cell, val_loss_history)
+            if n_grow > 0:
+                print(f"--- TSRLSTM growth signal fired: +{n_grow} hidden units "
+                      f"({model.lstm.cell.hidden_size} → {model.lstm.cell.hidden_size + n_grow}) ---")
+                model.lstm.cell.grow_neurons(n_grow, init_scale=0.01)
+                # Pair the downstream FC layer: new hidden units feed in as new
+                # input columns (zero-init so output is unchanged at insertion).
+                fc_weight = model.fc.weight.data
+                new_cols = torch.zeros(model.fc.out_features, n_grow, device=device)
+                model.fc.weight = nn.Parameter(torch.cat([fc_weight, new_cols], dim=1))
+                model.fc.in_features += n_grow
+                optimizer = Adam(model.parameters(), lr=0.001)  # re-init for new params
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             # Eval on test set

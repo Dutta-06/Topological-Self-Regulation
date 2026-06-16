@@ -137,6 +137,59 @@ def compute_model_flops(model: nn.Module, input_shape: tuple) -> int:
     return total_flops
 
 
+def differentiable_effective_flops(model: nn.Module, input_shape: tuple):
+    """Differentiable estimate of the model's effective (gated) inference FLOPs.
+
+    Unlike compute_model_flops (which thresholds gates at 0.5 and returns an
+    int), this returns a torch scalar whose value scales smoothly with each
+    layer's open-gate mass sigmoid(gate).sum(), so gradient flows back to the
+    gate logits. Adding lambda * this to the training loss prices the compute
+    the network actually uses: gates that aren't earning their FLOPs get pushed
+    closed, which is the "compute price" that makes TSR size itself.
+
+    Each TSR layer's cost is weighted by its OWN output gates against full input
+    width — a well-defined per-layer price (not the full input×output gated
+    product). That is sufficient for a penalty term: it monotonically rewards
+    closing output units, which is the lever we want.
+
+    Args:
+        model: The TSR model.
+        input_shape: Input shape (C, H, W).
+
+    Returns:
+        Scalar tensor (effective FLOPs per sample), differentiable w.r.t. gates.
+    """
+    import torch
+
+    device = next(model.parameters()).device
+    total = torch.zeros((), device=device)
+    current_shape = input_shape
+
+    for name, module in model.named_modules():
+        if isinstance(module, TSRLinear):
+            open_mass = torch.sigmoid(module.gate).sum()  # ~effective out neurons
+            per_out = 2 * module.in_features + (1 if module.bias is not None else 0)
+            total = total + open_mass * per_out
+            current_shape = (module.out_features,)
+
+        elif isinstance(module, TSRConv2d):
+            kh, kw = module.kernel_size
+            if len(current_shape) >= 2:
+                h_in, w_in = current_shape[-2], current_shape[-1]
+                sh, sw = module.stride
+                ph, pw = module.padding
+                h_out = (h_in + 2 * ph - kh) // sh + 1
+                w_out = (w_in + 2 * pw - kw) // sw + 1
+            else:
+                h_out, w_out = 1, 1
+            open_mass = torch.sigmoid(module.gate).sum()  # ~effective out channels
+            per_out = 2 * module.in_channels * kh * kw * h_out * w_out
+            total = total + open_mass * per_out
+            current_shape = (module.out_channels, h_out, w_out)
+
+    return total
+
+
 class CumulativeFLOPsTracker:
     """Tracks cumulative training FLOPs over the training trajectory.
 
