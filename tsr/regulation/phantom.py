@@ -304,6 +304,8 @@ class PhantomManager(nn.Module):
                 probe = old.get(key)
                 if probe is None or probe.weight.shape[1:] != module.weight.shape[1:]:
                     probe = PhantomProbe(module, k=self.k, window=self.window)
+                    device = next(self.model.parameters()).device
+                    probe = probe.to(device)
                 self.probes[key] = probe
                 self._name_map[key] = name
                 h = module.register_forward_pre_hook(self._make_capture_hook(key))
