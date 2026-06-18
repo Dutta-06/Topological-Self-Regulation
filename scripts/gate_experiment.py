@@ -267,10 +267,12 @@ class TSRRunner:
         self.reg_config = {
             "death_threshold": reg_cfg.get("death_threshold", 0.01),
             "min_neurons": reg_cfg.get("min_neurons_per_layer", 4),
+            "newborn_protect_steps": reg_cfg.get("newborn_protect_steps", 400),
             "growth_enabled": reg_cfg.get("growth_enabled", True),
             "growth_rate": reg_cfg.get("growth_rate", 0.1),
             "max_neurons": reg_cfg.get("max_neurons_per_layer", 512),
             "bottleneck_threshold": reg_cfg.get("bottleneck_threshold", 0.1),
+            "newborn_gate_init": reg_cfg.get("newborn_gate_init", 0.0),
             "depth_adaptation_enabled": reg_cfg.get("layer_insertion_enabled", False),
             "layer_insertion_threshold": reg_cfg.get("layer_insertion_threshold", 5.0),
             "max_blocks": reg_cfg.get("max_blocks", 16),
@@ -645,20 +647,26 @@ def aggregate_results(results_root: Path, variants: List[str], seeds: List[int])
 
 
 def check_gate(summary: dict) -> bool:
-    """Print acceptance gate outcome and return True iff passed."""
+    """Print acceptance gate outcome and return True iff passed.
+
+    Gate conditions (all must hold):
+      1. tsr_phantom > static_final  — plasticity beats shape alone (matched params)
+      2. tsr_phantom > tsr_heuristic — phantom sensor beats hand-designed heuristic
+      3. tsr_phantom > vgg_tiny      — TSR beats a fixed net at comparable FLOPs
+    """
     phantom_acc = summary.get("tsr_phantom", {}).get("val_accuracy", {}).get("mean", 0.0)
     heuristic_acc = summary.get("tsr_heuristic", {}).get("val_accuracy", {}).get("mean", 0.0)
     tiny_acc = summary.get("vgg_tiny", {}).get("val_accuracy", {}).get("mean", 0.0)
-    small_acc = summary.get("vgg_small", {}).get("val_accuracy", {}).get("mean", 0.0)
+    static_acc = summary.get("static_final", {}).get("val_accuracy", {}).get("mean", 0.0)
 
     print("\n" + "=" * 60)
     print("ACCEPTANCE GATE")
     print("=" * 60)
 
     lines = [
-        ("tsr_phantom vs tsr_heuristic", phantom_acc, heuristic_acc),
-        ("tsr_phantom vs vgg_tiny",       phantom_acc, tiny_acc),
-        ("tsr_phantom vs vgg_small",      phantom_acc, small_acc),
+        ("tsr_phantom vs static_final  [CORE]", phantom_acc, static_acc),
+        ("tsr_phantom vs tsr_heuristic [SENSOR]", phantom_acc, heuristic_acc),
+        ("tsr_phantom vs vgg_tiny      [PARETO]", phantom_acc, tiny_acc),
     ]
     passed = True
     for label, a, b in lines:

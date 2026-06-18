@@ -12,6 +12,10 @@ checkpoints/
 **/*.pdf
 # Track results/ text outputs (jsonl, json, csv, tex) but not binaries.
 # No blanket 'results/' ignore.
+# Gate experiment output directories (committed selectively, not automatically)
+gate/
+gate_v2/
+gate_smoke*/
 *.log
 
 # Raw datasets live under data/ but the loader *source* (data/*.py) is tracked.

@@ -279,18 +279,20 @@ def grow_neurons_paired(
     n: int,
     step: int,
     init_scale: float = 0.001,
+    newborn_gate: float = 0.0,
 ) -> Optional[StructuralEvent]:
     """Grow neurons in a layer and correctly update all downstream dependencies.
 
-    New neurons are initialized "asleep" (gate ≈ 0) with small random weights.
-    They must earn their place via gradient signal.
+    New neurons are initialized with gate logit newborn_gate (default 0.0 → sigmoid=0.5,
+    alive and gradient-accessible). Caller should seed weights via _seed_grown_from_phantom.
 
     Args:
         model: The full TSR model.
         layer_name: Name of the layer to grow.
         n: Number of neurons/channels to add.
-        step: Current training step (for logging).
-        init_scale: Scale for new weight initialization.
+        step: Current training step (for logging and birth tracking).
+        init_scale: Scale for new weight initialization (overwritten by phantom seed).
+        newborn_gate: Gate logit for new neurons.
 
     Returns:
         StructuralEvent describing what happened, or None if nothing changed.
@@ -308,10 +310,10 @@ def grow_neurons_paired(
 
     # 1. Grow the target layer
     if isinstance(target, TSRLinear):
-        target.grow_neurons(n, init_scale=init_scale)
+        target.grow_neurons(n, init_scale=init_scale, newborn_gate=newborn_gate, step=step)
         new_size = target.out_features
     elif isinstance(target, TSRConv2d):
-        target.grow_channels(n, init_scale=init_scale)
+        target.grow_channels(n, init_scale=init_scale, newborn_gate=newborn_gate, step=step)
         new_size = target.out_channels
     else:
         return None
@@ -352,12 +354,14 @@ def apply_structural_update(
     # Death signal params
     death_threshold: float = 0.01,
     min_neurons: int = 4,
+    newborn_protect_steps: int = 400,
     # Growth signal params
     growth_enabled: bool = True,
     growth_rate: float = 0.1,
     max_neurons: int = 512,
     bottleneck_threshold: float = 0.1,
     init_scale: float = 0.001,
+    newborn_gate_init: float = 0.0,
     # Growth-signal selection: "phantom" (measured) or "heuristic" (bottleneck score)
     growth_signal_mode: str = "phantom",
     phantom_manager: Optional[nn.Module] = None,
@@ -423,7 +427,8 @@ def apply_structural_update(
             continue
 
         dead_indices = compute_death_signal(
-            stats, layer, threshold=death_threshold, min_neurons=min_neurons
+            stats, layer, threshold=death_threshold, min_neurons=min_neurons,
+            current_step=step, newborn_protect_steps=newborn_protect_steps,
         )
         if len(dead_indices) > 0:
             event = prune_neurons_paired(model, layer_name, dead_indices, step)
@@ -462,7 +467,8 @@ def apply_structural_update(
             if n_grow <= 0:
                 continue
             event = grow_neurons_paired(
-                model, layer_name, n_grow, step, init_scale=init_scale
+                model, layer_name, n_grow, step, init_scale=init_scale,
+                newborn_gate=newborn_gate_init,
             )
             if event is not None:
                 # Initialize the first grown neuron from the winning phantom's
@@ -517,7 +523,8 @@ def apply_structural_update(
             )
             if n_grow > 0:
                 event = grow_neurons_paired(
-                    model, layer_name, n_grow, step, init_scale=init_scale
+                    model, layer_name, n_grow, step, init_scale=init_scale,
+                    newborn_gate=newborn_gate_init,
                 )
                 if event is not None:
                     events.append(event)
@@ -545,7 +552,8 @@ def apply_structural_update(
                         f"adaptive threshold {adaptive_threshold:.4f}"
                     )
                     event = grow_neurons_paired(
-                        model, best_layer, n_grow, step, init_scale=init_scale
+                        model, best_layer, n_grow, step, init_scale=init_scale,
+                        newborn_gate=newborn_gate_init,
                     )
                     if event is not None:
                         events.append(event)

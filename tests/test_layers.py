@@ -150,16 +150,16 @@ class TestTSRLinearStructural:
         assert layer.bias.shape == (12,)
         assert layer.gate.shape == (12,)
 
-    def test_grow_neurons_start_asleep(self):
-        """New neurons should have near-zero gate activation."""
+    def test_grow_neurons_born_alive(self):
+        """New neurons start at newborn_gate=0.0 (sigmoid≈0.5), alive but not open."""
         layer = TSRLinear(16, 8)
         layer.grow_neurons(4)
 
         gate_vals = layer.gate_values()
         # Original 8 neurons should be ~0.95 (gate_init=3.0)
         assert gate_vals[:8].min().item() > 0.9
-        # New 4 neurons should be ~0.007 (gate=-5.0)
-        assert gate_vals[8:].max().item() < 0.01
+        # New 4 neurons: born at logit=0.0 → sigmoid=0.5 (alive, above death threshold)
+        assert abs(gate_vals[8:].max().item() - 0.5) < 0.01
 
     def test_grow_neurons_nonzero_weights(self):
         """New neuron weights must NOT be zero (the bug fix)."""

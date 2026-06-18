@@ -70,6 +70,8 @@ def compute_death_signal(
     layer: nn.Module,
     threshold: float = 0.01,
     min_neurons: int = 4,
+    current_step: int = 0,
+    newborn_protect_steps: int = 400,
 ) -> torch.Tensor:
     """Identify dead neurons/channels that should be pruned.
 
@@ -77,14 +79,17 @@ def compute_death_signal(
       1. Its gate activation is below threshold (it's nearly off), AND
       2. Its mean activation magnitude over the monitoring window is below threshold
 
-    Both conditions must hold to avoid pruning neurons that are gated low
-    but still have gradient signal (they might wake up).
+    Neurons grown during training (neuron_birth_step >= 0) are protected from pruning
+    for newborn_protect_steps steps after birth — enough time for the task gradient
+    to either lift the gate or confirm the neuron is genuinely useless.
 
     Args:
         layer_stats: Statistics from the monitoring window.
         layer: The TSR layer to inspect.
         threshold: Activation/gate threshold below which a neuron is dead.
         min_neurons: Minimum neurons to keep in the layer (never prune below this).
+        current_step: Current training step.
+        newborn_protect_steps: Steps after birth during which a neuron cannot be pruned.
 
     Returns:
         1D tensor of indices of dead neurons. Empty tensor if none are dead.
@@ -110,6 +115,14 @@ def compute_death_signal(
 
     # Dead = gate low AND activation low
     is_dead = (gate_vals.cpu() < threshold) & (mean_act < threshold)
+
+    # Protect newborns: neurons with birth_step >= 0 are grown neurons; skip them
+    # until they've had newborn_protect_steps to earn their keep (or confirm uselessness).
+    if newborn_protect_steps > 0 and hasattr(layer, 'neuron_birth_step'):
+        birth = layer.neuron_birth_step.cpu()
+        is_grown = birth >= 0  # -1 means original neuron → never protected
+        age = torch.where(is_grown, current_step - birth, torch.full_like(birth, newborn_protect_steps + 1))
+        is_dead = is_dead & (age >= newborn_protect_steps)
 
     dead_indices = is_dead.nonzero(as_tuple=True)[0]
 

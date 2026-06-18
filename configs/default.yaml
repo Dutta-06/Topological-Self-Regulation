@@ -41,6 +41,12 @@ regulation:
   # ── Phantom sensor params (growth_signal_mode: phantom) ──
   phantom_k: 4               # candidate phantom neurons per layer
   phantom_threshold: 0.05    # mean |phantom gate-grad| above this triggers growth
+  # ── Newborn protection ──
+  # Grown neurons start with gate logit newborn_gate_init (sigmoid(0.0)=0.5, alive).
+  # They cannot be pruned for newborn_protect_steps training steps after birth,
+  # giving the task gradient time to either lift them or confirm they're useless.
+  newborn_gate_init: 0.0     # gate logit at birth; sigmoid(0)≈0.5 (above death threshold)
+  newborn_protect_steps: 400 # steps before a grown neuron can be pruned (2 update cycles)
   # ── Compute price (lambda) ──
   # Coefficient on the differentiable effective-FLOPs penalty. >0 makes the
   # network size itself to the budget implied by the price. 0.0 disables.

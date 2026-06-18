@@ -56,6 +56,9 @@ class TSRLinear(nn.Module):
         # Per-neuron gate logits: sigmoid(gate) ∈ (0, 1) controls neuron contribution
         self.gate = nn.Parameter(torch.full((out_features,), gate_init))
 
+        # Birth step per neuron: -1 = original (never protected), >0 = grown at that step
+        self.register_buffer('neuron_birth_step', torch.full((out_features,), -1, dtype=torch.long))
+
         # Activation mixture logits: softmax(act_weights) gives mixture coefficients
         # over [ReLU, Tanh, GELU, SiLU]
         act_idx = ACTIVATION_NAMES.index(act_init) if act_init in ACTIVATION_NAMES else 0
@@ -148,6 +151,7 @@ class TSRLinear(nn.Module):
         if self.bias is not None:
             self.bias = nn.Parameter(self.bias.data[keep_indices])
         self.gate = nn.Parameter(self.gate.data[keep_indices])
+        self.neuron_birth_step = self.neuron_birth_step[keep_indices]
         self.out_features = len(keep_indices)
 
     def prune_input_channels(self, indices_to_remove: torch.Tensor) -> None:
@@ -166,23 +170,21 @@ class TSRLinear(nn.Module):
         self.weight = nn.Parameter(self.weight.data[:, keep_indices])
         self.in_features = len(keep_indices)
 
-    def grow_neurons(self, n: int, init_scale: float = 0.001) -> None:
-        """Add n new neurons, initialized small with gates "asleep".
+    def grow_neurons(self, n: int, init_scale: float = 0.001, newborn_gate: float = 0.0, step: int = 0) -> None:
+        """Add n new neurons, born alive at newborn_gate logit.
 
-        New neurons start with:
-          - Small random weights (Kaiming-scaled * init_scale)
-          - Zero bias
-          - Gate logit = -5.0 → sigmoid(-5) ≈ 0.007 (nearly off)
-
-        This ensures new neurons don't disrupt existing representations
-        and must "wake up" via gradient signal to contribute.
+        New neurons start with phantom-initialized (or small random) weights and a
+        gate logit of newborn_gate (default 0.0 → sigmoid≈0.5, alive and gradient-accessible).
+        The caller should seed weights via _seed_grown_from_phantom after calling this.
 
         NOTE: The caller is responsible for also updating the downstream
         layer's in_features/weight columns.
 
         Args:
             n: Number of neurons to add.
-            init_scale: Scale factor for weight initialization.
+            init_scale: Scale factor for weight initialization (overwritten by phantom seed).
+            newborn_gate: Gate logit for new neurons. 0.0 → sigmoid=0.5 (alive, not open).
+            step: Current training step, recorded for newborn protection.
         """
         if n <= 0:
             return
@@ -190,9 +192,8 @@ class TSRLinear(nn.Module):
         device = self.weight.device
         dtype = self.weight.dtype
 
-        # Small random weights (NOT zeros — avoids death spiral)
         new_w = torch.randn(n, self.in_features, device=device, dtype=dtype) * init_scale
-        new_g = torch.full((n,), -5.0, device=device, dtype=dtype)  # asleep
+        new_g = torch.full((n,), newborn_gate, device=device, dtype=dtype)
 
         self.weight = nn.Parameter(torch.cat([self.weight.data, new_w], dim=0))
         self.gate = nn.Parameter(torch.cat([self.gate.data, new_g], dim=0))
@@ -200,6 +201,9 @@ class TSRLinear(nn.Module):
         if self.bias is not None:
             new_b = torch.zeros(n, device=device, dtype=dtype)
             self.bias = nn.Parameter(torch.cat([self.bias.data, new_b], dim=0))
+
+        new_birth = torch.full((n,), step, dtype=torch.long, device=device)
+        self.neuron_birth_step = torch.cat([self.neuron_birth_step, new_birth])
 
         self.out_features += n
 

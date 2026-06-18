@@ -66,6 +66,9 @@ class TSRConv2d(nn.Module):
         # Per-channel gate logits
         self.gate = nn.Parameter(torch.full((out_channels,), gate_init))
 
+        # Birth step per channel: -1 = original (never protected), >0 = grown at that step
+        self.register_buffer('neuron_birth_step', torch.full((out_channels,), -1, dtype=torch.long))
+
         # Shared activation mixture logits
         act_idx = ACTIVATION_NAMES.index(act_init) if act_init in ACTIVATION_NAMES else 0
         act_logits = torch.zeros(NUM_ACTIVATIONS)
@@ -155,6 +158,7 @@ class TSRConv2d(nn.Module):
         if self.bias is not None:
             self.bias = nn.Parameter(self.bias.data[keep_indices])
         self.gate = nn.Parameter(self.gate.data[keep_indices])
+        self.neuron_birth_step = self.neuron_birth_step[keep_indices]
         self.out_channels = len(keep_indices)
 
     def prune_input_channels(self, indices_to_remove: torch.Tensor) -> None:
@@ -173,14 +177,20 @@ class TSRConv2d(nn.Module):
         self.weight = nn.Parameter(self.weight.data[:, keep_indices])
         self.in_channels = len(keep_indices)
 
-    def grow_channels(self, n: int, init_scale: float = 0.001) -> None:
-        """Add n new output channels, initialized small with gates asleep.
+    def grow_channels(self, n: int, init_scale: float = 0.001, newborn_gate: float = 0.0, step: int = 0) -> None:
+        """Add n new output channels, born alive at newborn_gate logit.
+
+        New channels start with phantom-initialized (or small random) weights and a
+        gate logit of newborn_gate (default 0.0 → sigmoid≈0.5, alive and gradient-accessible).
+        The caller should seed weights via _seed_grown_from_phantom after calling this.
 
         NOTE: Caller must update downstream layer's input dimension.
 
         Args:
             n: Number of channels to add.
-            init_scale: Scale factor for weight initialization.
+            init_scale: Scale factor for weight initialization (overwritten by phantom seed).
+            newborn_gate: Gate logit for new channels. 0.0 → sigmoid=0.5 (alive, not open).
+            step: Current training step, recorded for newborn protection.
         """
         if n <= 0:
             return
@@ -192,7 +202,7 @@ class TSRConv2d(nn.Module):
             torch.randn(n, self.in_channels, *self.kernel_size, device=device, dtype=dtype)
             * init_scale
         )
-        new_g = torch.full((n,), -5.0, device=device, dtype=dtype)
+        new_g = torch.full((n,), newborn_gate, device=device, dtype=dtype)
 
         self.weight = nn.Parameter(torch.cat([self.weight.data, new_w], dim=0))
         self.gate = nn.Parameter(torch.cat([self.gate.data, new_g], dim=0))
@@ -200,6 +210,9 @@ class TSRConv2d(nn.Module):
         if self.bias is not None:
             new_b = torch.zeros(n, device=device, dtype=dtype)
             self.bias = nn.Parameter(torch.cat([self.bias.data, new_b], dim=0))
+
+        new_birth = torch.full((n,), step, dtype=torch.long, device=device)
+        self.neuron_birth_step = torch.cat([self.neuron_birth_step, new_birth])
 
         self.out_channels += n
 
