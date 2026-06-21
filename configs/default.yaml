@@ -36,7 +36,7 @@ regulation:
   #   heuristic — the original utilization×uniformity×saturation bottleneck score.
   growth_signal_mode: phantom
   growth_rate: 0.1           # fraction of current width to add (rounded up)
-  max_neurons_per_layer: 512 # hard cap on layer width
+  max_neurons_per_layer: 1024 # hard cap on layer width
   bottleneck_threshold: 0.1  # heuristic-mode score above this triggers growth
   # ── Phantom sensor params (growth_signal_mode: phantom) ──
   phantom_k: 4               # candidate phantom neurons per layer
@@ -63,7 +63,7 @@ regulation:
   max_blocks: 16                  # hard cap on network depth
   # ── Scheduling ──
   cooldown_steps: 50          # min steps between structural changes per layer
-  anneal_structural_rate: true  # reduce structural change rate over training
+  anneal_structural_rate: false  # reduce structural change rate over training
   anneal_start_step: 5000     # when to start annealing
   anneal_factor: 0.95         # multiplicative decay per update_interval
 
