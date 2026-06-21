@@ -611,13 +611,13 @@ def run_one(
                 cfg_copy.setdefault("model", {})["classifier_hidden"] = model_state["classifier.0.weight"].shape[0]
             if seed_channels:
                 cfg_copy.setdefault("model", {})["seed_channels"] = seed_channels
-      return runner.run()
 
         model = build_tsr(cfg_copy)
         runner = TSRRunner(
             model, train_loader, val_loader, run_dir,
             cfg=cfg_copy, growth_signal_mode="phantom", device=device,
         )
+        return runner.run()
 
     elif variant == "tsr_heuristic":
         # Disable phantom: override growth mode in a config copy
