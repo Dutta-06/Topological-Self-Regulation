@@ -527,7 +527,7 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def build_tsr(cfg: dict, num_classes: int = 10, classifier_hidden=m.get("classifier_hidden", None)) -> TSRNetwork:
+def build_tsr(cfg: dict, num_classes: int = 10) -> TSRNetwork:
     m = cfg.get("model", {})
     return TSRNetwork(
         in_channels=3,
@@ -536,6 +536,7 @@ def build_tsr(cfg: dict, num_classes: int = 10, classifier_hidden=m.get("classif
         gate_init=m.get("gate_init", 3.0),
         act_init=m.get("act_init", "relu"),
         norm_group_size=m.get("norm_group_size", 8),
+        classifier_hidden=m.get("classifier_hidden", None),
     )
 
 
@@ -610,6 +611,7 @@ def run_one(
                 cfg_copy.setdefault("model", {})["classifier_hidden"] = model_state["classifier.0.weight"].shape[0]
             if seed_channels:
                 cfg_copy.setdefault("model", {})["seed_channels"] = seed_channels
+      return runner.run()
 
         model = build_tsr(cfg_copy)
         runner = TSRRunner(
@@ -806,6 +808,7 @@ def main():
     for variant in run_order:
         for seed in args.seeds:
             # For static_final, try to get the shape from tsr_phantom seed 0 run
+            sfclassifier = None
             sfchannels = None
             if variant == "static_final":
                 phantom_dir = results_root / "tsr_phantom" / f"seed{args.seeds[0]}"
