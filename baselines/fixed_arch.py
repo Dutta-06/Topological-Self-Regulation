@@ -7,7 +7,9 @@ class VGGBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn = nn.GroupNorm(min(32, out_channels), out_channels)
+        num_groups = next(g for g in range(min(32, out_channels), 0, -1) if out_channels % g == 0)
+        self.bn = nn.GroupNorm(num_groups, out_channels)
+
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -18,8 +20,8 @@ class FixedVGG(nn.Module):
     
     This architecture mimics the structure of TSRNetwork, but uses standard
     static convolutional layers instead of adaptive TSR blocks.
-    """
-    def __init__(self, channels: List[int], in_channels: int = 3, num_classes: int = 10):
+    """    
+    def __init__(self, channels: List[int], in_channels: int = 3, num_classes: int = 10, classifier_hidden: int = None):
         super().__init__()
         self.channels = channels
         
@@ -34,10 +36,12 @@ class FixedVGG(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((4, 4))
         
         # Classifier
+        if classifier_hidden is None:
+            classifier_hidden = current_channels * 4    
         self.classifier = nn.Sequential(
-            nn.Linear(current_channels * 16, current_channels * 4),
+            nn.Linear(current_channels * 16, classifier_hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(current_channels * 4, num_classes)
+            nn.Linear(classifier_hidden, num_classes)
         )
         
     def forward(self, x):
