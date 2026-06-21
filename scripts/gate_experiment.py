@@ -294,7 +294,10 @@ class TSRRunner:
         self.optimizer_kwargs = {"lr": lr, "weight_decay": wd}
         self.gate_lr_mult = gate_lr_mult
         self.act_lr_mult = act_lr_mult
-
+        self.lr = lr
+        self.min_lr = min_lr
+        self.total_steps = self.max_epochs * len(train_loader)
+        self.warmup = warmup
         self.optimizer = rebuild_optimizer(
             model, self.optimizer_cls, self.optimizer_kwargs,
             gate_lr_multiplier=gate_lr_mult, act_lr_multiplier=act_lr_mult,
@@ -304,13 +307,7 @@ class TSRRunner:
         total_steps = self.max_epochs * len(train_loader)
         self.warmup = warmup
 
-        def lr_lambda(step):
-            if step < warmup:
-                return step / max(warmup, 1)
-            progress = (step - warmup) / max(total_steps - warmup, 1)
-            return max(min_lr / lr, 0.5 * (1 + math.cos(math.pi * progress)))
-
-        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+        self.scheduler = self._build_scheduler()
 
         self.monitor = StructuralPlasticityMonitor(
             model, window=reg_cfg.get("monitor_window", 100)
@@ -327,6 +324,29 @@ class TSRRunner:
         self.step = 0
         self.best_val_acc = 0.0
         self.events: list = []
+      
+    def _build_scheduler(self, last_epoch: int = -1) -> LambdaLR:
+        lr, min_lr, warmup, total_steps = self.lr, self.min_lr, self.warmup, self.total_steps
+
+        def _cosine_lambda(step):
+            if step < warmup:
+                return step / max(warmup, 1)
+            progress = (step - warmup) / max(total_steps - warmup, 1)
+            return max(min_lr / lr, 0.5 * (1 + math.cos(math.pi * progress)))
+
+        def _constant_lambda(step):
+            if step < warmup:
+                return step / max(warmup, 1)
+            return 1.0
+
+        lambdas = []
+        for group in self.optimizer.param_groups:
+            if group.get("group_name") == "phantom":
+                lambdas.append(_constant_lambda)
+            else:
+                lambdas.append(_cosine_lambda)
+
+        return LambdaLR(self.optimizer, lambdas, last_epoch=last_epoch)
 
     def _add_phantom_group(self):
         if self.phantom_manager is None:
@@ -344,11 +364,27 @@ class TSRRunner:
         events_path = self.run_dir / "events.jsonl"
         topology_path = self.run_dir / "topology.jsonl"
 
-        # Log initial topology
-        topo = capture_topology(self.model, 0)
-        _write_jsonl(topology_path, topo.to_dict())
+        start_epoch = 0
+        existing_ckpts = sorted(self.run_dir.glob("checkpoint_*.pt"))
+        if existing_ckpts:
+            latest_ckpt = existing_ckpts[-1]
+            logger.info(f"Resuming from checkpoint: {latest_ckpt}")
+            state = torch.load(latest_ckpt, map_location=self.device)
+            self.model.load_state_dict(state["model_state_dict"])
+            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+            self.scheduler.load_state_dict(state["scheduler_state_dict"])
+            self.step = state["step"]
+            start_epoch = state.get("extra", {}).get("epoch", -1) + 1
+            self.best_val_acc = state.get("extra", {}).get("best_val_acc", 0.0)
+            
+            if (self.run_dir / "events.jsonl").exists():
+                with open(self.run_dir / "events.jsonl", "r") as f:
+                    self.events = [json.loads(line) for line in f]
+        else:
+            topo = capture_topology(self.model, 0)
+            _write_jsonl(self.run_dir / "topology.jsonl", topo.to_dict())
 
-        for epoch in range(self.max_epochs):
+        for epoch in range(start_epoch, self.max_epochs):
             self.model.train()
             for data, target in self.train_loader:
                 data, target = data.to(self.device), target.to(self.device)
@@ -448,21 +484,9 @@ class TSRRunner:
             )
             self._add_phantom_group()
 
-            lr = self.optimizer_kwargs["lr"]
-            min_lr = 1e-5
-            total_steps = self.max_epochs * len(self.train_loader)
-            warmup = self.warmup
-            current_step = self.step
-
-            def lr_lambda(step):
-                if step < warmup:
-                    return step / max(warmup, 1)
-                progress = (step - warmup) / max(total_steps - warmup, 1)
-                return max(min_lr / lr, 0.5 * (1 + math.cos(math.pi * progress)))
-
             for group in self.optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
-            self.scheduler = LambdaLR(self.optimizer, lr_lambda, last_epoch=current_step)
+            self.scheduler = self._build_scheduler(last_epoch=self.step)
 
             self.structural_scheduler.record_update(self.step, [e.layer_name for e in events])
         else:
@@ -503,7 +527,7 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def build_tsr(cfg: dict, num_classes: int = 10) -> TSRNetwork:
+def build_tsr(cfg: dict, num_classes: int = 10, classifier_hidden=m.get("classifier_hidden", None)) -> TSRNetwork:
     m = cfg.get("model", {})
     return TSRNetwork(
         in_channels=3,
@@ -515,22 +539,27 @@ def build_tsr(cfg: dict, num_classes: int = 10) -> TSRNetwork:
     )
 
 
-def _tsr_final_shape(run_dir: Path) -> Optional[List[int]]:
-    """Read TSR phantom run's final topology and return channel list for static_final."""
+def _tsr_final_shape(run_dir: Path) -> Tuple[Optional[List[int]], Optional[int]]:
     final_path = run_dir / "final.json"
     if not final_path.exists():
-        return None
+        return None, None
     with open(final_path) as f:
         d = json.load(f)
     topo = d.get("topology_state")
     if not topo:
-        return None
+        return None, None
     channels = [
         layer["out_size"]
         for layer in topo.get("layers", [])
         if layer.get("layer_type") == "conv"
     ]
-    return channels if channels else None
+    classifier_hidden = None
+    for layer in topo.get("layers", []):
+        if layer.get("layer_type") == "linear" and layer.get("name") != "classifier.2":
+            classifier_hidden = layer["out_size"]
+            break
+            
+    return (channels if channels else None), classifier_hidden
 
 
 def run_one(
@@ -542,6 +571,7 @@ def run_one(
     results_root: Path,
     device: torch.device,
     static_final_channels: Optional[List[int]] = None,
+    static_final_classifier: Optional[int] = None,
 ) -> dict:
     run_dir = results_root / variant / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -563,12 +593,29 @@ def run_one(
     ckpt_every = train_cfg.get("checkpoint_interval", 2000)
 
     if variant == "tsr_phantom":
-        model = build_tsr(cfg)
+        cfg_copy = json.loads(json.dumps(cfg))
+        existing_ckpts = sorted(run_dir.glob("checkpoint_*.pt"))
+        if existing_ckpts:
+            latest_ckpt = existing_ckpts[-1]
+            state = torch.load(latest_ckpt, map_location=device)
+            model_state = state["model_state_dict"]
+            seed_channels = []
+            for i in range(16):
+                key = f"blocks.{i}.conv.weight"
+                if key in model_state:
+                    seed_channels.append(model_state[key].shape[0])
+                else:
+                    break
+            if "classifier.0.weight" in model_state:
+                cfg_copy.setdefault("model", {})["classifier_hidden"] = model_state["classifier.0.weight"].shape[0]
+            if seed_channels:
+                cfg_copy.setdefault("model", {})["seed_channels"] = seed_channels
+
+        model = build_tsr(cfg_copy)
         runner = TSRRunner(
             model, train_loader, val_loader, run_dir,
-            cfg=cfg, growth_signal_mode="phantom", device=device,
+            cfg=cfg_copy, growth_signal_mode="phantom", device=device,
         )
-        return runner.run()
 
     elif variant == "tsr_heuristic":
         # Disable phantom: override growth mode in a config copy
@@ -602,7 +649,7 @@ def run_one(
     elif variant == "static_final":
         channels = static_final_channels or [8, 8, 16]
         logger.info(f"  static_final channels: {channels}")
-        model = FixedVGG(channels, num_classes=10)
+        model = FixedVGG(channels, num_classes=10, classifier_hidden=static_final_classifier)
         runner = BaselineRunner(
             model, train_loader, val_loader, run_dir,
             max_epochs=max_epochs, lr=lr, weight_decay=wd,
@@ -762,7 +809,7 @@ def main():
             sfchannels = None
             if variant == "static_final":
                 phantom_dir = results_root / "tsr_phantom" / f"seed{args.seeds[0]}"
-                sfchannels = _tsr_final_shape(phantom_dir)
+                sfchannels, sfclassifier = _tsr_final_shape(phantom_dir)
                 if sfchannels:
                     logger.info(f"  static_final will use discovered shape: {sfchannels}")
                 else:
@@ -777,6 +824,7 @@ def main():
                 results_root=results_root,
                 device=device,
                 static_final_channels=sfchannels,
+                static_final_classifier=sfclassifier
             )
             all_results[variant][seed] = result
 
