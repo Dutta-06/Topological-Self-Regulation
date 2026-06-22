@@ -6,7 +6,7 @@ model:
   name: tsr
   # Minimal seed architecture (VGG-style: stack of conv → linear classifier)
   # Each entry is the initial channel count for one conv layer
-  seed_channels: [8, 8]
+  seed_channels: [16, 16, 32]
   num_classes: 10
   # Gate initialization: sigmoid(gate_init) = initial gate openness
   gate_init: 3.0   # sigmoid(3.0) ≈ 0.95
@@ -35,12 +35,14 @@ regulation:
   #               sensors (the novel signal; default).
   #   heuristic — the original utilization×uniformity×saturation bottleneck score.
   growth_signal_mode: phantom
-  growth_rate: 0.1           # fraction of current width to add (rounded up)
-  max_neurons_per_layer: 1024 # hard cap on layer width
+  growth_rate: 0.2           # fraction of current width to add (rounded up)
+  max_neurons_per_layer: 1024 # hard cap on layer width (lower to encourage depth over width)
   bottleneck_threshold: 0.1  # heuristic-mode score above this triggers growth
   # ── Phantom sensor params (growth_signal_mode: phantom) ──
-  phantom_k: 4               # candidate phantom neurons per layer
-  phantom_threshold: 0.05    # mean |phantom gate-grad| above this triggers growth
+  phantom_k: 8               # candidate phantom neurons per layer
+  phantom_threshold: 0.005    # mean |phantom gate-grad| above this triggers growth
+  max_growth_per_update: 2   # max number of layers allowed to grow in a single update step
+  growth_cooldown_steps: 1000 # min steps between growths for the same layer
   # ── Newborn protection ──
   # Grown neurons start with gate logit newborn_gate_init (sigmoid(0.0)=0.5, alive).
   # They cannot be pruned for newborn_protect_steps training steps after birth,
@@ -55,12 +57,12 @@ regulation:
   rewire_enabled: false       # disabled for v1; enable for edge-level adaptation
   rewire_fraction: 0.1        # fraction of connections to consider per update
   # ── Layer insertion (depth adaptation) ──
-  layer_insertion_enabled: false  # set true to enable organic depth growth
+  layer_insertion_enabled: true   # enables organic depth growth (like VGG stacking layers)
   # Insert a new block when the max adjacent-layer gradient-norm ratio exceeds
   # this. The ratio is grad_norm(next) / grad_norm(prev); a large value means
   # the representational gap between two layers is too wide.
-  layer_insertion_threshold: 5.0
-  max_blocks: 16                  # hard cap on network depth
+  layer_insertion_threshold: 2.0   # was 5.0; lower = more eager to add layers
+  max_blocks: 24                  # hard cap on network depth
   # ── Scheduling ──
   cooldown_steps: 50          # min steps between structural changes per layer
   anneal_structural_rate: false  # reduce structural change rate over training
@@ -71,7 +73,7 @@ regulation:
 training:
   dataset: cifar10
   batch_size: 128
-  max_epochs: 200
+  max_epochs: 100
   max_steps: null   # if set, overrides max_epochs
   # Optimizer
   optimizer: adam

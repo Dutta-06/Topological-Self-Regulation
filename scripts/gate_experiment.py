@@ -55,7 +55,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from baselines.fixed_arch import FixedVGG
+from baselines.fixed_arch import FixedVGG, VGG_CONFIGS
 from data.cifar import get_cifar10_loaders
 from tsr.model import TSRNetwork
 from tsr.flops import compute_model_flops, CumulativeFLOPsTracker, differentiable_effective_flops
@@ -659,6 +659,26 @@ def run_one(
         )
         return runner.run()
 
+    elif variant == "vgg16":
+        logger.info(f"  vgg16 channels: {VGG_CONFIGS['vgg16']}")
+        model = FixedVGG(VGG_CONFIGS["vgg16"], num_classes=10)
+        runner = BaselineRunner(
+            model, train_loader, val_loader, run_dir,
+            max_epochs=max_epochs, lr=lr, weight_decay=wd,
+            warmup_steps=warmup, ckpt_every=ckpt_every, device=device,
+        )
+        return runner.run()
+
+    elif variant == "vgg19":
+        logger.info(f"  vgg19 channels: {VGG_CONFIGS['vgg19']}")
+        model = FixedVGG(VGG_CONFIGS["vgg19"], num_classes=10)
+        runner = BaselineRunner(
+            model, train_loader, val_loader, run_dir,
+            max_epochs=max_epochs, lr=lr, weight_decay=wd,
+            warmup_steps=warmup, ckpt_every=ckpt_every, device=device,
+        )
+        return runner.run()
+
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -735,7 +755,7 @@ def check_gate(summary: dict) -> bool:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALL_VARIANTS = ["tsr_phantom", "tsr_heuristic", "vgg_tiny", "vgg_small", "static_final"]
+ALL_VARIANTS = ["tsr_phantom", "tsr_heuristic", "vgg_tiny", "vgg_small", "static_final", "vgg16", "vgg19"]
 
 
 def main():
@@ -786,7 +806,7 @@ def main():
     data_root = cfg["data"].get("root", "./data")
     batch_size = cfg["training"].get("batch_size", 128)
     num_workers = cfg["data"].get("num_workers", 4)
-    augmentation = cfg["data"].get("augmentation", "standard")
+    augmentation = cfg["data"].get("augmentation", "full")
 
     logger.info(f"Loading CIFAR-10 from {data_root}")
     train_loader, val_loader = get_cifar10_loaders(

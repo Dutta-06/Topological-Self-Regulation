@@ -61,6 +61,16 @@ def get_baseline_models(num_classes: int = 10) -> dict:
         "vgg_medium": FixedVGG([32, 32, 64], num_classes=num_classes),
         "vgg_large": FixedVGG([64, 64, 128], num_classes=num_classes),
         "vgg_xlarge": FixedVGG([64, 64, 128, 128, 256, 256, 256], num_classes=num_classes),
-        "vgg_16_style": FixedVGG([64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512], num_classes=num_classes),
-        "vgg_19_style": FixedVGG([64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512], num_classes=num_classes),
+        "vgg_16_style": FixedVGG(VGG_CONFIGS["vgg16"], num_classes=num_classes),
+        "vgg_19_style": FixedVGG(VGG_CONFIGS["vgg19"], num_classes=num_classes),
     }
+
+
+# Standard VGG channel configurations adapted for CIFAR-10.
+# These match the original VGG paper channel widths but use AdaptiveAvgPool
+# to handle CIFAR-10's 32x32 input (no need for the full 224x224 spatial stack).
+VGG_CONFIGS: dict = {
+    "vgg16": [64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512],
+    "vgg19": [64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512],
+}
+

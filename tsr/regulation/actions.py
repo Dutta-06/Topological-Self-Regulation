@@ -366,6 +366,8 @@ def apply_structural_update(
     growth_signal_mode: str = "phantom",
     phantom_manager: Optional[nn.Module] = None,
     phantom_threshold: float = 0.05,
+    growth_cooldown_steps: int = 1000,
+    max_growth_per_update: int = 2,
     # Depth adaptation params
     depth_adaptation_enabled: bool = False,
     layer_insertion_threshold: float = 5.0,
@@ -451,12 +453,26 @@ def apply_structural_update(
                 f"Step {step}: Phantom growth signals: [{sig_str}], "
                 f"threshold={phantom_threshold:.4f}"
             )
-        for layer_name, signal in signals.items():
+        layers_grown_this_update = 0
+        sorted_signals = sorted(signals.items(), key=lambda x: x[1], reverse=True)
+
+        for layer_name, signal in sorted_signals:
+            if layers_grown_this_update >= max_growth_per_update:
+                break
             if layer_name == terminal_layer:
                 continue  # never grow the output head
             layer = tsr_layers.get(layer_name)
             if layer is None or signal < phantom_threshold:
                 continue
+
+            if hasattr(layer, 'neuron_birth_step'):
+                birth = layer.neuron_birth_step.cpu()
+                if (birth >= 0).any():
+                    last_birth = birth[birth >= 0].max().item()
+                    if step - last_birth < growth_cooldown_steps:
+                        logger.debug(f"Step {step}: Skipping growth for {layer_name} due to cooldown ({step - last_birth} < {growth_cooldown_steps})")
+                        continue
+
             width = (
                 layer.out_features if isinstance(layer, TSRLinear) else layer.out_channels
             )
@@ -478,6 +494,7 @@ def apply_structural_update(
                 phantom_manager.reset_layer(layer_name)
                 events.append(event)
                 modified_layers.add(layer_name)
+                layers_grown_this_update += 1
 
     elif growth_enabled:
         # Collect bottleneck scores for all layers

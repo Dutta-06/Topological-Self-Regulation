@@ -76,7 +76,7 @@ class PhantomProbe(nn.Module):
         self.bias = nn.Parameter(torch.zeros(k))
         # Phantom gates start near zero (dormant). Their *gradient* is the signal;
         # their value stays ~0 so phantoms never meaningfully contribute.
-        self.gate = nn.Parameter(torch.full((k,), -5.0))
+        self.gate = nn.Parameter(torch.full((k,), -2.0))
 
         # Share the host's activation mixture so the phantom senses through the
         # same nonlinearity the layer actually uses. Hold a reference to the
@@ -285,7 +285,7 @@ class PhantomManager(nn.Module):
             probe.clear()
             probe._reset_parameters()
             with torch.no_grad():
-                probe.gate.fill_(-5.0)
+                probe.gate.fill_(-2.0)
 
     def refresh(self) -> None:
         """Rebuild probes against the current module tree (after depth changes)."""
