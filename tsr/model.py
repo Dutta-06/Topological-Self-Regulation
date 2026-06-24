@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
 from tsr.layers.tsr_norm import TSRGroupNorm
+from tsr.layers.gated_connection import GatedConnection
 
 
 class TSRBlock(nn.Module):
@@ -119,11 +120,16 @@ class TSRNetwork(nn.Module):
                 pool_positions = [len(seed_channels) - 1]
         self.pool_positions = set(pool_positions)
 
-        # ── Adaptive pooling to fixed spatial size ──
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        # ── Skip connections discovered by TSR ──
+        # Keys are "src__dst" (block indices). ModuleDict so parameters are registered.
+        self.skip_connections: nn.ModuleDict = nn.ModuleDict()
+
+        # ── Adaptive pooling: Global Average Pool collapses spatial dims to 1×1 ──
+        # GAP keeps the conv→linear bridge factor at 1 (no ×16 blowup as channels grow).
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
 
         # ── Classifier head ──
-        flat_features = prev_channels * 4 * 4
+        flat_features = prev_channels  # GAP: each channel → 1 scalar
         if classifier_hidden is None:
             classifier_hidden = max(prev_channels * 2, 32)
 
@@ -132,6 +138,54 @@ class TSRNetwork(nn.Module):
             TSRGroupNorm(classifier_hidden, target_group_size=norm_group_size),
             TSRLinear(classifier_hidden, num_classes, gate_init=gate_init, act_init=act_init),
         )
+
+    def add_skip_connection(
+        self,
+        src_idx: int,
+        dst_idx: int,
+        step: int = 0,
+        gate_init: float = 0.0,
+        projection_weight: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Materialize a skip connection from block src_idx to block dst_idx.
+
+        Args:
+            src_idx: Source block index.
+            dst_idx: Destination block index (must be > src_idx).
+            step: Current training step (for newborn protection).
+            gate_init: Initial gate logit (0.0 → sigmoid=0.5, born-alive).
+            projection_weight: Optional learned weight from the phantom probe.
+
+        Returns:
+            True if connection was added, False if it already exists or indices invalid.
+        """
+        key = f"{src_idx}__{dst_idx}"
+        if key in self.skip_connections:
+            return False
+        if src_idx < 0 or dst_idx >= len(self.blocks) or src_idx >= dst_idx:
+            return False
+
+        src_ch = self.blocks[src_idx].conv.out_channels
+        dst_ch = self.blocks[dst_idx].conv.out_channels
+        conn = GatedConnection(src_ch, dst_ch, is_conv=True, gate_init=gate_init, step=step)
+
+        if projection_weight is not None and not isinstance(conn.projection, nn.Identity):
+            with torch.no_grad():
+                if conn.projection.weight.shape == projection_weight.shape:
+                    conn.projection.weight.copy_(projection_weight)
+
+        device = next(self.parameters()).device
+        conn = conn.to(device)
+        self.skip_connections[key] = conn
+        return True
+
+    def prune_skip_connection(self, src_idx: int, dst_idx: int) -> bool:
+        """Remove a skip connection. Returns True if it existed."""
+        key = f"{src_idx}__{dst_idx}"
+        if key not in self.skip_connections:
+            return False
+        del self.skip_connections[key]
+        return True
 
     def insert_block(self, after_index: int) -> None:
         """Dynamically insert a new TSRBlock after the specified index.
@@ -181,7 +235,7 @@ class TSRNetwork(nn.Module):
         self.pool_positions = new_pool_positions
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through conv blocks → pool → classifier.
+        """Forward pass through conv blocks (with skip connections) → GAP → classifier.
 
         Args:
             x: Input images of shape (batch, channels, H, W).
@@ -189,13 +243,23 @@ class TSRNetwork(nn.Module):
         Returns:
             Logits of shape (batch, num_classes).
         """
+        block_outputs: List[torch.Tensor] = []
+
         for i, block in enumerate(self.blocks):
-            x = block(x)
-            if i in self.pool_positions:
-                x = F.max_pool2d(x, 2)
+            h = block(x)
+
+            # Add contributions from any incoming skip connections
+            for key, conn in self.skip_connections.items():
+                src_idx, dst_idx = (int(v) for v in key.split("__"))
+                if dst_idx == i:
+                    h = h + conn(block_outputs[src_idx], dst_spatial=h.shape[-2:])
+
+            block_outputs.append(h)
+
+            x = F.max_pool2d(h, 2) if i in self.pool_positions else h
 
         x = self.adaptive_pool(x)
-        x = x.flatten(1)  # (batch, channels * 4 * 4)
+        x = x.flatten(1)  # (batch, channels) after GAP
         x = self.classifier(x)
         return x
 
@@ -214,6 +278,7 @@ class TSRNetwork(nn.Module):
         """
         state = {
             "blocks": [],
+            "skip_connections": [],
             "classifier_layers": [],
             "total_params": sum(p.numel() for p in self.parameters()),
             "trainable_params": sum(p.numel() for p in self.parameters() if p.requires_grad),
@@ -231,6 +296,17 @@ class TSRNetwork(nn.Module):
                 "gate_max": conv.gate_values().max().item(),
                 "dominant_activation": conv.dominant_activation(),
                 "activation_distribution": conv.activation_distribution(),
+            })
+
+        for key, conn in self.skip_connections.items():
+            src_idx, dst_idx = (int(v) for v in key.split("__"))
+            state["skip_connections"].append({
+                "src": src_idx,
+                "dst": dst_idx,
+                "gate_value": conn.gate_value(),
+                "src_channels": conn.src_channels,
+                "dst_channels": conn.dst_channels,
+                "birth_step": int(conn.birth_step.item()),
             })
 
         for i, module in enumerate(self.classifier):
@@ -258,8 +334,11 @@ class TSRNetwork(nn.Module):
                 )
 
         total = sum(p.numel() for p in self.parameters())
+        skips = len(self.skip_connections)
+        skip_str = f", skips={skips}" if skips else ""
         return (
             f"TSR[conv={'→'.join(channels)}, "
-            f"fc={'→'.join(classifier_info)}, "
+            f"fc={'→'.join(classifier_info)}"
+            f"{skip_str}, "
             f"params={total:,}]"
         )

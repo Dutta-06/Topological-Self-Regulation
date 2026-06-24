@@ -35,7 +35,7 @@ path nor the existing monitor. Enable it from the trainer; disable it and TSR
 behaves exactly as before.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -88,6 +88,10 @@ class PhantomProbe(nn.Module):
 
         # Windowed accumulator of per-phantom gate-gradient (filled by a hook).
         self._grad_window: List[torch.Tensor] = []
+        # Windowed accumulator of the host's real gate-gradient scale (for normalization).
+        # Normalizing phantom signal by real gate grad scale makes growth decisions
+        # scale-invariant: "does this candidate help more than the average existing neuron?"
+        self._real_grad_window: List[torch.Tensor] = []
 
         self._reset_parameters()
 
@@ -135,14 +139,23 @@ class PhantomProbe(nn.Module):
     def record_gate_grad(self) -> None:
         """Snapshot the current phantom gate gradient into the window.
 
-        Call after ``loss.backward()``. The accumulated mean is the measured
-        growth signal per phantom.
+        Also records the host layer's real gate gradient scale so best_signal()
+        can normalize: signal = phantom_grad / real_grad_scale.
+
+        Call after ``loss.backward()``.
         """
         if self.gate.grad is None:
             return
         self._grad_window.append(self.gate.grad.detach().abs().cpu())
         if len(self._grad_window) > self.window:
             self._grad_window.pop(0)
+        # Track host real gate grad scale for normalization
+        host = self._host
+        if host.gate.grad is not None:
+            scale = host.gate.grad.detach().abs().mean().cpu()
+            self._real_grad_window.append(scale)
+            if len(self._real_grad_window) > self.window:
+                self._real_grad_window.pop(0)
 
     def signal(self) -> Optional[torch.Tensor]:
         """Windowed mean |gate-gradient| per phantom, or None if no data yet."""
@@ -150,10 +163,25 @@ class PhantomProbe(nn.Module):
             return None
         return torch.stack(self._grad_window).mean(dim=0)
 
+    def real_gate_grad_scale(self) -> float:
+        """Windowed mean |host gate gradient| — used to normalize phantom signal."""
+        if not self._real_grad_window:
+            return 1.0
+        return float(torch.stack(self._real_grad_window).mean().item())
+
     def best_signal(self) -> float:
-        """Scalar growth signal for the host layer = strongest phantom."""
+        """Scale-invariant growth signal: strongest phantom grad / host real grad scale.
+
+        Semantics: "how much more than an average existing neuron would this candidate help?"
+        A ratio > 1 means the candidate is more useful than the average existing neuron.
+        This tracks the moving gradient scale so late-training convergence (small absolute
+        gradients everywhere) does not cause false-stops.
+        """
         sig = self.signal()
-        return float(sig.max().item()) if sig is not None else 0.0
+        if sig is None:
+            return 0.0
+        scale = self.real_gate_grad_scale()
+        return float((sig / (scale + 1e-8)).max().item())
 
     def best_phantom_index(self) -> Optional[int]:
         """Index of the phantom with the strongest signal (the one to materialize)."""
@@ -162,6 +190,7 @@ class PhantomProbe(nn.Module):
 
     def clear(self) -> None:
         self._grad_window.clear()
+        self._real_grad_window.clear()
 
 
 class PhantomManager(nn.Module):
@@ -315,3 +344,206 @@ class PhantomManager(nn.Module):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection-level phantom sensors
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConnectionPhantomProbe(nn.Module):
+    """Dormant sensor for a candidate skip edge (src_block → dst_block).
+
+    Uses the same hard-zero trick as PhantomProbe: the candidate projection
+    contributes identically zero to the forward output, but its gate receives a
+    gradient that measures the marginal utility of adding that edge.
+
+    The signal is normalized by the mean real gate gradient across both endpoint
+    blocks (same scale-invariance principle as PhantomProbe.best_signal).
+
+    Args:
+        src_channels: Output channels of the source block.
+        dst_channels: Output channels of the destination block.
+        is_conv: True for conv blocks; False for linear blocks.
+        window: Sliding-window length for gradient averaging.
+    """
+
+    def __init__(
+        self,
+        src_channels: int,
+        dst_channels: int,
+        is_conv: bool = True,
+        window: int = 100,
+    ):
+        super().__init__()
+        self.is_conv = is_conv
+        self.window = window
+
+        # Dormant gate — stays near zero so it never contributes forward; gradient is signal.
+        self.gate = nn.Parameter(torch.tensor(-2.0))
+
+        if is_conv:
+            self.projection = nn.Conv2d(src_channels, dst_channels, kernel_size=1, bias=False)
+            nn.init.kaiming_uniform_(self.projection.weight, a=5 ** 0.5)
+        else:
+            self.projection = nn.Linear(src_channels, dst_channels, bias=False)
+            nn.init.kaiming_uniform_(self.projection.weight, a=5 ** 0.5)
+
+        self._grad_window: List[torch.Tensor] = []
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        dst_spatial: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """Hard-zero contribution with live gradient to self.gate."""
+        h = self.projection(src)
+        if self.is_conv and dst_spatial is not None:
+            h_dst, w_dst = dst_spatial
+            if h.shape[-2] != h_dst or h.shape[-1] != w_dst:
+                h = F.adaptive_avg_pool2d(h, (h_dst, w_dst))
+        g = torch.sigmoid(self.gate)
+        if self.is_conv:
+            return ((g - g.detach()) * h).sum()
+        return ((g - g.detach()) * h).sum()
+
+    def record_gate_grad(self) -> None:
+        if self.gate.grad is None:
+            return
+        self._grad_window.append(self.gate.grad.detach().abs().cpu())
+        if len(self._grad_window) > self.window:
+            self._grad_window.pop(0)
+
+    def signal(self) -> float:
+        if not self._grad_window:
+            return 0.0
+        return float(torch.stack(self._grad_window).mean().item())
+
+    def clear(self) -> None:
+        self._grad_window.clear()
+
+    def materialize_projection(self):
+        """Return projection weight (and bias if any) for initializing a real GatedConnection."""
+        with torch.no_grad():
+            w = self.projection.weight.data.clone()
+            b = getattr(self.projection, "bias", None)
+            return w, (b.data.clone() if b is not None else None)
+
+
+class ConnectionPhantomManager(nn.Module):
+    """Owns dormant probes for candidate skip edges and drives the connection-growth signal.
+
+    Candidate edges are generated per the vision vocabulary: skips spanning 2–4 blocks
+    (configurable via max_skip_span). Edges that already exist in the model are excluded.
+
+    Args:
+        model: The TSRNetwork instance.
+        max_skip_span: Maximum number of blocks to span (e.g. 4 means src+4=dst).
+        window: Sliding-window length for gradient averaging.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        max_skip_span: int = 4,
+        window: int = 100,
+    ):
+        super().__init__()
+        object.__setattr__(self, "model", model)
+        self.max_skip_span = max_skip_span
+        self.window = window
+
+        self.probes: nn.ModuleDict = nn.ModuleDict()
+        self._captured: Dict[int, torch.Tensor] = {}  # block_idx → output tensor
+        self._hooks: list = []
+
+        self._attach()
+
+    @staticmethod
+    def _key(src: int, dst: int) -> str:
+        return f"{src}__{dst}"
+
+    def _attach(self) -> None:
+        model = self.model
+        if not hasattr(model, "blocks"):
+            return
+        n = len(model.blocks)
+        existing = set(getattr(model, "skip_connections", {}).keys())
+
+        for src in range(n):
+            for dst in range(src + 2, min(src + self.max_skip_span + 1, n)):
+                key = self._key(src, dst)
+                if key in existing:
+                    continue
+                src_ch = model.blocks[src].conv.out_channels
+                dst_ch = model.blocks[dst].conv.out_channels
+                self.probes[key] = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
+
+        # Forward hooks to capture block outputs
+        self._hooks.clear()
+        self._captured.clear()
+        for i, block in enumerate(model.blocks):
+            h = block.register_forward_hook(self._make_capture_hook(i))
+            self._hooks.append(h)
+
+    def _make_capture_hook(self, idx: int):
+        def hook(module, inputs, output):
+            self._captured[idx] = output
+        return hook
+
+    def aux_loss(self) -> torch.Tensor:
+        """Summed hard-zero probe contributions. Add to training loss before backward."""
+        device = next(self.model.parameters()).device
+        total = torch.zeros((), device=device)
+        for key, probe in self.probes.items():
+            src_idx, dst_idx = (int(x) for x in key.split("__"))
+            src_feat = self._captured.get(src_idx)
+            dst_feat = self._captured.get(dst_idx)
+            if src_feat is None or dst_feat is None:
+                continue
+            dst_spatial = dst_feat.shape[-2:] if probe.is_conv else None
+            total = total + probe(src_feat.detach(), dst_spatial)
+        return total
+
+    def record_gradients(self) -> None:
+        for probe in self.probes.values():
+            probe.record_gate_grad()
+
+    def growth_signals(self, real_gate_scale: float = 1.0) -> Dict[str, float]:
+        """Return normalized signal per candidate edge, keyed by 'src__dst'."""
+        return {
+            key: probe.signal() / (real_gate_scale + 1e-8)
+            for key, probe in self.probes.items()
+        }
+
+    def remove_hooks(self) -> None:
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def refresh(self) -> None:
+        """Rebuild probes after depth/width changes."""
+        self.remove_hooks()
+        old_probes = dict(self.probes)
+        self.probes = nn.ModuleDict()
+        self._captured.clear()
+        model = self.model
+        if not hasattr(model, "blocks"):
+            return
+        n = len(model.blocks)
+        existing = set(getattr(model, "skip_connections", {}).keys())
+        for src in range(n):
+            for dst in range(src + 2, min(src + self.max_skip_span + 1, n)):
+                key = self._key(src, dst)
+                if key in existing:
+                    continue
+                src_ch = model.blocks[src].conv.out_channels
+                dst_ch = model.blocks[dst].conv.out_channels
+                probe = old_probes.get(key)
+                if probe is None or probe.projection.weight.shape != (dst_ch, src_ch, 1, 1):
+                    probe = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
+                    device = next(self.model.parameters()).device
+                    probe = probe.to(device)
+                self.probes[key] = probe
+        for i, block in enumerate(model.blocks):
+            h = block.register_forward_hook(self._make_capture_hook(i))
+            self._hooks.append(h)

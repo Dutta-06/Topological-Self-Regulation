@@ -40,7 +40,10 @@ regulation:
   bottleneck_threshold: 0.1  # heuristic-mode score above this triggers growth
   # ── Phantom sensor params (growth_signal_mode: phantom) ──
   phantom_k: 8               # candidate phantom neurons per layer
-  phantom_threshold: 0.005    # mean |phantom gate-grad| above this triggers growth
+  # Relative threshold: phantom_signal / real_gate_grad_scale > this triggers growth.
+  # A ratio of 1.0 means "the candidate is as useful as the average existing neuron."
+  # Typical useful range: 0.5–2.0. Lower = more eager to grow; higher = more conservative.
+  phantom_threshold: 1.0
   max_growth_per_update: 2   # max number of layers allowed to grow in a single update step
   growth_cooldown_steps: 1000 # min steps between growths for the same layer
   # ── Newborn protection ──
@@ -53,6 +56,15 @@ regulation:
   # Coefficient on the differentiable effective-FLOPs penalty. >0 makes the
   # network size itself to the budget implied by the price. 0.0 disables.
   flops_price: 0.0
+  # ── Connection-level plasticity (skip/residual edges) ──
+  # TSR grows and prunes gated skip connections between conv blocks using the same
+  # phantom sensor + sparsity pressure machinery as neurons.
+  connection_plasticity_enabled: true
+  # Relative signal threshold for materializing a new skip edge.
+  # Same scale as phantom_threshold (normalized by real gate grad scale).
+  connection_threshold: 1.0
+  # Maximum block span for candidate skip edges (e.g. 4 = skip from block i to i+2..i+4).
+  max_skip_span: 4
   # ── Rewiring ──
   rewire_enabled: false       # disabled for v1; enable for edge-level adaptation
   rewire_fraction: 0.1        # fraction of connections to consider per update

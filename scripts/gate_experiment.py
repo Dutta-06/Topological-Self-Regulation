@@ -277,18 +277,29 @@ class TSRRunner:
             "layer_insertion_threshold": reg_cfg.get("layer_insertion_threshold", 5.0),
             "max_blocks": reg_cfg.get("max_blocks", 16),
             "growth_signal_mode": growth_signal_mode,
-            "phantom_threshold": reg_cfg.get("phantom_threshold", 0.05),
+            "phantom_threshold": reg_cfg.get("phantom_threshold", 1.0),
+            "connection_threshold": reg_cfg.get("connection_threshold", 1.0),
+            "max_skip_span": reg_cfg.get("max_skip_span", 4),
+            "max_growth_per_update": reg_cfg.get("max_growth_per_update", 2),
+            "growth_cooldown_steps": reg_cfg.get("growth_cooldown_steps", 1000),
         }
 
         # Phantom manager (only for phantom mode)
         self.phantom_manager = None
+        self.connection_phantom_manager = None
         if growth_signal_mode == "phantom":
-            from tsr.regulation.phantom import PhantomManager
+            from tsr.regulation.phantom import PhantomManager, ConnectionPhantomManager
             self.phantom_manager = PhantomManager(
                 model,
                 k=reg_cfg.get("phantom_k", 4),
                 window=reg_cfg.get("monitor_window", 100),
             ).to(device)
+            if reg_cfg.get("connection_plasticity_enabled", True):
+                self.connection_phantom_manager = ConnectionPhantomManager(
+                    model,
+                    max_skip_span=reg_cfg.get("max_skip_span", 4),
+                    window=reg_cfg.get("monitor_window", 100),
+                ).to(device)
 
         self.optimizer_cls = torch.optim.Adam
         self.optimizer_kwargs = {"lr": lr, "weight_decay": wd}
@@ -303,6 +314,7 @@ class TSRRunner:
             gate_lr_multiplier=gate_lr_mult, act_lr_multiplier=act_lr_mult,
         )
         self._add_phantom_group()
+        self._add_connection_phantom_group()
 
         total_steps = self.max_epochs * len(train_loader)
         self.warmup = warmup
@@ -321,6 +333,9 @@ class TSRRunner:
         )
 
         self.flops_tracker = CumulativeFLOPsTracker()
+        # Cache FLOPs: recomputing every step is O(model_size) and dominates wall-time
+        # at larger model sizes. Recompute only after structural changes (model shape changes).
+        self._cached_fwd_flops = compute_model_flops(self.model, INPUT_SHAPE)
         self.step = 0
         self.best_val_acc = 0.0
         self.events: list = []
@@ -357,6 +372,21 @@ class TSRRunner:
                 "params": params,
                 "lr": self.optimizer_kwargs["lr"],
                 "group_name": "phantom",
+            })
+
+    def _add_connection_phantom_group(self):
+        if self.connection_phantom_manager is None:
+            return
+        existing_ids = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
+        new_params = [
+            p for p in self.connection_phantom_manager.parameters()
+            if p.requires_grad and id(p) not in existing_ids
+        ]
+        if new_params:
+            self.optimizer.add_param_group({
+                "params": new_params,
+                "lr": self.optimizer_kwargs["lr"],
+                "group_name": "connection_phantom",
             })
 
     def run(self) -> dict:
@@ -402,21 +432,27 @@ class TSRRunner:
                     )
                 if self.phantom_manager is not None:
                     loss = loss + self.phantom_manager.aux_loss()
+                if self.connection_phantom_manager is not None:
+                    loss = loss + self.connection_phantom_manager.aux_loss()
 
                 loss.backward()
 
                 if self.phantom_manager is not None:
                     self.phantom_manager.record_gradients()
+                if self.connection_phantom_manager is not None:
+                    self.connection_phantom_manager.record_gradients()
 
                 self.optimizer.step()
                 self.scheduler.step()
 
                 self.monitor.record_loss(task_loss.item())
-                fwd_flops = compute_model_flops(self.model, INPUT_SHAPE)
-                self.flops_tracker.record_step(fwd_flops, data.size(0))
+                self.flops_tracker.record_step(self._cached_fwd_flops, data.size(0))
 
                 if self.structural_scheduler.should_update(self.step):
                     new_events = self._structural_step()
+                    if new_events:
+                        # Model shape changed — recompute cached FLOPs once
+                        self._cached_fwd_flops = compute_model_flops(self.model, INPUT_SHAPE)
                     for ev in new_events:
                         _write_jsonl(events_path, ev.to_dict())
                         topo = capture_topology(self.model, self.step)
@@ -467,6 +503,7 @@ class TSRRunner:
             monitor=self.monitor,
             step=self.step,
             phantom_manager=self.phantom_manager,
+            connection_phantom_manager=self.connection_phantom_manager,
             **self.reg_config,
         )
         if events:
@@ -475,6 +512,8 @@ class TSRRunner:
                 self.monitor.refresh_hooks()
             if self.phantom_manager is not None:
                 self.phantom_manager.refresh()
+            if self.connection_phantom_manager is not None:
+                self.connection_phantom_manager.refresh()
 
             self.optimizer = rebuild_optimizer(
                 self.model, self.optimizer_cls, self.optimizer_kwargs,
@@ -483,6 +522,7 @@ class TSRRunner:
                 act_lr_multiplier=self.act_lr_mult,
             )
             self._add_phantom_group()
+            self._add_connection_phantom_group()
 
             for group in self.optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])

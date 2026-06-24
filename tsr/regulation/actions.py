@@ -70,6 +70,23 @@ class StructuralEvent:
         }
 
 
+def _conv_to_linear_bridge_factor(model: nn.Module) -> int:
+    """Spatial factor by which one conv output channel maps to linear input features.
+
+    With AdaptiveAvgPool2d((H, W)), each conv channel expands to H*W linear inputs.
+    GAP ((1,1)) → factor = 1; legacy 4×4 → factor = 16.
+    Derived from the model rather than hardcoded so changing pool size is not a bug.
+    """
+    pool = getattr(model, "adaptive_pool", None)
+    if pool is None:
+        return 1
+    os = getattr(pool, "output_size", (1, 1))
+    if isinstance(os, int):
+        return os * os
+    h, w = os
+    return int(h) * int(w)
+
+
 def _get_layer_pair(
     model: nn.Module,
     layer_name: str,
@@ -241,10 +258,10 @@ def prune_neurons_paired(
     # 2. Update the next layer's input dimension
     if next_layer is not None:
         if isinstance(next_layer, TSRLinear) and isinstance(target, TSRConv2d):
-            # Bridging Conv -> Linear: multiply by spatial size (4x4 = 16)
+            bridge = _conv_to_linear_bridge_factor(model)
             linear_indices = []
             for idx in indices.tolist():
-                linear_indices.extend(range(idx * 16, (idx + 1) * 16))
+                linear_indices.extend(range(idx * bridge, (idx + 1) * bridge))
             next_layer.prune_input_channels(
                 torch.tensor(linear_indices, device=indices.device)
             )
@@ -254,6 +271,23 @@ def prune_neurons_paired(
     # 3. Resize any norm layer between them
     if norm is not None:
         norm.resize(new_size)
+
+    # Remove skip connections referencing this block (projection shapes are now stale).
+    block_idx = None
+    parts = layer_name.split(".")
+    if len(parts) >= 2 and parts[0] == "blocks":
+        try:
+            block_idx = int(parts[1])
+        except ValueError:
+            pass
+    if block_idx is not None and hasattr(model, "skip_connections"):
+        stale = [
+            key for key in list(model.skip_connections.keys())
+            if any(int(v) == block_idx for v in key.split("__"))
+        ]
+        for key in stale:
+            del model.skip_connections[key]
+            logger.debug(f"Step {step}: Removed stale skip {key} (block {block_idx} pruned)")
 
     event = StructuralEvent(
         step=step,
@@ -321,14 +355,32 @@ def grow_neurons_paired(
     # 2. Update the next layer's input dimension
     if next_layer is not None:
         if isinstance(next_layer, TSRLinear) and isinstance(target, TSRConv2d):
-            # Bridging Conv -> Linear: multiply by spatial size (4x4 = 16)
-            next_layer.grow_input_channels(n * 16)
+            bridge = _conv_to_linear_bridge_factor(model)
+            next_layer.grow_input_channels(n * bridge)
         elif isinstance(next_layer, (TSRLinear, TSRConv2d)):
             next_layer.grow_input_channels(n)
 
     # 3. Resize any norm layer between them
     if norm is not None:
         norm.resize(new_size)
+
+    # Skip connections referencing this block by index are now shape-invalid.
+    # Remove them; the connection phantom will rediscover them at the next update.
+    block_idx = None
+    parts = layer_name.split(".")
+    if len(parts) >= 2 and parts[0] == "blocks":
+        try:
+            block_idx = int(parts[1])
+        except ValueError:
+            pass
+    if block_idx is not None and hasattr(model, "skip_connections"):
+        stale = [
+            key for key in list(model.skip_connections.keys())
+            if any(int(v) == block_idx for v in key.split("__"))
+        ]
+        for key in stale:
+            del model.skip_connections[key]
+            logger.debug(f"Step {step}: Removed stale skip {key} (block {block_idx} grew)")
 
     event = StructuralEvent(
         step=step,
@@ -372,6 +424,10 @@ def apply_structural_update(
     depth_adaptation_enabled: bool = False,
     layer_insertion_threshold: float = 5.0,
     max_blocks: int = 16,
+    # Connection-level plasticity params
+    connection_phantom_manager: Optional[nn.Module] = None,
+    connection_threshold: float = 1.0,
+    max_skip_span: int = 4,
 ) -> List[StructuralEvent]:
     """Execute one full structural update cycle across all layers.
 
@@ -615,11 +671,82 @@ def apply_structural_update(
     for layer_name in modified_layers:
         monitor.reset_layer(layer_name)
 
+    # ── Phase 5: Connection-level plasticity ──
+    if connection_phantom_manager is not None and hasattr(model, "skip_connections"):
+        # Compute normalizer: mean real gate grad scale across all probed layers
+        if phantom_manager is not None and hasattr(phantom_manager, "probes"):
+            scales = [
+                probe.real_gate_grad_scale()
+                for probe in phantom_manager.probes.values()
+            ]
+            real_scale = sum(scales) / max(len(scales), 1)
+        else:
+            real_scale = 1.0
+
+        # Prune existing skip connections whose gate fell below death_threshold
+        # (same death criterion as neurons, with newborn protection)
+        for key in list(model.skip_connections.keys()):
+            conn = model.skip_connections[key]
+            gate_val = conn.gate_value()
+            if gate_val < death_threshold:
+                age = step - int(conn.birth_step.item())
+                if age >= newborn_protect_steps:
+                    src_idx, dst_idx = (int(v) for v in key.split("__"))
+                    model.prune_skip_connection(src_idx, dst_idx)
+                    events.append(StructuralEvent(
+                        step=step,
+                        layer_name=f"skip_{src_idx}__{dst_idx}",
+                        action="prune_connection",
+                        details={"src": src_idx, "dst": dst_idx, "gate": gate_val},
+                    ))
+                    logger.info(
+                        f"Step {step}: Pruned skip {src_idx}→{dst_idx} (gate={gate_val:.4f})"
+                    )
+
+        # Grow new skip connections where the phantom signal is strong
+        if growth_enabled:
+            conn_signals = connection_phantom_manager.growth_signals(real_gate_scale=real_scale)
+            sorted_conn = sorted(conn_signals.items(), key=lambda x: x[1], reverse=True)
+            conn_grown = 0
+            for key, signal in sorted_conn:
+                if conn_grown >= max_growth_per_update:
+                    break
+                if signal < connection_threshold:
+                    break
+                if key in model.skip_connections:
+                    continue
+                src_idx, dst_idx = (int(v) for v in key.split("__"))
+                proj_w, _ = connection_phantom_manager.probes[key].materialize_projection()
+                added = model.add_skip_connection(
+                    src_idx, dst_idx,
+                    step=step,
+                    gate_init=newborn_gate_init,
+                    projection_weight=proj_w,
+                )
+                if added:
+                    events.append(StructuralEvent(
+                        step=step,
+                        layer_name=f"skip_{src_idx}__{dst_idx}",
+                        action="grow_connection",
+                        details={
+                            "src": src_idx, "dst": dst_idx,
+                            "signal": signal, "threshold": connection_threshold,
+                        },
+                    ))
+                    logger.info(
+                        f"Step {step}: Added skip {src_idx}→{dst_idx} "
+                        f"(signal={signal:.4f} > threshold={connection_threshold:.4f})"
+                    )
+                    conn_grown += 1
+                    # Rebuild probes so the new edge is excluded and channel changes are reflected
+                    connection_phantom_manager.refresh()
+
     if events:
         logger.info(
             f"Step {step}: {len(events)} structural events "
             f"({sum(1 for e in events if e.action == 'prune')} prune, "
-            f"{sum(1 for e in events if e.action == 'grow')} grow)"
+            f"{sum(1 for e in events if e.action == 'grow')} grow, "
+            f"{sum(1 for e in events if 'connection' in e.action)} connection)"
         )
     else:
         logger.debug(f"Step {step}: No structural events (scores below threshold)")
