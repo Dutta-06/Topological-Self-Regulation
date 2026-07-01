@@ -1,6 +1,16 @@
 # Gate Experiment v3 — Run Instructions
 
-Two experiments to run in sequence. **Do not reuse `gate_v2/`** — the architecture changes (GAP bridge, connection plasticity) change what the numbers mean.
+**Do not reuse `gate_v2/`** — the architecture changes (GAP bridge, connection plasticity, normalization fix) change what the numbers mean.
+
+## TL;DR — one command
+
+```bash
+bash run_experiments.sh
+```
+
+Runs everything — `tsr_phantom`, `tsr_heuristic`, `vgg_tiny`, `vgg_small`, `static_final`, `vgg16`, `vgg19`, `resnet_sanity` — 3 seeds, 100 epochs each, into `gate_v3_full/`. `vgg16`/`vgg19` are ~15-20M params each, so expect this to take several hours on a single GPU. Use `bash run_experiments.sh --smoke` first (1 seed, 5 epochs, a few minutes) to confirm the pipeline runs clean on your machine before committing to the full run. Add `--with-pareto` to also run the λ-FLOPs budget experiment afterward into `gate_v3_pareto/`.
+
+Everything below is reference detail for what each variant means and how to read the output — the single command above is all you need to kick it off.
 
 ---
 
@@ -13,6 +23,11 @@ Two experiments to run in sequence. **Do not reuse `gate_v2/`** — the architec
 | Scale-invariant phantom signal | Raw `|∂L/∂phantom_gate|` false-stops at convergence; now normalized by `mean |∂L/∂real_gate|` so signal is "is this candidate more useful than the average existing neuron?" | `tsr/regulation/phantom.py` |
 | `compute_model_flops` cached between structural steps | Was recomputed every training step — O(model_size) per step, 5-10× slowdown as network grew | `scripts/gate_experiment.py` |
 | **Connection-level plasticity** | TSR now grows/prunes gated skip connections between conv blocks (same phantom sensor + born-alive + sparsity machinery applied to edges). This is what allows TSR to break the plain-VGG 90% ceiling. | `tsr/layers/gated_connection.py`, `tsr/model.py`, `tsr/regulation/actions.py`, `tsr/regulation/phantom.py` |
+| One-candidate-per-destination + per-destination signal normalization | An earlier free-form generator (all src→dst pairs, single global gradient scale) piled every candidate onto the last block (`*→11`), since raw gradients are largest near the loss. Now exactly one candidate per destination (`src = dst - 2`, a standard residual unit) with per-destination normalization — output fan-in is structurally impossible. | `tsr/regulation/phantom.py` (`ConnectionPhantomManager`) |
+| Skip connections grow/prune in place instead of being deleted | Channel growth on an endpoint block used to delete any touching skip connection outright, forcing rediscovery from scratch and bypassing `newborn_protect_steps`. Now the projection resizes in place (with Identity→Conv2d promotion when a mismatch first appears), preserving learned weights, gate value, and birth_step. | `tsr/layers/gated_connection.py`, `tsr/regulation/actions.py` |
+| `static_final` reconstructs discovered skip connections + matched head | `capture_topology()` previously didn't serialize skip connections at all (a dead `model.topology_state()` method did, but nothing read it) — so the CORE control (`tsr_phantom` vs `static_final`) was comparing a net with skips against one without. Now `final.json`'s `topology_state` includes `skip_connections` + `pool_positions`, and `FixedVGG` rebuilds them exactly, with the same GAP head as TSR. | `tsr/topology.py`, `baselines/fixed_arch.py`, `scripts/gate_experiment.py` |
+| `_make_gn` normalization bug fixed | Every static baseline (`vgg_tiny`, `vgg_small`, `static_final`, `vgg16`, `vgg19`, `resnet_sanity`) was using near-InstanceNorm (1 channel/group for any channel count ≤32) instead of proper GroupNorm, while TSR itself correctly used ~8 channels/group — a hidden confound favoring TSR in every prior baseline comparison. Now matches `TSRGroupNorm` exactly. | `baselines/fixed_arch.py` |
+| `resnet_sanity` baseline added | ResNet-20-style (GroupNorm, GAP head) competitor — confirms whether real residual shortcuts clear the plain-VGG ceiling under this identical recipe, independent of TSR's own discovery process. | `baselines/fixed_arch.py`, `scripts/gate_experiment.py` |
 
 ---
 

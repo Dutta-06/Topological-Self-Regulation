@@ -269,7 +269,8 @@ class TSRNetwork(nn.Module):
 
             block_outputs.append(h)
 
-            x = F.max_pool2d(h, 2) if i in self.pool_positions else h
+            # Guard against over-downsampling past 1x1 spatial size.
+            x = F.max_pool2d(h, 2) if (i in self.pool_positions and h.shape[-1] > 1) else h
 
         x = self.adaptive_pool(x)
         x = x.flatten(1)  # (batch, channels) after GAP

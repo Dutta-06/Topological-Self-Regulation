@@ -3,9 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
-def _make_gn(channels: int) -> nn.GroupNorm:
-    num_groups = next(g for g in range(min(32, channels), 0, -1) if channels % g == 0)
-    return nn.GroupNorm(num_groups, channels)
+def _make_gn(channels: int, target_group_size: int = 8) -> nn.GroupNorm:
+    """GroupNorm targeting ~target_group_size channels per group.
+
+    Matches TSRGroupNorm._compute_num_groups exactly, so static baselines get
+    the same normalization granularity as TSR rather than a stricter one. The
+    previous version searched for the largest group COUNT dividing channels
+    (range(min(32,channels), 0, -1)), which for any channels <= 32 immediately
+    returns num_groups == channels — i.e. 1 channel per group (InstanceNorm),
+    far noisier than TSR's ~8-channels-per-group and a hidden confound favoring
+    TSR in every baseline comparison (vgg_tiny, vgg_small, static_final, etc).
+    """
+    if channels <= 0:
+        return nn.GroupNorm(1, max(channels, 1))
+    ideal_groups = max(1, channels // target_group_size)
+    best = 1
+    for g in range(1, ideal_groups + 1):
+        if channels % g == 0:
+            best = g
+    return nn.GroupNorm(best, channels)
 
 
 class VGGBlock(nn.Module):
@@ -190,7 +206,12 @@ class FixedVGG(nn.Module):
                     h = h + proj(block_outputs[src_idx], h.shape[-2:])
 
             block_outputs.append(h)
-            x = F.max_pool2d(h, 2) if i in self.pool_positions else h
+            # Guard against over-downsampling: deep fixed channel lists (vgg16/vgg19)
+            # applying the every-2nd-block default across 13+ blocks would otherwise
+            # halve spatial size past 1x1 and crash. TSR itself avoids this because
+            # insert_block only shifts existing pool positions rather than adding new
+            # ones as depth grows; a long static list has no such protection.
+            x = F.max_pool2d(h, 2) if (i in self.pool_positions and h.shape[-1] > 1) else h
 
         x = self.pool(x)
         x = x.flatten(1)
