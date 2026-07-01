@@ -63,8 +63,12 @@ regulation:
   # Relative signal threshold for materializing a new skip edge.
   # Same scale as phantom_threshold (normalized by real gate grad scale).
   connection_threshold: 1.0
-  # Maximum block span for candidate skip edges (e.g. 4 = skip from block i to i+2..i+4).
-  max_skip_span: 4
+  # Residual-unit span: candidate edges are src=dst-max_skip_span (exactly ONE
+  # candidate per destination block — a standard 2-conv residual unit at span=2).
+  # This is deliberate, not O(L^2): one-candidate-per-destination makes output
+  # fan-in structurally impossible, keeping the discovered topology a regular
+  # residual backbone instead of everything piling onto the last block.
+  max_skip_span: 2
   # ── Rewiring ──
   rewire_enabled: false       # disabled for v1; enable for edge-level adaptation
   rewire_fraction: 0.1        # fraction of connections to consider per update

@@ -66,6 +66,109 @@ class GatedConnection(nn.Module):
         with torch.no_grad():
             return torch.sigmoid(self.gate).item()
 
+    # ------------------------------------------------------------------
+    # Grow-in-place: when an endpoint block's channel count changes, resize
+    # the projection instead of deleting the connection. This preserves the
+    # connection's learned state, gate value, and birth_step (so
+    # newborn_protect_steps stays meaningful) across endpoint growth — the
+    # same principle TSRConv2d.grow_channels/grow_input_channels already use
+    # for neurons. Before this, a connection was deleted and rediscovered
+    # from scratch every time either endpoint grew, which happens constantly
+    # during the early bootstrap phase and defeated newborn protection.
+    # ------------------------------------------------------------------
+
+    def _rebuild_conv_projection(self, new_src: int, new_dst: int, weight: torch.Tensor) -> None:
+        conv = nn.Conv2d(new_src, new_dst, kernel_size=1, bias=False)
+        with torch.no_grad():
+            conv.weight.copy_(weight)
+        self.projection = conv.to(self.gate.device)
+        self.src_channels = new_src
+        self.dst_channels = new_dst
+
+    def grow_dst_channels(self, n: int) -> None:
+        """Destination block grew n new channels; extend the projection's output.
+
+        New output rows are zero-init so the added capacity starts silent (no
+        forward disruption) and must earn a nonzero projection via gradient,
+        consistent with how new neurons start at small/zero-init weights.
+        """
+        if n <= 0 or not self.is_conv:
+            return
+        device = self.gate.device
+        if isinstance(self.projection, nn.Identity):
+            # Identity only holds while src==dst; growing dst breaks that, so
+            # promote to a real 1x1 conv that reproduces the identity mapping
+            # for existing channels and zero for the new ones.
+            old_dim = self.dst_channels
+            weight = torch.zeros(old_dim + n, self.src_channels, 1, 1, device=device)
+            for i in range(min(old_dim, self.src_channels)):
+                weight[i, i, 0, 0] = 1.0
+            self._rebuild_conv_projection(self.src_channels, old_dim + n, weight)
+        else:
+            old_w = self.projection.weight.data
+            new_rows = torch.zeros(n, old_w.shape[1], 1, 1, device=device)
+            weight = torch.cat([old_w, new_rows], dim=0)
+            self._rebuild_conv_projection(self.src_channels, old_w.shape[0] + n, weight)
+
+    def grow_src_channels(self, n: int) -> None:
+        """Source block grew n new channels; extend the projection's input.
+
+        New input columns are zero-init: the new source channels contribute
+        nothing until gradient pulls them open, matching grow_dst_channels.
+        """
+        if n <= 0 or not self.is_conv:
+            return
+        device = self.gate.device
+        if isinstance(self.projection, nn.Identity):
+            old_dim = self.src_channels
+            weight = torch.zeros(self.dst_channels, old_dim + n, 1, 1, device=device)
+            for i in range(min(old_dim, self.dst_channels)):
+                weight[i, i, 0, 0] = 1.0
+            self._rebuild_conv_projection(old_dim + n, self.dst_channels, weight)
+        else:
+            old_w = self.projection.weight.data
+            new_cols = torch.zeros(old_w.shape[0], n, 1, 1, device=device)
+            weight = torch.cat([old_w, new_cols], dim=1)
+            self._rebuild_conv_projection(old_w.shape[1] + n, self.dst_channels, weight)
+
+    def prune_dst_channels(self, indices_to_remove: torch.Tensor) -> None:
+        """Destination block pruned these channel indices; shrink the projection's output."""
+        if len(indices_to_remove) == 0 or not self.is_conv:
+            return
+        device = self.gate.device
+        keep_mask = torch.ones(self.dst_channels, dtype=torch.bool)
+        keep_mask[indices_to_remove] = False
+        keep_indices = keep_mask.nonzero(as_tuple=True)[0]
+        new_dst = len(keep_indices)
+        if isinstance(self.projection, nn.Identity):
+            weight = torch.zeros(new_dst, self.src_channels, 1, 1, device=device)
+            for new_i, old_i in enumerate(keep_indices.tolist()):
+                if old_i < self.src_channels:
+                    weight[new_i, old_i, 0, 0] = 1.0
+            self._rebuild_conv_projection(self.src_channels, new_dst, weight)
+        else:
+            weight = self.projection.weight.data[keep_indices]
+            self._rebuild_conv_projection(self.src_channels, new_dst, weight)
+
+    def prune_src_channels(self, indices_to_remove: torch.Tensor) -> None:
+        """Source block pruned these channel indices; shrink the projection's input."""
+        if len(indices_to_remove) == 0 or not self.is_conv:
+            return
+        device = self.gate.device
+        keep_mask = torch.ones(self.src_channels, dtype=torch.bool)
+        keep_mask[indices_to_remove] = False
+        keep_indices = keep_mask.nonzero(as_tuple=True)[0]
+        new_src = len(keep_indices)
+        if isinstance(self.projection, nn.Identity):
+            weight = torch.zeros(self.dst_channels, new_src, 1, 1, device=device)
+            for new_i, old_i in enumerate(keep_indices.tolist()):
+                if old_i < self.dst_channels:
+                    weight[old_i, new_i, 0, 0] = 1.0
+            self._rebuild_conv_projection(new_src, self.dst_channels, weight)
+        else:
+            weight = self.projection.weight.data[:, keep_indices]
+            self._rebuild_conv_projection(new_src, self.dst_channels, weight)
+
     def forward(
         self,
         src: torch.Tensor,

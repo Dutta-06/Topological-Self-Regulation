@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+from typing import List, Optional, Tuple
 
 def _make_gn(channels: int) -> nn.GroupNorm:
     num_groups = next(g for g in range(min(32, channels), 0, -1) if channels % g == 0)
@@ -94,37 +94,104 @@ class FixedResNet(nn.Module):
         x = self.pool(x).flatten(1)
         return self.fc(x)
 
+class SkipProjection(nn.Module):
+    """Permanent (non-gated) residual projection for static baselines.
+
+    Used to reconstruct TSR's *discovered* skip topology in a control net that
+    has the same shape but none of the plasticity machinery — no learnable gate,
+    no born-alive/newborn-protection dynamics. Identity if channels match,
+    otherwise a 1x1 conv; spatially resized via adaptive_avg_pool if needed
+    (mirrors GatedConnection's projection logic minus the gate).
+    """
+
+    def __init__(self, src_channels: int, dst_channels: int):
+        super().__init__()
+        if src_channels != dst_channels:
+            self.proj: nn.Module = nn.Conv2d(src_channels, dst_channels, kernel_size=1, bias=False)
+        else:
+            self.proj = nn.Identity()
+
+    def forward(self, src: torch.Tensor, dst_spatial: Tuple[int, int]) -> torch.Tensor:
+        h = self.proj(src)
+        if h.shape[-2:] != dst_spatial:
+            h = F.adaptive_avg_pool2d(h, dst_spatial)
+        return h
+
+
 class FixedVGG(nn.Module):
     """A fixed VGG-style architecture for baseline comparison.
-    
-    This architecture mimics the structure of TSRNetwork, but uses standard
-    static convolutional layers instead of adaptive TSR blocks.
-    """    
-    def __init__(self, channels: List[int], in_channels: int = 3, num_classes: int = 10, classifier_hidden: int = None):
+
+    Mimics TSRNetwork's structure exactly — same block loop, pool_positions,
+    optional skip connections, and GAP head — but uses standard static conv
+    layers (no gating) so the *only* structural difference from TSR is that
+    this network never grows: same final shape, trained from scratch.
+
+    Args:
+        channels: Per-block output channel counts (mirrors TSRNetwork's discovered
+            or seed channel list — index i is block i's out_channels).
+        pool_positions: Indices of blocks after which to 2x2 maxpool. Defaults to
+            TSRNetwork's default (every 2nd block) so vanilla baselines (vgg_tiny
+            etc.) match TSR's downsampling schedule too.
+        skip_connections: Optional list of (src_block_idx, dst_block_idx) pairs —
+            TSR's discovered residual topology, reconstructed here as permanent
+            (non-gated) SkipProjection edges. None = plain VGG, no skips.
+    """
+
+    def __init__(
+        self,
+        channels: List[int],
+        in_channels: int = 3,
+        num_classes: int = 10,
+        classifier_hidden: Optional[int] = None,
+        pool_positions: Optional[List[int]] = None,
+        skip_connections: Optional[List[Tuple[int, int]]] = None,
+    ):
         super().__init__()
         self.channels = channels
-        
+
         blocks = []
         current_channels = in_channels
-        
         for out_channels in channels:
             blocks.append(VGGBlock(current_channels, out_channels))
             current_channels = out_channels
-            
-        self.features = nn.Sequential(*blocks)
-        self.pool = nn.AdaptiveAvgPool2d((4, 4))
-        
-        # Classifier
+        self.blocks = nn.ModuleList(blocks)
+
+        if pool_positions is None:
+            pool_positions = [i for i in range(1, len(channels), 2)]
+            if len(channels) >= 2 and not pool_positions:
+                pool_positions = [len(channels) - 1]
+        self.pool_positions = set(pool_positions)
+
+        self.skip_connections = nn.ModuleDict()
+        for src_idx, dst_idx in (skip_connections or []):
+            key = f"{src_idx}__{dst_idx}"
+            self.skip_connections[key] = SkipProjection(channels[src_idx], channels[dst_idx])
+
+        # GAP head — matches TSRNetwork so the classifier bridge is identical
+        # (no ×16 blowup, no confound from differing pooling schemes).
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
         if classifier_hidden is None:
-            classifier_hidden = current_channels * 4    
+            classifier_hidden = max(current_channels * 2, 32)  # matches TSRNetwork's default
         self.classifier = nn.Sequential(
-            nn.Linear(current_channels * 16, classifier_hidden),
+            nn.Linear(current_channels, classifier_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(classifier_hidden, num_classes)
         )
-        
+
     def forward(self, x):
-        x = self.features(x)
+        block_outputs = []
+        for i, block in enumerate(self.blocks):
+            h = block(x)
+
+            for key, proj in self.skip_connections.items():
+                src_idx, dst_idx = (int(v) for v in key.split("__"))
+                if dst_idx == i:
+                    h = h + proj(block_outputs[src_idx], h.shape[-2:])
+
+            block_outputs.append(h)
+            x = F.max_pool2d(h, 2) if i in self.pool_positions else h
+
         x = self.pool(x)
         x = x.flatten(1)
         x = self.classifier(x)

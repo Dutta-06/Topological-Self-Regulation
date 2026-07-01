@@ -234,6 +234,19 @@ class TSRNetwork(nn.Module):
                 new_pool_positions.add(p)
         self.pool_positions = new_pool_positions
 
+        # 4. Re-index skip connections whose endpoints shifted. Without this,
+        # any skip touching a block at or after the insertion point would
+        # silently reference the wrong block once indices shift.
+        shifted = nn.ModuleDict()
+        for key, conn in self.skip_connections.items():
+            src_idx, dst_idx = (int(v) for v in key.split("__"))
+            if src_idx >= after_index + 1:
+                src_idx += 1
+            if dst_idx >= after_index + 1:
+                dst_idx += 1
+            shifted[f"{src_idx}__{dst_idx}"] = conn
+        self.skip_connections = shifted
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through conv blocks (with skip connections) → GAP → classifier.
 
@@ -266,61 +279,6 @@ class TSRNetwork(nn.Module):
     # ------------------------------------------------------------------
     # Topology introspection
     # ------------------------------------------------------------------
-
-    def topology_state(self) -> dict:
-        """Return a serializable snapshot of the current topology.
-
-        Includes:
-          - Per-block channel count and gate statistics
-          - Classifier layer widths
-          - Total and effective parameter counts
-          - Activation distribution per layer
-        """
-        state = {
-            "blocks": [],
-            "skip_connections": [],
-            "classifier_layers": [],
-            "total_params": sum(p.numel() for p in self.parameters()),
-            "trainable_params": sum(p.numel() for p in self.parameters() if p.requires_grad),
-        }
-
-        for i, block in enumerate(self.blocks):
-            conv = block.conv
-            state["blocks"].append({
-                "index": i,
-                "in_channels": conv.in_channels,
-                "out_channels": conv.out_channels,
-                "effective_channels": conv.effective_channels(),
-                "gate_mean": conv.gate_values().mean().item(),
-                "gate_min": conv.gate_values().min().item(),
-                "gate_max": conv.gate_values().max().item(),
-                "dominant_activation": conv.dominant_activation(),
-                "activation_distribution": conv.activation_distribution(),
-            })
-
-        for key, conn in self.skip_connections.items():
-            src_idx, dst_idx = (int(v) for v in key.split("__"))
-            state["skip_connections"].append({
-                "src": src_idx,
-                "dst": dst_idx,
-                "gate_value": conn.gate_value(),
-                "src_channels": conn.src_channels,
-                "dst_channels": conn.dst_channels,
-                "birth_step": int(conn.birth_step.item()),
-            })
-
-        for i, module in enumerate(self.classifier):
-            if isinstance(module, TSRLinear):
-                state["classifier_layers"].append({
-                    "index": i,
-                    "in_features": module.in_features,
-                    "out_features": module.out_features,
-                    "effective_neurons": module.effective_neurons(),
-                    "gate_mean": module.gate_values().mean().item(),
-                    "dominant_activation": module.dominant_activation(),
-                })
-
-        return state
 
     def topology_summary(self) -> str:
         """Human-readable one-line topology summary."""

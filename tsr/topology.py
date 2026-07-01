@@ -28,10 +28,23 @@ class LayerTopology:
 
 
 @dataclass
+class SkipConnectionTopology:
+    """Topology of a single discovered skip connection."""
+    src: int
+    dst: int
+    gate_value: float
+    src_channels: int
+    dst_channels: int
+    birth_step: int
+
+
+@dataclass
 class TopologyState:
     """Complete frozen snapshot of network topology at a point in training."""
     step: int
     layers: List[LayerTopology] = field(default_factory=list)
+    skip_connections: List[SkipConnectionTopology] = field(default_factory=list)
+    pool_positions: List[int] = field(default_factory=list)
     total_params: int = 0
     effective_params: int = 0
 
@@ -44,9 +57,12 @@ class TopologyState:
     @classmethod
     def from_dict(cls, d: dict) -> "TopologyState":
         layers = [LayerTopology(**l) for l in d.get("layers", [])]
+        skips = [SkipConnectionTopology(**s) for s in d.get("skip_connections", [])]
         return cls(
             step=d["step"],
             layers=layers,
+            skip_connections=skips,
+            pool_positions=d.get("pool_positions", []),
             total_params=d.get("total_params", 0),
             effective_params=d.get("effective_params", 0),
         )
@@ -108,9 +124,25 @@ def capture_topology(model, step: int) -> TopologyState:
                 gate_max=module.gate_values().max().item(),
             ))
 
+    skip_connections = []
+    for key, conn in getattr(model, "skip_connections", {}).items():
+        src_idx, dst_idx = (int(v) for v in key.split("__"))
+        skip_connections.append(SkipConnectionTopology(
+            src=src_idx,
+            dst=dst_idx,
+            gate_value=conn.gate_value(),
+            src_channels=conn.src_channels,
+            dst_channels=conn.dst_channels,
+            birth_step=int(conn.birth_step.item()),
+        ))
+
+    pool_positions = sorted(getattr(model, "pool_positions", []))
+
     return TopologyState(
         step=step,
         layers=layers,
+        skip_connections=skip_connections,
+        pool_positions=pool_positions,
         total_params=count_parameters(model),
         effective_params=count_effective_parameters(model),
     )

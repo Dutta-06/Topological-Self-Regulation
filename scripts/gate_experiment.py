@@ -279,7 +279,7 @@ class TSRRunner:
             "growth_signal_mode": growth_signal_mode,
             "phantom_threshold": reg_cfg.get("phantom_threshold", 1.0),
             "connection_threshold": reg_cfg.get("connection_threshold", 1.0),
-            "max_skip_span": reg_cfg.get("max_skip_span", 4),
+            "max_skip_span": reg_cfg.get("max_skip_span", 2),
             "max_growth_per_update": reg_cfg.get("max_growth_per_update", 2),
             "growth_cooldown_steps": reg_cfg.get("growth_cooldown_steps", 1000),
         }
@@ -297,7 +297,7 @@ class TSRRunner:
             if reg_cfg.get("connection_plasticity_enabled", True):
                 self.connection_phantom_manager = ConnectionPhantomManager(
                     model,
-                    max_skip_span=reg_cfg.get("max_skip_span", 4),
+                    max_skip_span=reg_cfg.get("max_skip_span", 2),
                     window=reg_cfg.get("monitor_window", 100),
                 ).to(device)
 
@@ -580,15 +580,29 @@ def build_tsr(cfg: dict, num_classes: int = 10) -> TSRNetwork:
     )
 
 
-def _tsr_final_shape(run_dir: Path) -> Tuple[Optional[List[int]], Optional[int]]:
+def _tsr_final_shape(
+    run_dir: Path,
+) -> Tuple[Optional[List[int]], Optional[int], List[Tuple[int, int]], Optional[List[int]]]:
+    """Read TSR's discovered final topology for building a matched static_final.
+
+    Returns (channels, classifier_hidden, skip_connections, pool_positions).
+    skip_connections is the list of (src, dst) block-index pairs TSR discovered
+    and kept — required so static_final reconstructs the *exact* topology
+    (shape AND residual edges), not just the channel counts. Without this, the
+    CORE gate (tsr_phantom vs static_final) is confounded: TSR would have skips
+    the control lacks, and the comparison couldn't attribute the gap to
+    plasticity vs. topology.
+    """
+    empty: Tuple[Optional[List[int]], Optional[int], List[Tuple[int, int]], Optional[List[int]]]
+    empty = (None, None, [], None)
     final_path = run_dir / "final.json"
     if not final_path.exists():
-        return None, None
+        return empty
     with open(final_path) as f:
         d = json.load(f)
     topo = d.get("topology_state")
     if not topo:
-        return None, None
+        return empty
     channels = [
         layer["out_size"]
         for layer in topo.get("layers", [])
@@ -599,8 +613,13 @@ def _tsr_final_shape(run_dir: Path) -> Tuple[Optional[List[int]], Optional[int]]
         if layer.get("layer_type") == "linear" and layer.get("name") != "classifier.2":
             classifier_hidden = layer["out_size"]
             break
-            
-    return (channels if channels else None), classifier_hidden
+
+    skip_connections = [
+        (s["src"], s["dst"]) for s in topo.get("skip_connections", [])
+    ]
+    pool_positions = topo.get("pool_positions") or None
+
+    return (channels if channels else None), classifier_hidden, skip_connections, pool_positions
 
 
 def run_one(
@@ -613,6 +632,8 @@ def run_one(
     device: torch.device,
     static_final_channels: Optional[List[int]] = None,
     static_final_classifier: Optional[int] = None,
+    static_final_skips: Optional[List[Tuple[int, int]]] = None,
+    static_final_pool_positions: Optional[List[int]] = None,
 ) -> dict:
     run_dir = results_root / variant / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -690,8 +711,12 @@ def run_one(
 
     elif variant == "static_final":
         channels = static_final_channels or [8, 8, 16]
-        logger.info(f"  static_final channels: {channels}")
-        model = FixedVGG(channels, num_classes=10, classifier_hidden=static_final_classifier)
+        skips = static_final_skips or []
+        logger.info(f"  static_final channels: {channels}, skip_connections: {skips}")
+        model = FixedVGG(
+            channels, num_classes=10, classifier_hidden=static_final_classifier,
+            pool_positions=static_final_pool_positions, skip_connections=skips,
+        )
         runner = BaselineRunner(
             model, train_loader, val_loader, run_dir,
             max_epochs=max_epochs, lr=lr, weight_decay=wd,
@@ -885,14 +910,19 @@ def main():
     t_start = time.time()
     for variant in run_order:
         for seed in args.seeds:
-            # For static_final, try to get the shape from tsr_phantom seed 0 run
+            # For static_final, try to get the shape (+ discovered skips) from tsr_phantom seed 0 run
             sfclassifier = None
             sfchannels = None
+            sfskips: List[Tuple[int, int]] = []
+            sfpool = None
             if variant == "static_final":
                 phantom_dir = results_root / "tsr_phantom" / f"seed{args.seeds[0]}"
-                sfchannels, sfclassifier = _tsr_final_shape(phantom_dir)
+                sfchannels, sfclassifier, sfskips, sfpool = _tsr_final_shape(phantom_dir)
                 if sfchannels:
-                    logger.info(f"  static_final will use discovered shape: {sfchannels}")
+                    logger.info(
+                        f"  static_final will use discovered shape: {sfchannels}, "
+                        f"skips: {sfskips}, pool_positions: {sfpool}"
+                    )
                 else:
                     logger.warning("  tsr_phantom final not found; static_final uses [8,8,16]")
 
@@ -905,7 +935,9 @@ def main():
                 results_root=results_root,
                 device=device,
                 static_final_channels=sfchannels,
-                static_final_classifier=sfclassifier
+                static_final_classifier=sfclassifier,
+                static_final_skips=sfskips,
+                static_final_pool_positions=sfpool,
             )
             all_results[variant][seed] = result
 

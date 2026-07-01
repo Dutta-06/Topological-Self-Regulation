@@ -175,6 +175,46 @@ def _block_index_from_layer_name(layer_name: Optional[str]) -> Optional[int]:
     return None
 
 
+def _grow_skip_connections_for_block(model: nn.Module, block_idx: int, n: int, step: int) -> None:
+    """Grow-in-place any skip connection touching block_idx (source or destination side).
+
+    Called whenever a conv block's channel count grows. Resizing the connection's
+    projection preserves its learned weights, gate value, and birth_step — as
+    opposed to deleting and forcing rediscovery, which would bypass
+    newborn_protect_steps every time a nearby block grows (a frequent event
+    during the early bootstrap phase).
+    """
+    if not hasattr(model, "skip_connections"):
+        return
+    for key, conn in model.skip_connections.items():
+        src_idx, dst_idx = (int(v) for v in key.split("__"))
+        if src_idx == block_idx:
+            conn.grow_src_channels(n)
+            logger.debug(f"Step {step}: Grew skip {key} src side by {n} (block {block_idx} grew)")
+        if dst_idx == block_idx:
+            conn.grow_dst_channels(n)
+            logger.debug(f"Step {step}: Grew skip {key} dst side by {n} (block {block_idx} grew)")
+
+
+def _prune_skip_connections_for_block(
+    model: nn.Module, block_idx: int, indices: torch.Tensor, step: int
+) -> None:
+    """Shrink-in-place any skip connection touching block_idx (source or destination side).
+
+    Mirrors _grow_skip_connections_for_block for the prune direction.
+    """
+    if not hasattr(model, "skip_connections"):
+        return
+    for key, conn in model.skip_connections.items():
+        src_idx, dst_idx = (int(v) for v in key.split("__"))
+        if src_idx == block_idx:
+            conn.prune_src_channels(indices)
+            logger.debug(f"Step {step}: Pruned skip {key} src side (block {block_idx} pruned)")
+        if dst_idx == block_idx:
+            conn.prune_dst_channels(indices)
+            logger.debug(f"Step {step}: Pruned skip {key} dst side (block {block_idx} pruned)")
+
+
 def _seed_grown_from_phantom(
     model: nn.Module,
     layer_name: str,
@@ -272,22 +312,13 @@ def prune_neurons_paired(
     if norm is not None:
         norm.resize(new_size)
 
-    # Remove skip connections referencing this block (projection shapes are now stale).
-    block_idx = None
-    parts = layer_name.split(".")
-    if len(parts) >= 2 and parts[0] == "blocks":
-        try:
-            block_idx = int(parts[1])
-        except ValueError:
-            pass
-    if block_idx is not None and hasattr(model, "skip_connections"):
-        stale = [
-            key for key in list(model.skip_connections.keys())
-            if any(int(v) == block_idx for v in key.split("__"))
-        ]
-        for key in stale:
-            del model.skip_connections[key]
-            logger.debug(f"Step {step}: Removed stale skip {key} (block {block_idx} pruned)")
+    # Shrink (not delete) any skip connection touching this block, mirroring how
+    # the paired next_layer above shrinks its input channels. Deleting would
+    # discard the connection's learned projection, gate value, and birth_step —
+    # forcing rediscovery from scratch and bypassing newborn_protect_steps.
+    block_idx = _block_index_from_layer_name(layer_name)
+    if block_idx is not None:
+        _prune_skip_connections_for_block(model, block_idx, indices, step)
 
     event = StructuralEvent(
         step=step,
@@ -364,23 +395,13 @@ def grow_neurons_paired(
     if norm is not None:
         norm.resize(new_size)
 
-    # Skip connections referencing this block by index are now shape-invalid.
-    # Remove them; the connection phantom will rediscover them at the next update.
-    block_idx = None
-    parts = layer_name.split(".")
-    if len(parts) >= 2 and parts[0] == "blocks":
-        try:
-            block_idx = int(parts[1])
-        except ValueError:
-            pass
-    if block_idx is not None and hasattr(model, "skip_connections"):
-        stale = [
-            key for key in list(model.skip_connections.keys())
-            if any(int(v) == block_idx for v in key.split("__"))
-        ]
-        for key in stale:
-            del model.skip_connections[key]
-            logger.debug(f"Step {step}: Removed stale skip {key} (block {block_idx} grew)")
+    # Grow (not delete) any skip connection touching this block, mirroring how
+    # the paired next_layer above grows its input channels. Deleting would
+    # discard the connection's learned projection, gate value, and birth_step —
+    # forcing rediscovery from scratch and bypassing newborn_protect_steps.
+    block_idx = _block_index_from_layer_name(layer_name)
+    if block_idx is not None:
+        _grow_skip_connections_for_block(model, block_idx, n, step)
 
     event = StructuralEvent(
         step=step,
@@ -427,7 +448,7 @@ def apply_structural_update(
     # Connection-level plasticity params
     connection_phantom_manager: Optional[nn.Module] = None,
     connection_threshold: float = 1.0,
-    max_skip_span: int = 4,
+    max_skip_span: int = 2,  # accepted for reg_config unpacking; actual span lives on ConnectionPhantomManager
 ) -> List[StructuralEvent]:
     """Execute one full structural update cycle across all layers.
 
@@ -673,15 +694,22 @@ def apply_structural_update(
 
     # ── Phase 5: Connection-level plasticity ──
     if connection_phantom_manager is not None and hasattr(model, "skip_connections"):
-        # Compute normalizer: mean real gate grad scale across all probed layers
+        # Per-destination-block normalizer: maps block index -> that block's own
+        # real gate grad scale. A single GLOBAL scale would bias every candidate
+        # toward the last block (raw |dL/dgate| is largest near the loss) — this
+        # is what produced the earlier output-fan-in artifact. Per-destination
+        # normalization lets an early-stage residual unit compete fairly with a
+        # late-stage one.
+        dst_scale: Dict[int, float] = {}
         if phantom_manager is not None and hasattr(phantom_manager, "probes"):
-            scales = [
-                probe.real_gate_grad_scale()
-                for probe in phantom_manager.probes.values()
-            ]
-            real_scale = sum(scales) / max(len(scales), 1)
-        else:
-            real_scale = 1.0
+            for pkey, probe in phantom_manager.probes.items():
+                real_name = phantom_manager._name_map.get(pkey, "")
+                parts = real_name.split(".")
+                if len(parts) >= 2 and parts[0] == "blocks":
+                    try:
+                        dst_scale[int(parts[1])] = probe.real_gate_grad_scale()
+                    except ValueError:
+                        pass
 
         # Prune existing skip connections whose gate fell below death_threshold
         # (same death criterion as neurons, with newborn protection)
@@ -705,7 +733,7 @@ def apply_structural_update(
 
         # Grow new skip connections where the phantom signal is strong
         if growth_enabled:
-            conn_signals = connection_phantom_manager.growth_signals(real_gate_scale=real_scale)
+            conn_signals = connection_phantom_manager.growth_signals(dst_scale=dst_scale)
             sorted_conn = sorted(conn_signals.items(), key=lambda x: x[1], reverse=True)
             conn_grown = 0
             for key, signal in sorted_conn:

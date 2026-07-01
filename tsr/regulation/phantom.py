@@ -432,19 +432,28 @@ class ConnectionPhantomProbe(nn.Module):
 class ConnectionPhantomManager(nn.Module):
     """Owns dormant probes for candidate skip edges and drives the connection-growth signal.
 
-    Candidate edges are generated per the vision vocabulary: skips spanning 2–4 blocks
-    (configurable via max_skip_span). Edges that already exist in the model are excluded.
+    Candidate generation: exactly ONE candidate per destination block — the
+    standard ResNet residual-unit source ``dst - residual_span`` (default span 2,
+    matching a classic 2-conv residual unit). This is a deliberate design choice:
+    an earlier free-form O(L²) generator (any src→dst within a window) combined
+    with a single global gradient-scale normalizer produced a degenerate topology
+    where every candidate piled onto the last block (raw |∂L/∂gate| is largest
+    near the loss, so late blocks always won). With one candidate per destination,
+    output fan-in is structurally impossible — the discovered topology is a
+    regular residual backbone, not a dump onto the head. Signal normalization
+    is per-destination (see growth_signals) so early blocks compete fairly.
 
     Args:
         model: The TSRNetwork instance.
-        max_skip_span: Maximum number of blocks to span (e.g. 4 means src+4=dst).
+        max_skip_span: Residual-unit span — src = dst - max_skip_span. Default 2
+            (a standard 2-conv residual unit, as in ResNet-20/32/etc).
         window: Sliding-window length for gradient averaging.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        max_skip_span: int = 4,
+        max_skip_span: int = 2,
         window: int = 100,
     ):
         super().__init__()
@@ -468,15 +477,17 @@ class ConnectionPhantomManager(nn.Module):
             return
         n = len(model.blocks)
         existing = set(getattr(model, "skip_connections", {}).keys())
+        span = self.max_skip_span
 
-        for src in range(n):
-            for dst in range(src + 2, min(src + self.max_skip_span + 1, n)):
-                key = self._key(src, dst)
-                if key in existing:
-                    continue
-                src_ch = model.blocks[src].conv.out_channels
-                dst_ch = model.blocks[dst].conv.out_channels
-                self.probes[key] = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
+        # One candidate per destination block: src = dst - span.
+        for dst in range(span, n):
+            src = dst - span
+            key = self._key(src, dst)
+            if key in existing:
+                continue
+            src_ch = model.blocks[src].conv.out_channels
+            dst_ch = model.blocks[dst].conv.out_channels
+            self.probes[key] = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
 
         # Forward hooks to capture block outputs
         self._hooks.clear()
@@ -508,12 +519,25 @@ class ConnectionPhantomManager(nn.Module):
         for probe in self.probes.values():
             probe.record_gate_grad()
 
-    def growth_signals(self, real_gate_scale: float = 1.0) -> Dict[str, float]:
-        """Return normalized signal per candidate edge, keyed by 'src__dst'."""
-        return {
-            key: probe.signal() / (real_gate_scale + 1e-8)
-            for key, probe in self.probes.items()
-        }
+    def growth_signals(self, dst_scale: Optional[Dict[int, float]] = None) -> Dict[str, float]:
+        """Return per-destination-normalized signal per candidate edge, keyed by 'src__dst'.
+
+        Args:
+            dst_scale: Maps destination block index → real gate grad scale (from the
+                node PhantomManager's per-layer probes at that block). Normalizing by
+                the DESTINATION's own scale — not a single global scale — is what lets
+                an early-stage residual unit compete fairly with a late-stage one; a
+                global normalizer biases every candidate toward the last block, since
+                raw |∂L/∂gate| is largest near the loss. Falls back to 1.0 (conservative)
+                for any destination without a supplied scale.
+        """
+        dst_scale = dst_scale or {}
+        result = {}
+        for key, probe in self.probes.items():
+            _, dst_idx = (int(v) for v in key.split("__"))
+            scale = dst_scale.get(dst_idx, 1.0)
+            result[key] = probe.signal() / (scale + 1e-8)
+        return result
 
     def remove_hooks(self) -> None:
         for h in self._hooks:
@@ -531,19 +555,20 @@ class ConnectionPhantomManager(nn.Module):
             return
         n = len(model.blocks)
         existing = set(getattr(model, "skip_connections", {}).keys())
-        for src in range(n):
-            for dst in range(src + 2, min(src + self.max_skip_span + 1, n)):
-                key = self._key(src, dst)
-                if key in existing:
-                    continue
-                src_ch = model.blocks[src].conv.out_channels
-                dst_ch = model.blocks[dst].conv.out_channels
-                probe = old_probes.get(key)
-                if probe is None or probe.projection.weight.shape != (dst_ch, src_ch, 1, 1):
-                    probe = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
-                    device = next(self.model.parameters()).device
-                    probe = probe.to(device)
-                self.probes[key] = probe
+        span = self.max_skip_span
+        for dst in range(span, n):
+            src = dst - span
+            key = self._key(src, dst)
+            if key in existing:
+                continue
+            src_ch = model.blocks[src].conv.out_channels
+            dst_ch = model.blocks[dst].conv.out_channels
+            probe = old_probes.get(key)
+            if probe is None or probe.projection.weight.shape != (dst_ch, src_ch, 1, 1):
+                probe = ConnectionPhantomProbe(src_ch, dst_ch, is_conv=True, window=self.window)
+                device = next(self.model.parameters()).device
+                probe = probe.to(device)
+            self.probes[key] = probe
         for i, block in enumerate(model.blocks):
             h = block.register_forward_hook(self._make_capture_hook(i))
             self._hooks.append(h)
