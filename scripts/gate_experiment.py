@@ -404,8 +404,14 @@ class TSRRunner:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
             self.scheduler.load_state_dict(state["scheduler_state_dict"])
             self.step = state["step"]
-            start_epoch = state.get("extra", {}).get("epoch", -1) + 1
-            self.best_val_acc = state.get("extra", {}).get("best_val_acc", 0.0)
+            # _save_checkpoint flattens `extra` into the top-level dict (no nested
+            # "extra" key ever exists), so read these directly. The old
+            # state.get("extra", {}) lookup always returned {} here, silently
+            # resetting start_epoch/best_val_acc to defaults on every resume.
+            start_epoch = state.get("epoch", -1) + 1
+            self.best_val_acc = state.get("best_val_acc", 0.0)
+            if "pool_positions" in state and hasattr(self.model, "pool_positions"):
+                self.model.pool_positions = set(state["pool_positions"])
             
             if (self.run_dir / "events.jsonl").exists():
                 with open(self.run_dir / "events.jsonl", "r") as f:
@@ -459,10 +465,17 @@ class TSRRunner:
                         _write_jsonl(topology_path, topo.to_dict())
 
                 if self.step > 0 and self.step % self.ckpt_every == 0:
+                    # pool_positions is a plain Python attribute (not a tensor), so it's
+                    # invisible to model.state_dict() — must be saved explicitly or a
+                    # resumed model silently gets a wrong default (mismatched downsampling).
                     _save_checkpoint(
                         self.run_dir, self.step,
                         self.model, self.optimizer, self.scheduler,
-                        {"epoch": epoch, "best_val_acc": self.best_val_acc},
+                        {
+                            "epoch": epoch,
+                            "best_val_acc": self.best_val_acc,
+                            "pool_positions": sorted(getattr(self.model, "pool_positions", [])),
+                        },
                     )
 
                 self.step += 1
@@ -657,23 +670,40 @@ def run_one(
     if variant == "tsr_phantom":
         cfg_copy = json.loads(json.dumps(cfg))
         existing_ckpts = sorted(run_dir.glob("checkpoint_*.pt"))
+        skip_pairs: List[Tuple[int, int]] = []
         if existing_ckpts:
             latest_ckpt = existing_ckpts[-1]
             state = torch.load(latest_ckpt, map_location=device)
             model_state = state["model_state_dict"]
+
+            # Discover block widths dynamically — do NOT assume a fixed max
+            # depth. TSR can grow past any hardcoded scan limit via layer
+            # insertion (max_blocks defaults to 24), and a fixed range(16)
+            # here would silently truncate reconstruction for deeper runs.
             seed_channels = []
-            for i in range(16):
-                key = f"blocks.{i}.conv.weight"
-                if key in model_state:
-                    seed_channels.append(model_state[key].shape[0])
-                else:
-                    break
+            i = 0
+            while f"blocks.{i}.conv.weight" in model_state:
+                seed_channels.append(model_state[f"blocks.{i}.conv.weight"].shape[0])
+                i += 1
+
             if "classifier.0.weight" in model_state:
                 cfg_copy.setdefault("model", {})["classifier_hidden"] = model_state["classifier.0.weight"].shape[0]
             if seed_channels:
                 cfg_copy.setdefault("model", {})["seed_channels"] = seed_channels
 
+            # Discover skip connections so they can be reconstructed on the
+            # fresh model BEFORE load_state_dict — otherwise their keys show
+            # up as "unexpected" and the strict load raises.
+            for key in model_state:
+                if key.startswith("skip_connections.") and key.endswith(".gate"):
+                    pair = key[len("skip_connections."):-len(".gate")]
+                    src_idx, dst_idx = (int(v) for v in pair.split("__"))
+                    skip_pairs.append((src_idx, dst_idx))
+
         model = build_tsr(cfg_copy)
+        for src_idx, dst_idx in skip_pairs:
+            model.add_skip_connection(src_idx, dst_idx, step=0)
+
         runner = TSRRunner(
             model, train_loader, val_loader, run_dir,
             cfg=cfg_copy, growth_signal_mode="phantom", device=device,
