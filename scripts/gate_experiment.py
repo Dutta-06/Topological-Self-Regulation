@@ -55,7 +55,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from baselines.fixed_arch import FixedVGG, VGG_CONFIGS
+from baselines.fixed_arch import FixedVGG, VGG_CONFIGS, FixedResNet
 from data.cifar import get_cifar10_loaders
 from tsr.model import TSRNetwork
 from tsr.flops import compute_model_flops, CumulativeFLOPsTracker, differentiable_effective_flops
@@ -719,6 +719,20 @@ def run_one(
         )
         return runner.run()
 
+    elif variant == "resnet_sanity":
+        # Sanity check (Workstream A): does a hand-built ResNet with real residual
+        # shortcuts clear the ~90% plain-VGG ceiling under this identical recipe?
+        # GroupNorm + GAP head match TSR/FixedVGG exactly — the only difference
+        # from vgg_small-class nets is the shortcut itself.
+        logger.info("  resnet_sanity: ResNet-20-style, stage_channels=[16,32,64]")
+        model = FixedResNet(stage_channels=[16, 32, 64], blocks_per_stage=3, num_classes=10)
+        runner = BaselineRunner(
+            model, train_loader, val_loader, run_dir,
+            max_epochs=max_epochs, lr=lr, weight_decay=wd,
+            warmup_steps=warmup, ckpt_every=ckpt_every, device=device,
+        )
+        return runner.run()
+
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
@@ -795,7 +809,7 @@ def check_gate(summary: dict) -> bool:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALL_VARIANTS = ["tsr_phantom", "tsr_heuristic", "vgg_tiny", "vgg_small", "static_final", "vgg16", "vgg19"]
+ALL_VARIANTS = ["tsr_phantom", "tsr_heuristic", "vgg_tiny", "vgg_small", "static_final", "vgg16", "vgg19", "resnet_sanity"]
 
 
 def main():
@@ -813,6 +827,8 @@ def main():
                         help="Device: auto, cuda, cpu")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--data-root", type=str, default=None)
+    parser.add_argument("--flops-price", type=float, default=None,
+                        help="λ-FLOPs penalty coefficient (overrides config). 0=free growth, >0=budget pressure.")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -841,6 +857,8 @@ def main():
         cfg["training"]["batch_size"] = args.batch_size
     if args.data_root is not None:
         cfg["data"]["root"] = args.data_root
+    if args.flops_price is not None:
+        cfg["regulation"]["flops_price"] = args.flops_price
 
     # Data loaders (shared across all variants/seeds for comparability)
     data_root = cfg["data"].get("root", "./data")

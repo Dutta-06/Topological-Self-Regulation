@@ -73,7 +73,7 @@ regulation:
   # Insert a new block when the max adjacent-layer gradient-norm ratio exceeds
   # this. The ratio is grad_norm(next) / grad_norm(prev); a large value means
   # the representational gap between two layers is too wide.
-  layer_insertion_threshold: 2.0   # was 5.0; lower = more eager to add layers
+  layer_insertion_threshold: 2.0
   max_blocks: 24                  # hard cap on network depth
   # ── Scheduling ──
   cooldown_steps: 50          # min steps between structural changes per layer

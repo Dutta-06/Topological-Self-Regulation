@@ -3,17 +3,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
 
+def _make_gn(channels: int) -> nn.GroupNorm:
+    num_groups = next(g for g in range(min(32, channels), 0, -1) if channels % g == 0)
+    return nn.GroupNorm(num_groups, channels)
+
+
 class VGGBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        num_groups = next(g for g in range(min(32, out_channels), 0, -1) if out_channels % g == 0)
-        self.bn = nn.GroupNorm(num_groups, out_channels)
-
+        self.bn = _make_gn(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         return self.relu(self.bn(self.conv(x)))
+
+
+class ResBasicBlock(nn.Module):
+    """Standard CIFAR-style residual unit: identity shortcut within a stage,
+    1x1-projection + stride-2 shortcut at stage transitions. Uses GroupNorm
+    (not BatchNorm) so the only difference from VGGBlock is the shortcut itself
+    — an apples-to-apples test of whether residual connections raise the ceiling.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.gn1 = _make_gn(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+        self.gn2 = _make_gn(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                _make_gn(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return self.relu(out + identity)
+
+
+class FixedResNet(nn.Module):
+    """CIFAR-style ResNet (He et al. 2016), GroupNorm variant, for the sanity check:
+    does adding real residual shortcuts raise the ~90% plain-VGG ceiling under this
+    exact recipe (same optimizer/schedule/augmentation/head as TSR and FixedVGG)?
+
+    Default stage_channels=[16,32,64], blocks_per_stage=3 is the classic ResNet-20
+    (6n+2 layers, n=3), adapted with a GAP head to match TSRNetwork's current head.
+    """
+
+    def __init__(
+        self,
+        stage_channels: List[int] = None,
+        blocks_per_stage: int = 3,
+        in_channels: int = 3,
+        num_classes: int = 10,
+    ):
+        super().__init__()
+        if stage_channels is None:
+            stage_channels = [16, 32, 64]
+        self.stage_channels = stage_channels
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, stage_channels[0], 3, padding=1, bias=False),
+            _make_gn(stage_channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        layers = []
+        prev = stage_channels[0]
+        for i, ch in enumerate(stage_channels):
+            for b in range(blocks_per_stage):
+                stride = 2 if (b == 0 and i > 0) else 1
+                layers.append(ResBasicBlock(prev, ch, stride=stride))
+                prev = ch
+        self.layers = nn.Sequential(*layers)
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(prev, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layers(x)
+        x = self.pool(x).flatten(1)
+        return self.fc(x)
 
 class FixedVGG(nn.Module):
     """A fixed VGG-style architecture for baseline comparison.
