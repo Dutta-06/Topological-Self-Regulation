@@ -1,0 +1,53 @@
+# Time-series benchmark config — UCI Electricity Load (ECL) forecasting
+
+task: forecasting
+
+data:
+  name: electricity
+  root: ./data
+  seq_len: 96
+  pred_len: 1
+  batch_size: 128
+  num_workers: 0
+  num_clients: 16
+
+training:
+  max_epochs: 30
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_steps: 200
+  min_lr: 0.00001
+  grad_clip: 5.0
+
+models:
+  lstm:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.1
+  gru:
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.1
+  tcn:
+    hidden_channels: 64
+    num_levels: 4
+    kernel_size: 3
+    dropout: 0.1
+  patchtst:
+    patch_len: 16
+    stride: 8
+    d_model: 64
+    n_heads: 4
+    num_layers: 3
+    dropout: 0.1
+  mamba:
+    d_model: 64
+    d_state: 16
+    num_layers: 3
+    expand: 2
+    dropout: 0.1
+
+experiment:
+  seeds: [42, 123, 456]
+  device: auto

@@ -21,6 +21,8 @@ setup(
         "scikit-learn>=1.3.0",
         "numpy>=1.24.0",
         "tqdm>=4.65.0",
+        "pandas>=2.0.0",
+        "aeon>=1.0.0",
     ],
     extras_require={
         "dev": ["pytest>=7.4.0", "pytest-cov>=4.1.0"],

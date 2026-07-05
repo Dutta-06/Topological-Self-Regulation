@@ -25,4 +25,8 @@ data/cifar-100-python/
 data/*.tar.gz
 data/*.csv
 data/*.npz
+data/*.zip
+data/*.txt
+data/UCI HAR Dataset/
+data/ucr_uea/
 .DS_Store
