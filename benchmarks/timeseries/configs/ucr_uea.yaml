@@ -1,11 +1,14 @@
 # Time-series benchmark config — UCR/UEA archive classification (subset)
+# Section layout mirrors configs/default.yaml (TSR's own config) exactly:
+# batch_size lives in `training:`, num_workers/root live in `data:`. This is
+# deliberate — when TSR's sequence variant is added as a model here, it reads
+# the same training/data sections, no config-schema translation needed.
 
 task: classification
 
 data:
   name: ucr_uea
   root: ./data/ucr_uea
-  batch_size: 32
   num_workers: 0
   val_fraction: 0.2
   # Representative subset (univariate + multivariate, small + medium size).
@@ -13,6 +16,7 @@ data:
   datasets: [ECG200, FordA, BasicMotions]
 
 training:
+  batch_size: 32
   max_epochs: 50
   optimizer: adam
   learning_rate: 0.001
@@ -48,6 +52,14 @@ models:
     num_layers: 3
     expand: 2
     dropout: 0.1
+  # ── Reserved for TSR (not run here yet — see benchmarks/timeseries/README.md) ──
+  # TSR is intentionally excluded from this baseline suite for now. When its
+  # sequence variant lands, add a `tsr:` entry here shaped like `regulation:`
+  # in configs/default.yaml (phantom_k, phantom_threshold, newborn_gate_init,
+  # newborn_protect_steps, gate_sparsity_coeff, growth_rate, max_neurons_per_layer,
+  # update_interval, cooldown_steps) plus a `seed_hidden_size` — TSR starts
+  # small and grows, rather than training at a fixed width like the baselines
+  # above.
 
 experiment:
   seeds: [42, 123, 456]

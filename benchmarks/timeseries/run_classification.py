@@ -74,16 +74,16 @@ def build_model(model_name: str, cfg: dict, input_size: int, seq_len: int, num_c
     raise ValueError(f"Unknown model {model_name}")
 
 
-def get_loaders(dataset_name: str, data_cfg: dict, seed: int):
+def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int, seed: int):
     if dataset_name == "har":
         return get_har_loaders(
-            batch_size=data_cfg["batch_size"], root=data_cfg["root"],
+            batch_size=batch_size, root=data_cfg["root"],
             num_workers=data_cfg.get("num_workers", 0),
             val_fraction=data_cfg.get("val_fraction", 0.15), seed=seed,
         )
     # UCR/UEA: dataset_name here is a specific archive dataset name (e.g. "ECG200")
     train_loader, val_loader, test_loader, seq_len, num_channels, num_classes = get_ucr_uea_loaders(
-        dataset_name, batch_size=data_cfg["batch_size"], root=data_cfg["root"],
+        dataset_name, batch_size=batch_size, root=data_cfg["root"],
         num_workers=data_cfg.get("num_workers", 0),
         val_fraction=data_cfg.get("val_fraction", 0.2), seed=seed,
     )
@@ -177,7 +177,7 @@ def run_one(model_name: str, seed: int, cfg: dict, dataset_name: str, results_ro
     logger.info(f">>> {dataset_name}/{model_name} seed={seed} dir={run_dir}")
 
     train_loader, val_loader, test_loader, num_channels, num_classes = get_loaders(
-        dataset_name, cfg["data"], seed
+        dataset_name, cfg["data"], cfg["training"]["batch_size"], seed
     )
     sample_x, _ = next(iter(train_loader))
     seq_len = sample_x.shape[1]

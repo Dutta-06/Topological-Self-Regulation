@@ -37,6 +37,17 @@ is a ~2.5MB CSV per series, UCR/UEA subset datasets are similarly small).
 
 ## Run
 
+### One command, everything
+
+```bash
+bash run_timeseries_baselines.sh              # full: all 5 models, 3 seeds, all 5 datasets
+bash run_timeseries_baselines.sh --smoke      # 1 seed, 3 epochs, lstm only — fast pipeline check
+bash run_timeseries_baselines.sh --forecast-only   # etth1 + etth2 + electricity only
+bash run_timeseries_baselines.sh --classify-only   # har + ucr_uea only
+```
+
+Or run each dataset individually:
+
 ### Forecasting (ETTh1 / ETTh2 / Electricity)
 
 ```bash

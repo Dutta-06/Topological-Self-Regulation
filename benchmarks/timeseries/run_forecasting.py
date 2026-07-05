@@ -70,16 +70,16 @@ def build_model(model_name: str, cfg: dict, input_size: int, seq_len: int) -> nn
     raise ValueError(f"Unknown model {model_name}")
 
 
-def get_loaders(dataset_name: str, data_cfg: dict):
+def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int):
     if dataset_name in ("etth1", "etth2"):
         return get_ett_loaders(
-            name=dataset_name, batch_size=data_cfg["batch_size"],
+            name=dataset_name, batch_size=batch_size,
             seq_len=data_cfg["seq_len"], pred_len=data_cfg["pred_len"],
             root=data_cfg["root"], num_workers=data_cfg.get("num_workers", 0),
         )
     elif dataset_name == "electricity":
         return get_electricity_loaders(
-            batch_size=data_cfg["batch_size"], seq_len=data_cfg["seq_len"],
+            batch_size=batch_size, seq_len=data_cfg["seq_len"],
             pred_len=data_cfg["pred_len"], root=data_cfg["root"],
             num_workers=data_cfg.get("num_workers", 0),
             num_clients=data_cfg.get("num_clients", 16),
@@ -172,7 +172,7 @@ def run_one(model_name: str, seed: int, cfg: dict, dataset_name: str, results_ro
     set_seed(seed)
     logger.info(f">>> {model_name} seed={seed} dir={run_dir}")
 
-    train_loader, val_loader, test_loader = get_loaders(dataset_name, cfg["data"])
+    train_loader, val_loader, test_loader = get_loaders(dataset_name, cfg["data"], cfg["training"]["batch_size"])
     sample_x, _ = next(iter(train_loader))
     input_size = sample_x.shape[-1]
     seq_len = sample_x.shape[1]

@@ -1,17 +1,21 @@
 # Time-series benchmark config — UCI Electricity Load (ECL) forecasting
+# Section layout mirrors configs/default.yaml (TSR's own config) exactly:
+# batch_size lives in `training:`, num_workers/root live in `data:`. This is
+# deliberate — when TSR's sequence variant is added as a model here, it reads
+# the same training/data sections, no config-schema translation needed.
 
 task: forecasting
 
 data:
   name: electricity
   root: ./data
+  num_workers: 0
   seq_len: 96
   pred_len: 1
-  batch_size: 128
-  num_workers: 0
   num_clients: 16
 
 training:
+  batch_size: 128
   max_epochs: 30
   optimizer: adam
   learning_rate: 0.001
@@ -47,6 +51,14 @@ models:
     num_layers: 3
     expand: 2
     dropout: 0.1
+  # ── Reserved for TSR (not run here yet — see benchmarks/timeseries/README.md) ──
+  # TSR is intentionally excluded from this baseline suite for now. When its
+  # sequence variant lands, add a `tsr:` entry here shaped like `regulation:`
+  # in configs/default.yaml (phantom_k, phantom_threshold, newborn_gate_init,
+  # newborn_protect_steps, gate_sparsity_coeff, growth_rate, max_neurons_per_layer,
+  # update_interval, cooldown_steps) plus a `seed_hidden_size` — TSR starts
+  # small and grows, rather than training at a fixed width like the baselines
+  # above.
 
 experiment:
   seeds: [42, 123, 456]
