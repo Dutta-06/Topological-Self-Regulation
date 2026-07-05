@@ -44,7 +44,14 @@ def _download_and_extract(root: str) -> str:
         urlretrieve(_URL, zip_path)
     print(f"Extracting {zip_path} ...")
     with zipfile.ZipFile(zip_path) as zf:
-        names = [n for n in zf.namelist() if n.lower().endswith(".txt")]
+        # Exclude macOS resource-fork junk (__MACOSX/._*.txt) — it also ends in
+        # .txt and would otherwise be picked depending on zip entry order.
+        names = [
+            n for n in zf.namelist()
+            if n.lower().endswith(".txt") and "__MACOSX" not in n
+        ]
+        if not names:
+            raise FileNotFoundError(f"No .txt file found in {zip_path}")
         zf.extract(names[0], root)
         extracted = os.path.join(root, names[0])
         if extracted != txt_path:

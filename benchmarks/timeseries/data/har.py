@@ -42,6 +42,22 @@ def _download_and_extract(root: str) -> str:
     print(f"Extracting {zip_path} ...")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(root)
+
+    # The current UCI static-download URL wraps the real data one level deeper:
+    # uci_har.zip contains "UCI HAR Dataset.zip" (+ a .names file), not the
+    # extracted folder directly. Unwrap that inner zip if present.
+    if not os.path.isdir(dataset_dir):
+        inner_zip = os.path.join(root, "UCI HAR Dataset.zip")
+        if os.path.exists(inner_zip):
+            print(f"Extracting nested {inner_zip} ...")
+            with zipfile.ZipFile(inner_zip) as zf:
+                zf.extractall(root)
+
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(
+            f"Expected '{dataset_dir}' after extraction but it wasn't found. "
+            f"Check the archive layout under {root}."
+        )
     return dataset_dir
 
 
