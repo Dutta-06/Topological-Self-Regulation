@@ -210,3 +210,29 @@ Weather at a given preset+horizon because its per-channel head depends on
 `(num_patches, pred_len)`, not on channel count (channel-independence) —
 channel count only changes classification PatchTST slightly, via the
 positional embedding (see fidelity note above).
+
+### The 5-20M range: Electricity at longer horizons (no new code needed)
+
+LSTM/GRU/TCN/Mamba's forecast head is `Linear(hidden, pred_len * channels)` —
+a flat projection scaling with **horizon × channel count**, not just hidden
+size. At Electricity's 321 channels, the horizons we already sweep by default
+(`pred_lens: [96, 192, 336, 720]`) push several presets straight into 5-20M:
+
+| Horizon | Preset | LSTM | GRU | TCN | Mamba |
+|---|---|---|---|---|---|
+| 192 | xl | 8.31M | 8.22M | 8.46M | 8.36M |
+| 336 | l | 7.14M | 7.11M | 7.18M | 7.13M |
+| 336 | xl | 14.28M | 14.19M | 14.42M | 14.32M |
+| 720 | m | 7.67M | 7.66M | 7.68M | 7.66M |
+| 720 | l | 15.16M | 15.12M | 15.19M | 15.15M |
+
+(PatchTST stays at 134K–1.6M across these same cells — its channel-independent
+head doesn't scale with channel count at all. This contrast is worth stating
+explicitly in the paper: it's *why* channel-independent methods exist, not an
+inconsistency in our setup.)
+
+**No new dataset, model, or config change was needed for this** — these rows
+come from the sweep already defined in `configs/electricity.yaml`. When
+writing up Table 3, report at least one of the `h=336`/`h=720` rows alongside
+`h=96` so the 5-20M point is visible, rather than only showing the shortest
+horizon.
