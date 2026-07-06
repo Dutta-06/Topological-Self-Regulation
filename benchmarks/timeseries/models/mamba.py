@@ -117,15 +117,18 @@ class MambaEncoder(nn.Module):
 
 
 class MambaForecaster(nn.Module):
-    def __init__(self, input_size: int, d_model: int = 64, d_state: int = 16,
+    def __init__(self, input_size: int, pred_len: int, d_model: int = 64, d_state: int = 16,
                  num_layers: int = 3, expand: int = 2, dropout: float = 0.1):
         super().__init__()
         self.encoder = MambaEncoder(input_size, d_model, d_state, num_layers, expand, dropout)
-        self.head = nn.Linear(d_model, 1)
+        self.pred_len = pred_len
+        self.input_size = input_size
+        self.head = nn.Linear(d_model, pred_len * input_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.encoder(x)
-        return self.head(h[:, -1, :]).squeeze(-1)
+        out = self.head(h[:, -1, :])
+        return out.view(-1, self.pred_len, self.input_size)
 
 
 class MambaClassifier(nn.Module):

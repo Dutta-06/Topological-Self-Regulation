@@ -88,14 +88,17 @@ class TCNEncoder(nn.Module):
 
 
 class TCNForecaster(nn.Module):
-    def __init__(self, input_size: int, hidden_channels: int = 64, num_levels: int = 4,
+    def __init__(self, input_size: int, pred_len: int, hidden_channels: int = 64, num_levels: int = 4,
                  kernel_size: int = 3, dropout: float = 0.1):
         super().__init__()
         self.encoder = TCNEncoder(input_size, hidden_channels, num_levels, kernel_size, dropout)
-        self.head = nn.Linear(hidden_channels, 1)
+        self.pred_len = pred_len
+        self.input_size = input_size
+        self.head = nn.Linear(hidden_channels, pred_len * input_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.encoder(x)).squeeze(-1)
+        out = self.head(self.encoder(x))
+        return out.view(-1, self.pred_len, self.input_size)
 
 
 class TCNClassifier(nn.Module):

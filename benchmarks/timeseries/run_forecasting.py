@@ -3,8 +3,16 @@ Time-series forecasting benchmark runner.
 
 Trains LSTM, GRU, TCN, PatchTST, and Mamba baselines on a forecasting dataset
 (ETTh1, ETTh2, or Electricity) under identical conditions, across multiple
-seeds. Mirrors scripts/gate_experiment.py's runner pattern for consistency
+seeds, multiple forecast horizons, and multiple model-size presets (for a
+Pareto accuracy-vs-params comparison rather than one arbitrary size per
+model). Mirrors scripts/gate_experiment.py's runner pattern for consistency
 with the rest of the repo.
+
+Protocol: standard multivariate long-horizon forecasting (Informer/Autoformer/
+PatchTST convention) — given a seq_len window of ALL channels, predict the
+next pred_len steps of ALL channels; report MSE and MAE averaged over the
+full (pred_len, channels) target. Horizons default to the standard ETT set
+{96, 192, 336, 720}.
 
 Usage:
     python benchmarks/timeseries/run_forecasting.py --dataset etth1 \
@@ -32,6 +40,7 @@ sys.path.insert(0, str(ROOT))
 
 from benchmarks.timeseries.data.etth import get_ett_loaders
 from benchmarks.timeseries.data.electricity import get_electricity_loaders
+from benchmarks.timeseries.data.weather import get_weather_loaders
 from benchmarks.timeseries.models.rnn import RNNForecaster
 from benchmarks.timeseries.models.tcn import TCNForecaster
 from benchmarks.timeseries.models.patchtst import PatchTSTForecaster
@@ -55,34 +64,39 @@ def _write_jsonl(path: Path, obj: dict) -> None:
         f.write(json.dumps(obj) + "\n")
 
 
-def build_model(model_name: str, cfg: dict, input_size: int, seq_len: int) -> nn.Module:
-    mcfg = cfg["models"][model_name]
+def build_model(model_name: str, preset_cfg: dict, input_size: int, seq_len: int, pred_len: int) -> nn.Module:
     if model_name == "lstm":
-        return RNNForecaster(input_size, cell_type="lstm", **mcfg)
+        return RNNForecaster(input_size, pred_len, cell_type="lstm", **preset_cfg)
     elif model_name == "gru":
-        return RNNForecaster(input_size, cell_type="gru", **mcfg)
+        return RNNForecaster(input_size, pred_len, cell_type="gru", **preset_cfg)
     elif model_name == "tcn":
-        return TCNForecaster(input_size, **mcfg)
+        return TCNForecaster(input_size, pred_len, **preset_cfg)
     elif model_name == "patchtst":
-        return PatchTSTForecaster(input_size, seq_len=seq_len, **mcfg)
+        return PatchTSTForecaster(input_size, seq_len=seq_len, pred_len=pred_len, **preset_cfg)
     elif model_name == "mamba":
-        return MambaForecaster(input_size, **mcfg)
+        return MambaForecaster(input_size, pred_len, **preset_cfg)
     raise ValueError(f"Unknown model {model_name}")
 
 
-def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int):
+def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int, pred_len: int):
     if dataset_name in ("etth1", "etth2"):
         return get_ett_loaders(
             name=dataset_name, batch_size=batch_size,
-            seq_len=data_cfg["seq_len"], pred_len=data_cfg["pred_len"],
+            seq_len=data_cfg["seq_len"], pred_len=pred_len,
             root=data_cfg["root"], num_workers=data_cfg.get("num_workers", 0),
         )
     elif dataset_name == "electricity":
         return get_electricity_loaders(
             batch_size=batch_size, seq_len=data_cfg["seq_len"],
-            pred_len=data_cfg["pred_len"], root=data_cfg["root"],
+            pred_len=pred_len, root=data_cfg["root"],
             num_workers=data_cfg.get("num_workers", 0),
-            num_clients=data_cfg.get("num_clients", 16),
+            num_clients=data_cfg.get("num_clients", 321),
+        )
+    elif dataset_name == "weather":
+        return get_weather_loaders(
+            batch_size=batch_size, seq_len=data_cfg["seq_len"],
+            pred_len=pred_len, root=data_cfg["root"],
+            num_workers=data_cfg.get("num_workers", 0),
         )
     raise ValueError(f"Unknown forecasting dataset {dataset_name}")
 
@@ -115,10 +129,11 @@ class ForecastRunner:
         self.scheduler = LambdaLR(self.optimizer, lr_lambda)
         self.best_val_mse = float("inf")
         self.best_test_mse = float("inf")
+        self.best_test_mae = float("inf")
 
-    def _run_epoch(self, loader, train: bool) -> float:
+    def _run_epoch(self, loader, train: bool):
         self.model.train(train)
-        total_loss, n = 0.0, 0
+        total_mse, total_mae, n = 0.0, 0.0, 0
         with torch.set_grad_enabled(train):
             for x, y in loader:
                 x, y = x.to(self.device), y.to(self.device)
@@ -132,19 +147,22 @@ class ForecastRunner:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                     self.optimizer.step()
                     self.scheduler.step()
-                total_loss += loss.item() * x.size(0)
+                with torch.no_grad():
+                    mae = F.l1_loss(pred, y)
+                total_mse += loss.item() * x.size(0)
+                total_mae += mae.item() * x.size(0)
                 n += x.size(0)
-        return total_loss / max(n, 1)
+        return total_mse / max(n, 1), total_mae / max(n, 1)
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
         for epoch in range(self.max_epochs):
-            train_mse = self._run_epoch(self.train_loader, train=True)
-            val_mse = self._run_epoch(self.val_loader, train=False)
+            train_mse, train_mae = self._run_epoch(self.train_loader, train=True)
+            val_mse, val_mae = self._run_epoch(self.val_loader, train=False)
             if val_mse < self.best_val_mse:
                 self.best_val_mse = val_mse
-                self.best_test_mse = self._run_epoch(self.test_loader, train=False)
-            m = {"epoch": epoch, "train_mse": train_mse, "val_mse": val_mse}
+                self.best_test_mse, self.best_test_mae = self._run_epoch(self.test_loader, train=False)
+            m = {"epoch": epoch, "train_mse": train_mse, "train_mae": train_mae, "val_mse": val_mse}
             _write_jsonl(metrics_path, m)
             logger.info(
                 f"  epoch {epoch + 1}/{self.max_epochs} "
@@ -154,6 +172,7 @@ class ForecastRunner:
         final = {
             "best_val_mse": self.best_val_mse,
             "test_mse": self.best_test_mse,
+            "test_mae": self.best_test_mae,
             "params": sum(p.numel() for p in self.model.parameters()),
         }
         with open(self.run_dir / "final.json", "w") as f:
@@ -161,60 +180,78 @@ class ForecastRunner:
         return final
 
 
-def run_one(model_name: str, seed: int, cfg: dict, dataset_name: str, results_root: Path, device) -> dict:
-    run_dir = results_root / model_name / f"seed{seed}"
+def run_one(
+    model_name: str, preset_name: str, pred_len: int, seed: int, cfg: dict,
+    dataset_name: str, results_root: Path, device,
+) -> dict:
+    run_dir = results_root / model_name / preset_name / f"h{pred_len}" / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     if (run_dir / "final.json").exists():
-        logger.info(f"  [SKIP] {model_name}/seed{seed} already complete")
+        logger.info(f"  [SKIP] {model_name}/{preset_name}/h{pred_len}/seed{seed} already complete")
         with open(run_dir / "final.json") as f:
             return json.load(f)
 
     set_seed(seed)
-    logger.info(f">>> {model_name} seed={seed} dir={run_dir}")
+    logger.info(f">>> {model_name}/{preset_name} h={pred_len} seed={seed} dir={run_dir}")
 
-    train_loader, val_loader, test_loader = get_loaders(dataset_name, cfg["data"], cfg["training"]["batch_size"])
+    train_loader, val_loader, test_loader = get_loaders(
+        dataset_name, cfg["data"], cfg["training"]["batch_size"], pred_len
+    )
     sample_x, _ = next(iter(train_loader))
     input_size = sample_x.shape[-1]
     seq_len = sample_x.shape[1]
 
-    model = build_model(model_name, cfg, input_size, seq_len)
+    preset_cfg = cfg["models"][model_name]["presets"][preset_name]
+    model = build_model(model_name, preset_cfg, input_size, seq_len, pred_len)
     runner = ForecastRunner(model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device)
     return runner.run()
 
 
-def aggregate_results(results_root: Path, models, seeds) -> dict:
+def aggregate_results(results_root: Path, models, presets, pred_lens, seeds) -> dict:
     summary = {}
     for model_name in models:
-        test_mses, val_mses, params_list = [], [], []
-        for seed in seeds:
-            final_path = results_root / model_name / f"seed{seed}" / "final.json"
-            if not final_path.exists():
-                continue
-            with open(final_path) as f:
-                d = json.load(f)
-            test_mses.append(d.get("test_mse", float("nan")))
-            val_mses.append(d.get("best_val_mse", float("nan")))
-            params_list.append(d.get("params", 0))
-        if not test_mses:
-            continue
+        for preset_name in presets:
+            for pred_len in pred_lens:
+                key = f"{model_name}/{preset_name}/h{pred_len}"
+                test_mses, test_maes, val_mses, params_list = [], [], [], []
+                for seed in seeds:
+                    final_path = results_root / model_name / preset_name / f"h{pred_len}" / f"seed{seed}" / "final.json"
+                    if not final_path.exists():
+                        continue
+                    with open(final_path) as f:
+                        d = json.load(f)
+                    test_mses.append(d.get("test_mse", float("nan")))
+                    test_maes.append(d.get("test_mae", float("nan")))
+                    val_mses.append(d.get("best_val_mse", float("nan")))
+                    params_list.append(d.get("params", 0))
+                if not test_mses:
+                    continue
 
-        def _stats(lst):
-            a = np.array(lst, dtype=float)
-            return {"mean": float(np.nanmean(a)), "std": float(np.nanstd(a)), "runs": len(lst)}
+                def _stats(lst):
+                    a = np.array(lst, dtype=float)
+                    return {"mean": float(np.nanmean(a)), "std": float(np.nanstd(a)), "runs": len(lst)}
 
-        summary[model_name] = {
-            "test_mse": _stats(test_mses),
-            "val_mse": _stats(val_mses),
-            "params": _stats(params_list),
-        }
+                summary[key] = {
+                    "model": model_name,
+                    "preset": preset_name,
+                    "pred_len": pred_len,
+                    "test_mse": _stats(test_mses),
+                    "test_mae": _stats(test_maes),
+                    "val_mse": _stats(val_mses),
+                    "params": _stats(params_list),
+                }
     return summary
 
 
 def main():
     parser = argparse.ArgumentParser(description="Time-series forecasting benchmark")
-    parser.add_argument("--dataset", type=str, required=True, choices=["etth1", "etth2", "electricity"])
+    parser.add_argument("--dataset", type=str, required=True, choices=["etth1", "etth2", "electricity", "weather"])
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--models", nargs="+", default=["all"], choices=ALL_MODELS + ["all"])
+    parser.add_argument("--presets", nargs="+", default=None,
+                         help="Model-size presets to sweep (default: all presets in config, for a Pareto curve)")
+    parser.add_argument("--pred-lens", nargs="+", type=int, default=None,
+                         help="Forecast horizons to sweep (default: config.data.pred_lens)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--results-dir", type=str, required=True)
@@ -235,6 +272,7 @@ def main():
 
     models = ALL_MODELS if "all" in args.models else args.models
     seeds = args.seeds or cfg["experiment"]["seeds"]
+    pred_lens = args.pred_lens or cfg["data"]["pred_lens"]
 
     results_root = Path(args.results_dir)
     results_root.mkdir(parents=True, exist_ok=True)
@@ -243,22 +281,34 @@ def main():
     logger.info(f"Device: {device}")
 
     for model_name in models:
-        for seed in seeds:
-            run_one(model_name, seed, cfg, args.dataset, results_root, device)
+        presets = args.presets or list(cfg["models"][model_name]["presets"].keys())
+        for preset_name in presets:
+            for pred_len in pred_lens:
+                for seed in seeds:
+                    run_one(model_name, preset_name, pred_len, seed, cfg, args.dataset, results_root, device)
 
-    summary = aggregate_results(results_root, models, seeds)
+    # presets may differ per model; for aggregation, take the union actually run
+    all_presets = sorted({p for m in models for p in (args.presets or cfg["models"][m]["presets"].keys())})
+    summary = aggregate_results(results_root, models, all_presets, pred_lens, seeds)
     with open(results_root / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    print("\n" + "=" * 70)
-    print(f"{'MODEL':<12}{'TEST_MSE':>12}{'±STD':>10}{'PARAMS':>14}")
-    print("-" * 70)
-    for model_name, stats in summary.items():
-        print(
-            f"{model_name:<12}{stats['test_mse']['mean']:>12.4f}"
-            f"{stats['test_mse']['std']:>10.4f}{int(stats['params']['mean']):>14,}"
-        )
-    print("=" * 70)
+    # Pareto-sorted printout: params ascending within each horizon
+    print("\n" + "=" * 90)
+    print(f"FORECASTING SUMMARY — {args.dataset}")
+    print("=" * 90)
+    for pred_len in pred_lens:
+        rows = [v for v in summary.values() if v["pred_len"] == pred_len]
+        rows.sort(key=lambda r: r["params"]["mean"])
+        print(f"\n--- horizon={pred_len} ---")
+        print(f"{'MODEL':<10}{'PRESET':<8}{'PARAMS':>12}{'TEST_MSE':>12}{'TEST_MAE':>12}")
+        print("-" * 90)
+        for r in rows:
+            print(
+                f"{r['model']:<10}{r['preset']:<8}{int(r['params']['mean']):>12,}"
+                f"{r['test_mse']['mean']:>12.4f}{r['test_mae']['mean']:>12.4f}"
+            )
+    print("=" * 90)
 
 
 if __name__ == "__main__":

@@ -7,8 +7,13 @@ generalizes data/etth1.py to also cover ETTh2 without duplicating the window/
 split logic.
 
 Each batch yields (x, y):
-    x: (batch, seq_len, 7)   — a window of all 7 channels
-    y: (batch,)              — the OT target `pred_len` steps after the window
+    x: (batch, seq_len, 7)        — a window of all 7 channels
+    y: (batch, pred_len, 7)       — the next pred_len steps, all 7 channels
+
+Multivariate multi-horizon target — matches the standard ETT forecasting
+protocol used by Informer/Autoformer/PatchTST (predict the full future window
+across all channels, not a single scalar), so results are comparable to
+published numbers at the same (seq_len, pred_len) operating point.
 """
 
 import os
@@ -67,10 +72,9 @@ class _ETTWindowDataset(Dataset):
         return max(self.n, 0)
 
     def __getitem__(self, idx: int):
-        x = self.series[idx: idx + self.seq_len]
-        target_idx = idx + self.seq_len + self.pred_len - 1
-        y = self.series[target_idx, -1]
-        return torch.from_numpy(x), torch.tensor(y, dtype=torch.float32)
+        x = self.series[idx: idx + self.seq_len]                                    # (seq_len, C)
+        y = self.series[idx + self.seq_len: idx + self.seq_len + self.pred_len]      # (pred_len, C)
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 
 def get_ett_loaders(

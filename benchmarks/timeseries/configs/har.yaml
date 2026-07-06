@@ -3,6 +3,9 @@
 # batch_size lives in `training:`, num_workers/root live in `data:`. This is
 # deliberate — when TSR's sequence variant is added as a model here, it reads
 # the same training/data sections, no config-schema translation needed.
+#
+# Each model has 4 size presets (s/m/l/xl) so results form a Pareto curve
+# (accuracy vs params) instead of one arbitrary size per model.
 
 task: classification
 
@@ -24,31 +27,35 @@ training:
 
 models:
   lstm:
-    hidden_size: 64
-    num_layers: 2
-    dropout: 0.1
+    presets:
+      s:  {hidden_size: 16, num_layers: 1, dropout: 0.1}
+      m:  {hidden_size: 32, num_layers: 1, dropout: 0.1}
+      l:  {hidden_size: 64, num_layers: 2, dropout: 0.1}
+      xl: {hidden_size: 128, num_layers: 2, dropout: 0.1}
   gru:
-    hidden_size: 64
-    num_layers: 2
-    dropout: 0.1
+    presets:
+      s:  {hidden_size: 16, num_layers: 1, dropout: 0.1}
+      m:  {hidden_size: 32, num_layers: 1, dropout: 0.1}
+      l:  {hidden_size: 64, num_layers: 2, dropout: 0.1}
+      xl: {hidden_size: 128, num_layers: 2, dropout: 0.1}
   tcn:
-    hidden_channels: 64
-    num_levels: 4
-    kernel_size: 3
-    dropout: 0.1
+    presets:
+      s:  {hidden_channels: 16, num_levels: 3, kernel_size: 3, dropout: 0.1}
+      m:  {hidden_channels: 32, num_levels: 3, kernel_size: 3, dropout: 0.1}
+      l:  {hidden_channels: 64, num_levels: 4, kernel_size: 3, dropout: 0.1}
+      xl: {hidden_channels: 128, num_levels: 4, kernel_size: 3, dropout: 0.1}
   patchtst:
-    patch_len: 16
-    stride: 8
-    d_model: 64
-    n_heads: 4
-    num_layers: 3
-    dropout: 0.1
+    presets:
+      s:  {patch_len: 16, stride: 8, d_model: 16, n_heads: 2, num_layers: 2, dropout: 0.1}
+      m:  {patch_len: 16, stride: 8, d_model: 32, n_heads: 4, num_layers: 2, dropout: 0.1}
+      l:  {patch_len: 16, stride: 8, d_model: 64, n_heads: 4, num_layers: 3, dropout: 0.1}
+      xl: {patch_len: 16, stride: 8, d_model: 128, n_heads: 8, num_layers: 3, dropout: 0.1}
   mamba:
-    d_model: 64
-    d_state: 16
-    num_layers: 3
-    expand: 2
-    dropout: 0.1
+    presets:
+      s:  {d_model: 16, d_state: 8, num_layers: 2, expand: 2, dropout: 0.1}
+      m:  {d_model: 32, d_state: 16, num_layers: 2, expand: 2, dropout: 0.1}
+      l:  {d_model: 64, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
+      xl: {d_model: 128, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
   # ── Reserved for TSR (not run here yet — see benchmarks/timeseries/README.md) ──
   # TSR is intentionally excluded from this baseline suite for now. When its
   # sequence variant lands, add a `tsr:` entry here shaped like `regulation:`

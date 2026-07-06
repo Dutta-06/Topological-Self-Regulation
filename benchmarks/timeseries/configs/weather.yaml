@@ -1,13 +1,12 @@
-# Time-series benchmark config — ETTh1 forecasting
+# Time-series benchmark config — Weather forecasting
 # Section layout mirrors configs/default.yaml (TSR's own config) exactly:
 # batch_size lives in `training:`, num_workers/root live in `data:`. This is
 # deliberate — when TSR's sequence variant is added as a model here, it reads
 # the same training/data sections, no config-schema translation needed.
 #
-# Protocol: standard multivariate long-horizon forecasting (Informer/
-# Autoformer/PatchTST convention) — predict the next pred_len steps of ALL
-# 7 channels from a seq_len window, report MSE/MAE over the full target.
-# pred_lens sweeps the standard ETT horizon set {96,192,336,720}.
+# MPI Jena weather station, 2020, 21 channels, 10-min resolution — the
+# standard "Weather" long-horizon forecasting benchmark (Informer/Autoformer/
+# PatchTST). Completes the standard LTSF suite alongside ETTh1/ETTh2/Electricity.
 #
 # Each model has 4 size presets (s/m/l/xl) so results form a Pareto curve
 # (accuracy vs params) instead of one arbitrary size per model.
@@ -15,7 +14,7 @@
 task: forecasting
 
 data:
-  name: etth1
+  name: weather
   root: ./data
   num_workers: 0
   seq_len: 96

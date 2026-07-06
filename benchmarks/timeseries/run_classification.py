@@ -3,7 +3,9 @@ Time-series classification benchmark runner.
 
 Trains LSTM, GRU, TCN, PatchTST, and Mamba baselines on a classification
 dataset (HAR, or one/more UCR/UEA archive datasets) under identical
-conditions, across multiple seeds.
+conditions, across multiple seeds and multiple model-size presets (for a
+Pareto accuracy-vs-params comparison rather than one arbitrary size per
+model).
 
 Usage:
     python benchmarks/timeseries/run_classification.py --dataset har \
@@ -59,18 +61,17 @@ def _write_jsonl(path: Path, obj: dict) -> None:
         f.write(json.dumps(obj) + "\n")
 
 
-def build_model(model_name: str, cfg: dict, input_size: int, seq_len: int, num_classes: int) -> nn.Module:
-    mcfg = cfg["models"][model_name]
+def build_model(model_name: str, preset_cfg: dict, input_size: int, seq_len: int, num_classes: int) -> nn.Module:
     if model_name == "lstm":
-        return RNNClassifier(input_size, num_classes, cell_type="lstm", **mcfg)
+        return RNNClassifier(input_size, num_classes, cell_type="lstm", **preset_cfg)
     elif model_name == "gru":
-        return RNNClassifier(input_size, num_classes, cell_type="gru", **mcfg)
+        return RNNClassifier(input_size, num_classes, cell_type="gru", **preset_cfg)
     elif model_name == "tcn":
-        return TCNClassifier(input_size, num_classes, **mcfg)
+        return TCNClassifier(input_size, num_classes, **preset_cfg)
     elif model_name == "patchtst":
-        return PatchTSTClassifier(input_size, seq_len=seq_len, num_classes=num_classes, **mcfg)
+        return PatchTSTClassifier(input_size, seq_len=seq_len, num_classes=num_classes, **preset_cfg)
     elif model_name == "mamba":
-        return MambaClassifier(input_size, num_classes, **mcfg)
+        return MambaClassifier(input_size, num_classes, **preset_cfg)
     raise ValueError(f"Unknown model {model_name}")
 
 
@@ -165,16 +166,19 @@ class ClassifyRunner:
         return final
 
 
-def run_one(model_name: str, seed: int, cfg: dict, dataset_name: str, results_root: Path, device) -> dict:
-    run_dir = results_root / dataset_name / model_name / f"seed{seed}"
+def run_one(
+    model_name: str, preset_name: str, seed: int, cfg: dict, dataset_name: str,
+    results_root: Path, device,
+) -> dict:
+    run_dir = results_root / dataset_name / model_name / preset_name / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     if (run_dir / "final.json").exists():
-        logger.info(f"  [SKIP] {dataset_name}/{model_name}/seed{seed} already complete")
+        logger.info(f"  [SKIP] {dataset_name}/{model_name}/{preset_name}/seed{seed} already complete")
         with open(run_dir / "final.json") as f:
             return json.load(f)
 
     set_seed(seed)
-    logger.info(f">>> {dataset_name}/{model_name} seed={seed} dir={run_dir}")
+    logger.info(f">>> {dataset_name}/{model_name}/{preset_name} seed={seed} dir={run_dir}")
 
     train_loader, val_loader, test_loader, num_channels, num_classes = get_loaders(
         dataset_name, cfg["data"], cfg["training"]["batch_size"], seed
@@ -182,36 +186,41 @@ def run_one(model_name: str, seed: int, cfg: dict, dataset_name: str, results_ro
     sample_x, _ = next(iter(train_loader))
     seq_len = sample_x.shape[1]
 
-    model = build_model(model_name, cfg, num_channels, seq_len, num_classes)
+    preset_cfg = cfg["models"][model_name]["presets"][preset_name]
+    model = build_model(model_name, preset_cfg, num_channels, seq_len, num_classes)
     runner = ClassifyRunner(model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device)
     return runner.run()
 
 
-def aggregate_results(results_root: Path, dataset_name: str, models, seeds) -> dict:
+def aggregate_results(results_root: Path, dataset_name: str, models, presets, seeds) -> dict:
     summary = {}
     for model_name in models:
-        test_accs, val_accs, params_list = [], [], []
-        for seed in seeds:
-            final_path = results_root / dataset_name / model_name / f"seed{seed}" / "final.json"
-            if not final_path.exists():
+        for preset_name in presets:
+            key = f"{model_name}/{preset_name}"
+            test_accs, val_accs, params_list = [], [], []
+            for seed in seeds:
+                final_path = results_root / dataset_name / model_name / preset_name / f"seed{seed}" / "final.json"
+                if not final_path.exists():
+                    continue
+                with open(final_path) as f:
+                    d = json.load(f)
+                test_accs.append(d.get("test_acc", float("nan")))
+                val_accs.append(d.get("best_val_acc", float("nan")))
+                params_list.append(d.get("params", 0))
+            if not test_accs:
                 continue
-            with open(final_path) as f:
-                d = json.load(f)
-            test_accs.append(d.get("test_acc", float("nan")))
-            val_accs.append(d.get("best_val_acc", float("nan")))
-            params_list.append(d.get("params", 0))
-        if not test_accs:
-            continue
 
-        def _stats(lst):
-            a = np.array(lst, dtype=float)
-            return {"mean": float(np.nanmean(a)), "std": float(np.nanstd(a)), "runs": len(lst)}
+            def _stats(lst):
+                a = np.array(lst, dtype=float)
+                return {"mean": float(np.nanmean(a)), "std": float(np.nanstd(a)), "runs": len(lst)}
 
-        summary[model_name] = {
-            "test_acc": _stats(test_accs),
-            "val_acc": _stats(val_accs),
-            "params": _stats(params_list),
-        }
+            summary[key] = {
+                "model": model_name,
+                "preset": preset_name,
+                "test_acc": _stats(test_accs),
+                "val_acc": _stats(val_accs),
+                "params": _stats(params_list),
+            }
     return summary
 
 
@@ -220,6 +229,8 @@ def main():
     parser.add_argument("--dataset", type=str, required=True, choices=["har", "ucr_uea"])
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--models", nargs="+", default=["all"], choices=ALL_MODELS + ["all"])
+    parser.add_argument("--presets", nargs="+", default=None,
+                         help="Model-size presets to sweep (default: all presets in config, for a Pareto curve)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--ucr-datasets", nargs="+", default=None,
@@ -257,21 +268,26 @@ def main():
     all_summaries = {}
     for dataset_name in dataset_names:
         for model_name in models:
-            for seed in seeds:
-                run_one(model_name, seed, cfg, dataset_name, results_root, device)
-        summary = aggregate_results(results_root, dataset_name, models, seeds)
+            presets = args.presets or list(cfg["models"][model_name]["presets"].keys())
+            for preset_name in presets:
+                for seed in seeds:
+                    run_one(model_name, preset_name, seed, cfg, dataset_name, results_root, device)
+
+        all_presets = sorted({p for m in models for p in (args.presets or cfg["models"][m]["presets"].keys())})
+        summary = aggregate_results(results_root, dataset_name, models, all_presets, seeds)
         all_summaries[dataset_name] = summary
         with open(results_root / dataset_name / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
 
+        rows = sorted(summary.values(), key=lambda r: r["params"]["mean"])
         print("\n" + "=" * 70)
         print(f"DATASET: {dataset_name}")
-        print(f"{'MODEL':<12}{'TEST_ACC':>12}{'±STD':>10}{'PARAMS':>14}")
+        print(f"{'MODEL':<10}{'PRESET':<8}{'PARAMS':>12}{'TEST_ACC':>12}{'±STD':>10}")
         print("-" * 70)
-        for model_name, stats in summary.items():
+        for r in rows:
             print(
-                f"{model_name:<12}{stats['test_acc']['mean']:>12.4f}"
-                f"{stats['test_acc']['std']:>10.4f}{int(stats['params']['mean']):>14,}"
+                f"{r['model']:<10}{r['preset']:<8}{int(r['params']['mean']):>12,}"
+                f"{r['test_acc']['mean']:>12.4f}{r['test_acc']['std']:>10.4f}"
             )
         print("=" * 70)
 
