@@ -23,7 +23,7 @@ data:
 
 training:
   batch_size: 32
-  max_epochs: 50
+  max_epochs: 100
   optimizer: adam
   learning_rate: 0.001
   weight_decay: 0.0001
