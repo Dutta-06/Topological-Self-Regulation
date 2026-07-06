@@ -8,7 +8,9 @@ setup(
     packages=find_packages(),
     python_requires=">=3.9",
     install_requires=[
-        "torch>=2.0.0",
+        # >=2.3.0: benchmarks/timeseries runners use the unified
+        # torch.amp.GradScaler(device=...) API, only available from 2.3 onward.
+        "torch>=2.3.0",
         "torchvision>=0.15.0",
         "torchdiffeq>=0.2.3",
         "hydra-core>=1.3.0",

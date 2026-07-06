@@ -1,6 +1,9 @@
 # TSR: Topological Self-Regulation Framework
 # Core
-torch>=2.0.0
+# torch>=2.3.0: benchmarks/timeseries runners use the unified torch.amp.GradScaler
+# (device=...) API, only available from 2.3 onward (pre-2.3 only had the
+# device-specific torch.cuda.amp.GradScaler).
+torch>=2.3.0
 torchvision>=0.15.0
 torchdiffeq>=0.2.3
 
