@@ -155,6 +155,15 @@ Same convention as `scripts/gate_experiment.py`:
 
 ## Notes on fidelity
 
+- **Mixed precision (AMP)**: both runners use `torch.amp.autocast` +
+  `GradScaler` automatically whenever `device.type == "cuda"` (a no-op on
+  CPU). Numerically verified to reproduce identical MSE/MAE/accuracy to the
+  pre-AMP fp32 runs on ETTh1 and ECG200. Speeds up LSTM/GRU/TCN/PatchTST on
+  any CUDA GPU, and specifically engages Tensor Cores on GPUs that have them
+  (Titan RTX, L4, and other Turing/Ampere/Ada-class cards and newer) — this
+  is on top of, not instead of, the raw hardware speedup from a faster GPU.
+  Does not meaningfully help Mamba, whose bottleneck is sequential kernel-launch
+  overhead (see below), not per-step compute precision.
 - **Mamba**: implements the paper's selective-SSM recurrence exactly (input-
   dependent A/B/C/delta, zero-order-hold discretization) but as a sequential
   Python loop over time rather than the paper's hardware-aware parallel scan

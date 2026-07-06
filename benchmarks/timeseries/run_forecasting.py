@@ -112,6 +112,12 @@ class ForecastRunner:
         self.max_epochs = train_cfg["max_epochs"]
         self.grad_clip = train_cfg.get("grad_clip", 0.0)
 
+        # Mixed precision: only meaningful on CUDA (uses Tensor Cores where
+        # available). GradScaler(enabled=False) is a documented no-op, so this
+        # is always safe to call even on CPU.
+        self.use_amp = device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(device="cuda", enabled=self.use_amp)
+
         lr = train_cfg["learning_rate"]
         wd = train_cfg.get("weight_decay", 0.0)
         warmup = train_cfg.get("warmup_steps", 0)
@@ -139,16 +145,19 @@ class ForecastRunner:
                 x, y = x.to(self.device), y.to(self.device)
                 if train:
                     self.optimizer.zero_grad()
-                pred = self.model(x)
-                loss = F.mse_loss(pred, y)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    pred = self.model(x)
+                    loss = F.mse_loss(pred, y)
                 if train:
-                    loss.backward()
+                    self.scaler.scale(loss).backward()
                     if self.grad_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.optimizer.step()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                     self.scheduler.step()
                 with torch.no_grad():
-                    mae = F.l1_loss(pred, y)
+                    mae = F.l1_loss(pred.float(), y.float())
                 total_mse += loss.item() * x.size(0)
                 total_mae += mae.item() * x.size(0)
                 n += x.size(0)
