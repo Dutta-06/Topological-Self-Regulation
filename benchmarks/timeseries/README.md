@@ -91,7 +91,7 @@ zips from MPI Jena, UCR/UEA subset datasets are similarly small).
 ### One command, everything
 
 ```bash
-bash run_timeseries_baselines.sh              # full sweep: 5 models x 2 presets x 4 horizons, 1 seed
+bash run_timeseries_baselines.sh              # full sweep: 4 models x 2 presets x 4 horizons, 1 seed
 bash run_timeseries_baselines.sh --smoke      # 1 horizon, 3 epochs, lstm/l only — fast pipeline check
 bash run_timeseries_baselines.sh --forecast-only   # etth1 + etth2 + electricity + weather only
 bash run_timeseries_baselines.sh --classify-only   # har + ucr_uea only
@@ -100,8 +100,17 @@ bash run_timeseries_baselines.sh --pred-lens 96 192   # narrow the horizon sweep
 bash run_timeseries_baselines.sh --max-parallel 8     # more concurrent processes on the GPU
 ```
 
+**Mamba runs separately, via `run_timeseries_mamba.sh`** (identical flags) —
+`run_timeseries_baselines.sh` excludes it by default (LSTM/GRU/TCN/PatchTST
+only). Mamba's sequential-scan forward pass is confirmed far slower than the
+other 4 (didn't finish a 2-epoch/2-preset smoke test on Electricity's 321
+channels in 10+ minutes); keeping it in its own script means the fast sweep
+isn't stuck waiting for Mamba before it can print results. Override with
+`--models lstm mamba` (etc.) on the main script if you want Mamba included
+there instead.
+
 **Single seed (42) by default** — no variance estimate, results are point
-estimates. Per forecasting dataset: 5 models × 2 presets × 4 horizons = 40
+estimates. Per forecasting dataset: 4 models × 2 presets × 4 horizons = 32
 training runs, most of that training **concurrently on the GPU**, not
 one-at-a-time — see Parallelism above. Narrow further with
 `--presets`/`--pred-lens`/`--models`, or raise `--max-parallel` if you have

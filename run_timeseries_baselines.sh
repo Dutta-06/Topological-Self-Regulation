@@ -1,16 +1,25 @@
 #!/bin/bash
-# Runs the FULL Table 3 baseline suite: LSTM, GRU, TCN, PatchTST, Mamba on
-# every time-series dataset — ETTh1, ETTh2, Electricity, Weather (forecasting),
-# HAR, UCR/UEA subset (classification). One command, everything.
+# Runs the Table 3 baseline suite — LSTM, GRU, TCN, PatchTST (NOT Mamba, see
+# below) — on every time-series dataset: ETTh1, ETTh2, Electricity, Weather
+# (forecasting), HAR, UCR/UEA subset (classification). One command.
+#
+# Mamba is excluded by default and run via run_timeseries_mamba.sh instead —
+# its sequential Python scan makes it far slower than the other 4 models
+# (confirmed: didn't finish a 2-epoch/2-preset smoke test on Electricity's 321
+# channels in 10+ minutes). Batching it in here would occupy one worker slot
+# for a very long time AND the script wouldn't print final results/summaries
+# until every Mamba task finishes too, since aggregation happens after the
+# whole pool completes. Pass --models explicitly (e.g. --models lstm mamba)
+# to override this default if you really want Mamba included here.
 #
 # Protocol: standard multivariate long-horizon forecasting (all channels,
 # horizons {96,192,336,720}) and 2 size presets per model (l/xl) so results
 # form an accuracy-vs-params Pareto curve rather than one arbitrary size per
-# model. Per forecasting dataset: 5 models x 2 presets x 4 horizons x 1 seed
-# = 40 runs. NOTE: single-seed by default — no variance estimate, results are
-# point estimates only. Electricity uses the standard 321-client scale (not a
-# small subset) and Weather has 21 channels — both genuinely need more
-# capacity than ETT/HAR, not padding.
+# model. Per forecasting dataset: 4 models (lstm/gru/tcn/patchtst) x 2 presets
+# x 4 horizons x 1 seed = 32 runs. NOTE: single-seed by default — no variance
+# estimate, results are point estimates only. Electricity uses the standard
+# 321-client scale (not a small subset) and Weather has 21 channels — both
+# genuinely need more capacity than ETT/HAR, not padding.
 #
 # Parallelism: both runners train multiple (model, preset[, horizon])
 # combinations CONCURRENTLY on the same GPU (--max-parallel, default 4) —
@@ -29,6 +38,9 @@
 #   bash run_timeseries_baselines.sh --presets l      # narrow the size sweep further
 #   bash run_timeseries_baselines.sh --pred-lens 96 192  # narrow the horizon sweep
 #   bash run_timeseries_baselines.sh --max-parallel 8    # more concurrent processes on the GPU
+#   bash run_timeseries_baselines.sh --models lstm mamba # override the default model list (includes Mamba)
+#
+# For Mamba specifically, use run_timeseries_mamba.sh instead.
 
 set -e
 
@@ -38,12 +50,14 @@ RESULTS_ROOT="benchmarks/timeseries/results"
 
 COMMON_ARGS=()
 PRED_LENS_ARGS=()
+MODELS_ARGS=()
 
 for arg in "$@"; do
     case $arg in
         --smoke)
             SEEDS="42"
-            COMMON_ARGS+=(--models lstm --presets l --epochs 3)
+            MODELS_ARGS=(--models lstm)
+            COMMON_ARGS+=(--presets l --epochs 3)
             PRED_LENS_ARGS+=(--pred-lens 96)
             ;;
         --forecast-only) CLASSIFY=false ;;
@@ -53,8 +67,9 @@ done
 FORECAST=${FORECAST:-true}
 CLASSIFY=${CLASSIFY:-true}
 
-# Pass through --presets / --pred-lens / --max-parallel if the user supplied
-# them explicitly (beyond --smoke, which already sets its own narrow defaults).
+# Pass through --presets / --pred-lens / --max-parallel / --models if the user
+# supplied them explicitly (beyond --smoke, which already sets its own narrow
+# defaults above).
 ARGS=("$@")
 for i in "${!ARGS[@]}"; do
     if [[ "${ARGS[$i]}" == "--presets" ]]; then
@@ -74,7 +89,20 @@ for i in "${!ARGS[@]}"; do
     if [[ "${ARGS[$i]}" == "--max-parallel" ]]; then
         COMMON_ARGS+=(--max-parallel "${ARGS[$((i+1))]}")
     fi
+    if [[ "${ARGS[$i]}" == "--models" ]]; then
+        MODELS_ARGS=(--models)
+        j=$((i+1))
+        while [[ $j -lt ${#ARGS[@]} && "${ARGS[$j]}" != --* ]]; do
+            MODELS_ARGS+=("${ARGS[$j]}"); j=$((j+1))
+        done
+    fi
 done
+
+# Default: everything except Mamba (see header comment). Only kicks in when
+# neither --smoke nor an explicit --models was given.
+if [[ ${#MODELS_ARGS[@]} -eq 0 ]]; then
+    MODELS_ARGS=(--models lstm gru tcn patchtst)
+fi
 
 source .venv/bin/activate
 
@@ -91,7 +119,7 @@ run_forecast() {
         --seeds $SEEDS \
         --results-dir "$RESULTS_ROOT/$dataset" \
         --device "$DEVICE" \
-        "${COMMON_ARGS[@]}" "${PRED_LENS_ARGS[@]}"
+        "${MODELS_ARGS[@]}" "${COMMON_ARGS[@]}" "${PRED_LENS_ARGS[@]}"
 }
 
 run_classify() {
@@ -107,7 +135,7 @@ run_classify() {
         --seeds $SEEDS \
         --results-dir "$RESULTS_ROOT/$dataset" \
         --device "$DEVICE" \
-        "${COMMON_ARGS[@]}"
+        "${MODELS_ARGS[@]}" "${COMMON_ARGS[@]}"
 }
 
 if $FORECAST; then
