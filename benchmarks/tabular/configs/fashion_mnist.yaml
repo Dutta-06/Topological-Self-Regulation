@@ -1,0 +1,63 @@
+# Tabular benchmark config — Fashion-MNIST classification (flattened
+# pixels as tabular features)
+# Section layout mirrors benchmarks/timeseries/configs/*.yaml and TSR's own
+# configs/default.yaml.
+#
+# Each 28x28 image -> 784 standardized numeric features, 10 classes, no
+# categoricals — see data/fashion_mnist.py for why Fashion-MNIST (not plain
+# digit MNIST, which every baseline saturates near ~97-99%, making the
+# accuracy column uninformative) and why it's included at all (784 features
+# / 60K rows is genuinely large enough to need real capacity, like
+# Covertype/HIGGS, and it's the single most reviewer-familiar dataset in ML).
+#
+# ResNet-MLP / FT-Transformer / TabNet get the usual l/xl Pareto sweep.
+# SAINT gets a SINGLE preset here (`m`, not l/xl): its intersample attention
+# flattens all 785 tokens (784 features + CLS) into one per-sample vector
+# before attending across the batch, so cost scales with (785*d_token)^2 —
+# at this feature count, d_token=1 (the architectural floor; d_token must be
+# >=1) already costs ~2.5M params. There's no smaller setting to pair it
+# with, so a size sweep isn't meaningful for SAINT on this dataset — see
+# benchmarks/tabular/README.md's fidelity note.
+
+task: classification
+
+data:
+  name: fashion_mnist
+  root: ./data
+  num_workers: 0
+  val_fraction: 0.1
+
+training:
+  batch_size: 256
+  max_epochs: 100
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_steps: 200
+  min_lr: 0.00001
+  grad_clip: 5.0
+
+models:
+  mlp:
+    presets:
+      m: {hidden_size: 350, num_layers: 5, dropout: 0.1}
+  resnet_mlp:
+    presets:
+      l:  {d_main: 192, d_hidden: 384, num_blocks: 4, dropout: 0.1}
+      xl: {d_main: 256, d_hidden: 512, num_blocks: 6, dropout: 0.1}
+  ft_transformer:
+    presets:
+      l:  {d_token: 112, n_heads: 8, num_layers: 3, dropout: 0.1}
+      xl: {d_token: 144, n_heads: 8, num_layers: 4, dropout: 0.1}
+  tabnet:
+    presets:
+      l:  {n_d: 32, n_a: 32, n_steps: 4, gamma: 1.5, dropout: 0.1}
+      xl: {n_d: 48, n_a: 48, n_steps: 5, gamma: 1.5, dropout: 0.1}
+  saint:
+    presets:
+      m: {d_token: 1, n_heads: 1, num_layers: 1, dropout: 0.1}
+  # ── Reserved for TSR (see benchmarks/tabular/README.md) ──
+
+experiment:
+  seeds: [42]
+  device: auto

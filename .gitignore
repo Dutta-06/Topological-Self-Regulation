@@ -29,4 +29,10 @@ data/*.zip
 data/*.txt
 data/UCI HAR Dataset/
 data/ucr_uea/
+data/FashionMNIST/
+data/adult.data
+data/adult.test
+data/cal_housing_py3.pkz
+data/covertype/
+data/HIGGS.csv.gz
 .DS_Store

@@ -1,0 +1,66 @@
+# Tabular benchmark config — Forest Cover Type classification
+# Section layout mirrors benchmarks/timeseries/configs/*.yaml and TSR's own
+# configs/default.yaml.
+#
+# Covertype (581K rows, 54 features, 7 classes) is the second dataset in
+# this suite genuinely large enough to need real capacity — matches the
+# "Revisiting Tabular DL" paper's ResNet/FT-Transformer configs landing in
+# the 1-2M param range for this dataset. ResNet-MLP / FT-Transformer /
+# TabNet / SAINT each get an l/xl preset pair (Pareto curve); MLP is the
+# fixed-size reference.
+#
+# Heterogeneous feature blocks (10 continuous elevation/slope/hillshade
+# features + 44 pre-one-hot binary wilderness/soil-type indicators) make
+# this the dataset where TSR's structural plasticity should show the
+# clearest advantage over a static net of matched size — the "right"
+# per-feature capacity isn't obvious a priori (see [[tsr-core-claim]]).
+#
+# No official train/test split is shipped; fixed-seed 80/10/10 split — see
+# data/covertype.py.
+
+task: classification
+
+data:
+  name: covertype
+  root: ./data
+  num_workers: 0
+  val_fraction: 0.1
+  test_fraction: 0.1
+
+training:
+  batch_size: 512
+  max_epochs: 100
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_steps: 200
+  min_lr: 0.00001
+  grad_clip: 5.0
+
+models:
+  mlp:
+    presets:
+      m: {hidden_size: 400, num_layers: 7, dropout: 0.1}
+  resnet_mlp:
+    presets:
+      l:  {d_main: 224, d_hidden: 448, num_blocks: 5, dropout: 0.1}
+      xl: {d_main: 256, d_hidden: 512, num_blocks: 8, dropout: 0.1}
+  ft_transformer:
+    presets:
+      l:  {d_token: 144, n_heads: 8, num_layers: 4, dropout: 0.1}
+      xl: {d_token: 192, n_heads: 8, num_layers: 5, dropout: 0.1}
+  tabnet:
+    presets:
+      l:  {n_d: 128, n_a: 128, n_steps: 5, gamma: 1.5, dropout: 0.1}
+      xl: {n_d: 192, n_a: 192, n_steps: 6, gamma: 1.5, dropout: 0.1}
+  saint:
+    presets:
+      l:  {d_token: 8,  n_heads: 4, num_layers: 2, dropout: 0.1}
+      xl: {d_token: 11, n_heads: 1, num_layers: 2, dropout: 0.1}
+  # ── Reserved for TSR (see benchmarks/tabular/README.md) ──
+  # Add a `tsr:` entry shaped like `regulation:` in configs/default.yaml
+  # plus `seed_hidden_size` once TSR's tabular/MLP variant (TSRLinear) lands.
+
+experiment:
+  seeds: [42]
+  device: auto

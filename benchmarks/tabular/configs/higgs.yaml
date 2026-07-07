@@ -1,0 +1,64 @@
+# Tabular benchmark config — HIGGS classification
+# Section layout mirrors benchmarks/timeseries/configs/*.yaml and TSR's own
+# configs/default.yaml: batch_size lives in `training:`, num_workers/root
+# live in `data:`.
+#
+# Higgs (subsampled to num_train_rows) is one of two datasets in this suite
+# genuinely large enough to need real capacity without padding — 28
+# continuous features, a famously non-linear decision boundary, up to 1M
+# training rows. ResNet-MLP / FT-Transformer / TabNet / SAINT each get an
+# l/xl preset pair forming a Pareto curve (accuracy vs. params); MLP is the
+# fixed-size reference (its whole point is to NOT be swept).
+#
+# Protocol: last 500,000 rows of the full 11M-row file are the test set
+# (matches the UCI page's documented convention) — see data/higgs.py.
+
+task: classification
+
+data:
+  name: higgs
+  root: ./data
+  num_workers: 0
+  num_train_rows: 1000000
+  val_fraction: 0.05
+
+training:
+  batch_size: 512
+  max_epochs: 100
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_steps: 200
+  min_lr: 0.00001
+  grad_clip: 5.0
+
+models:
+  mlp:
+    presets:
+      m: {hidden_size: 400, num_layers: 7, dropout: 0.1}
+  resnet_mlp:
+    presets:
+      l:  {d_main: 224, d_hidden: 448, num_blocks: 5, dropout: 0.1}
+      xl: {d_main: 256, d_hidden: 512, num_blocks: 8, dropout: 0.1}
+  ft_transformer:
+    presets:
+      l:  {d_token: 144, n_heads: 8, num_layers: 4, dropout: 0.1}
+      xl: {d_token: 192, n_heads: 8, num_layers: 5, dropout: 0.1}
+  tabnet:
+    presets:
+      l:  {n_d: 128, n_a: 128, n_steps: 5, gamma: 1.5, dropout: 0.1}
+      xl: {n_d: 192, n_a: 192, n_steps: 6, gamma: 1.5, dropout: 0.1}
+  saint:
+    presets:
+      l:  {d_token: 16, n_heads: 4, num_layers: 2, dropout: 0.1}
+      xl: {d_token: 22, n_heads: 2, num_layers: 2, dropout: 0.1}
+  # ── Reserved for TSR (not run here yet — see benchmarks/tabular/README.md) ──
+  # TSR is intentionally excluded from this baseline suite for now. When its
+  # tabular/MLP variant (TSRLinear) lands, add a `tsr:` entry here shaped
+  # like `regulation:` in configs/default.yaml, plus a `seed_hidden_size` —
+  # TSR starts small and grows, rather than training at a fixed width like
+  # the baselines above.
+
+experiment:
+  seeds: [42]
+  device: auto

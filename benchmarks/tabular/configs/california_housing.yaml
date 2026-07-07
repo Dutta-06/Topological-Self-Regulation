@@ -1,0 +1,50 @@
+# Tabular benchmark config — California Housing regression
+# Section layout mirrors benchmarks/timeseries/configs/*.yaml and TSR's own
+# configs/default.yaml.
+#
+# Small dataset (20,640 rows), 8 continuous features, no categoricals — no
+# preset sweep needed, single fixed model size per baseline.
+#
+# Target (median house value, $100,000s) is standardized for training and
+# unstandardized before computing metrics — see data/california_housing.py.
+
+task: regression
+
+data:
+  name: california_housing
+  root: ./data
+  num_workers: 0
+  val_fraction: 0.1
+  test_fraction: 0.2
+
+training:
+  batch_size: 256
+  max_epochs: 100
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_steps: 100
+  min_lr: 0.00001
+  grad_clip: 5.0
+
+models:
+  mlp:
+    presets:
+      m: {hidden_size: 64, num_layers: 2, dropout: 0.1}
+  resnet_mlp:
+    presets:
+      m: {d_main: 64, d_hidden: 128, num_blocks: 2, dropout: 0.1}
+  ft_transformer:
+    presets:
+      m: {d_token: 32, n_heads: 4, num_layers: 2, dropout: 0.1}
+  tabnet:
+    presets:
+      m: {n_d: 32, n_a: 32, n_steps: 3, gamma: 1.5, dropout: 0.1}
+  saint:
+    presets:
+      m: {d_token: 8, n_heads: 2, num_layers: 2, dropout: 0.1}
+  # ── Reserved for TSR (see benchmarks/tabular/README.md) ──
+
+experiment:
+  seeds: [42]
+  device: auto
