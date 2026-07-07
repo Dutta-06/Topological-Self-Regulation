@@ -91,8 +91,8 @@ zips from MPI Jena, UCR/UEA subset datasets are similarly small).
 ### One command, everything
 
 ```bash
-bash run_timeseries_baselines.sh              # full sweep: 5 models x 2 presets x 4 horizons x 3 seeds
-bash run_timeseries_baselines.sh --smoke      # 1 seed/horizon, 3 epochs, lstm/l only — fast pipeline check
+bash run_timeseries_baselines.sh              # full sweep: 5 models x 2 presets x 4 horizons, 1 seed
+bash run_timeseries_baselines.sh --smoke      # 1 horizon, 3 epochs, lstm/l only — fast pipeline check
 bash run_timeseries_baselines.sh --forecast-only   # etth1 + etth2 + electricity + weather only
 bash run_timeseries_baselines.sh --classify-only   # har + ucr_uea only
 bash run_timeseries_baselines.sh --presets l       # narrow the size sweep further
@@ -100,12 +100,13 @@ bash run_timeseries_baselines.sh --pred-lens 96 192   # narrow the horizon sweep
 bash run_timeseries_baselines.sh --max-parallel 8     # more concurrent processes on the GPU
 ```
 
-**This is a much bigger sweep than a single-point run** — per forecasting
-dataset: 5 models × 2 presets × 4 horizons × 3 seeds = 120 training runs, but
-most of that is (model, preset, horizon) combinations training **concurrently
-on the GPU**, not one-at-a-time — see Parallelism above. Narrow with
-`--presets`/`--pred-lens`/`--models` if you need an even faster pass, or raise
-`--max-parallel` if you have GPU headroom to spare.
+**Single seed (42) by default** — no variance estimate, results are point
+estimates. Per forecasting dataset: 5 models × 2 presets × 4 horizons = 40
+training runs, most of that training **concurrently on the GPU**, not
+one-at-a-time — see Parallelism above. Narrow further with
+`--presets`/`--pred-lens`/`--models`, or raise `--max-parallel` if you have
+GPU headroom to spare. Pass `--seeds 42 123 456` explicitly (to either Python
+script) if/when you want a variance estimate for the final paper numbers.
 
 Or run each dataset individually:
 

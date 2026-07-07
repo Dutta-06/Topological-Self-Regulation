@@ -62,5 +62,5 @@ models:
   # above.
 
 experiment:
-  seeds: [42, 123, 456]
+  seeds: [42]
   device: auto

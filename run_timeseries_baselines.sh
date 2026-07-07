@@ -6,10 +6,11 @@
 # Protocol: standard multivariate long-horizon forecasting (all channels,
 # horizons {96,192,336,720}) and 2 size presets per model (l/xl) so results
 # form an accuracy-vs-params Pareto curve rather than one arbitrary size per
-# model. Per forecasting dataset: 5 models x 2 presets x 4 horizons x 3 seeds
-# = 120 runs. Electricity uses the standard 321-client scale (not a small
-# subset) and Weather has 21 channels — both genuinely need more capacity
-# than ETT/HAR, not padding.
+# model. Per forecasting dataset: 5 models x 2 presets x 4 horizons x 1 seed
+# = 40 runs. NOTE: single-seed by default — no variance estimate, results are
+# point estimates only. Electricity uses the standard 321-client scale (not a
+# small subset) and Weather has 21 channels — both genuinely need more
+# capacity than ETT/HAR, not padding.
 #
 # Parallelism: both runners train multiple (model, preset[, horizon])
 # combinations CONCURRENTLY on the same GPU (--max-parallel, default 4) —
@@ -21,7 +22,7 @@
 # TSR itself is intentionally excluded (see benchmarks/timeseries/README.md).
 #
 # Usage:
-#   bash run_timeseries_baselines.sh              # full sweep, 3 seeds each
+#   bash run_timeseries_baselines.sh              # full sweep, 1 seed
 #   bash run_timeseries_baselines.sh --smoke      # 1 seed/horizon, 3 epochs, lstm/l only
 #   bash run_timeseries_baselines.sh --forecast-only
 #   bash run_timeseries_baselines.sh --classify-only
@@ -31,7 +32,7 @@
 
 set -e
 
-SEEDS="42 123 456"
+SEEDS="42"
 DEVICE="auto"
 RESULTS_ROOT="benchmarks/timeseries/results"
 
