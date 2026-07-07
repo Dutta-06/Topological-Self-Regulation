@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
+from tsr.layers.tsr_conv1d import TSRConv1d
 from tsr.layers.tsr_norm import TSRGroupNorm
 from tsr.regulation.monitor import StructuralPlasticityMonitor
 from tsr.regulation.signals import (
@@ -92,7 +93,7 @@ def _get_layer_pair(
     norm_modules = []
 
     for name, module in model.named_modules():
-        if isinstance(module, (TSRLinear, TSRConv2d)):
+        if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
             tsr_modules.append((name, module))
         elif isinstance(module, TSRGroupNorm):
             norm_modules.append((name, module))
@@ -127,7 +128,7 @@ def _get_layer_pair(
             if isinstance(module, TSRGroupNorm):
                 norm_between = module
                 break
-            if isinstance(module, (TSRLinear, TSRConv2d)):
+            if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 break  # Hit next TSR layer without finding norm
 
     return target_layer, next_layer, norm_between
@@ -181,7 +182,7 @@ def _seed_grown_from_phantom(
 
     target = None
     for name, module in model.named_modules():
-        if name == layer_name and isinstance(module, (TSRLinear, TSRConv2d)):
+        if name == layer_name and isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
             target = module
             break
     if target is None:
@@ -232,7 +233,7 @@ def prune_neurons_paired(
     if isinstance(target, TSRLinear):
         target.prune_neurons(indices)
         new_size = target.out_features
-    elif isinstance(target, TSRConv2d):
+    elif isinstance(target, (TSRConv2d, TSRConv1d)):
         target.prune_channels(indices)
         new_size = target.out_channels
     else:
@@ -241,14 +242,15 @@ def prune_neurons_paired(
     # 2. Update the next layer's input dimension
     if next_layer is not None:
         if isinstance(next_layer, TSRLinear) and isinstance(target, TSRConv2d):
-            # Bridging Conv -> Linear: multiply by spatial size (4x4 = 16)
+            # Bridging Conv2d -> Linear: multiply by spatial size (4x4 = 16)
+            # (VGG architecture: adaptive avg pool to 4x4 before classifier)
             linear_indices = []
             for idx in indices.tolist():
                 linear_indices.extend(range(idx * 16, (idx + 1) * 16))
             next_layer.prune_input_channels(
                 torch.tensor(linear_indices, device=indices.device)
             )
-        elif isinstance(next_layer, (TSRLinear, TSRConv2d)):
+        elif isinstance(next_layer, (TSRLinear, TSRConv2d, TSRConv1d)):
             next_layer.prune_input_channels(indices)
 
     # 3. Resize any norm layer between them
@@ -312,7 +314,7 @@ def grow_neurons_paired(
     if isinstance(target, TSRLinear):
         target.grow_neurons(n, init_scale=init_scale, newborn_gate=newborn_gate, step=step)
         new_size = target.out_features
-    elif isinstance(target, TSRConv2d):
+    elif isinstance(target, (TSRConv2d, TSRConv1d)):
         target.grow_channels(n, init_scale=init_scale, newborn_gate=newborn_gate, step=step)
         new_size = target.out_channels
     else:
@@ -321,9 +323,10 @@ def grow_neurons_paired(
     # 2. Update the next layer's input dimension
     if next_layer is not None:
         if isinstance(next_layer, TSRLinear) and isinstance(target, TSRConv2d):
-            # Bridging Conv -> Linear: multiply by spatial size (4x4 = 16)
+            # Bridging Conv2d -> Linear: multiply by spatial size (4x4 = 16)
+            # (VGG architecture: adaptive avg pool to 4x4 before classifier)
             next_layer.grow_input_channels(n * 16)
-        elif isinstance(next_layer, (TSRLinear, TSRConv2d)):
+        elif isinstance(next_layer, (TSRLinear, TSRConv2d, TSRConv1d)):
             next_layer.grow_input_channels(n)
 
     # 3. Resize any norm layer between them
@@ -409,7 +412,7 @@ def apply_structural_update(
 
     tsr_layers = {}
     for name, module in model.named_modules():
-        if isinstance(module, (TSRLinear, TSRConv2d)):
+        if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
             tsr_layers[name] = module
 
     # The final TSR layer is the output head: its width IS the number of task
@@ -515,7 +518,7 @@ def apply_structural_update(
 
             if isinstance(layer, TSRLinear):
                 layer_widths[layer_name] = layer.out_features
-            elif isinstance(layer, TSRConv2d):
+            elif isinstance(layer, (TSRConv2d, TSRConv1d)):
                 layer_widths[layer_name] = layer.out_channels
 
         # Log all scores for diagnostics

@@ -52,13 +52,37 @@ models:
       l:  {d_model: 64, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
       xl: {d_model: 128, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
   # ── Reserved for TSR (not run here yet — see benchmarks/timeseries/README.md) ──
-  # TSR is intentionally excluded from this baseline suite for now. When its
-  # sequence variant lands, add a `tsr:` entry here shaped like `regulation:`
-  # in configs/default.yaml (phantom_k, phantom_threshold, newborn_gate_init,
-  # newborn_protect_steps, gate_sparsity_coeff, growth_rate, max_neurons_per_layer,
-  # update_interval, cooldown_steps) plus a `seed_hidden_size` — TSR starts
-  # small and grows, rather than training at a fixed width like the baselines
-  # above.
+
+# TSR configuration — Topological Self-Regulating TCN
+tsr:
+  seed_channels: 64
+  num_levels: 4
+  kernel_size: 3
+  gate_init: 3.0
+  act_init: relu
+  norm_group_size: 8
+  update_interval: 200
+  monitor_window: 100
+  death_threshold: 0.01
+  min_neurons_per_layer: 4
+  gate_sparsity_coeff: 0.0001
+  growth_enabled: true
+  growth_rate: 0.2
+  max_neurons_per_layer: 512
+  bottleneck_threshold: 0.1
+  phantom_k: 8
+  phantom_threshold: 0.005
+  max_growth_per_update: 2
+  growth_cooldown_steps: 1000
+  newborn_gate_init: 0.0
+  newborn_protect_steps: 400
+  layer_insertion_enabled: true
+  layer_insertion_threshold: 2.0
+  max_blocks: 16
+  cooldown_steps: 50
+  anneal_structural_rate: false
+  anneal_start_step: 5000
+  anneal_factor: 0.95
 
 experiment:
   seeds: [42]

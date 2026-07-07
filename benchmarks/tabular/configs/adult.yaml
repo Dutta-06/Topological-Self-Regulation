@@ -43,6 +43,39 @@ models:
       m: {d_token: 8, n_heads: 2, num_layers: 2, dropout: 0.1}
   # ── Reserved for TSR (see benchmarks/tabular/README.md) ──
 
+# TSR configuration — Topological Self-Regulating MLP
+tsr:
+  # Seed architecture: minimal hidden layers that will grow during training
+  seed_hidden: [64, 64]
+  cat_emb_dim: 8
+  # Gate/activation initialization
+  gate_init: 3.0
+  act_init: relu
+  norm_group_size: 8
+  # Regulation parameters (from configs/default.yaml)
+  update_interval: 200
+  monitor_window: 100
+  death_threshold: 0.01
+  min_neurons_per_layer: 4
+  gate_sparsity_coeff: 0.0001
+  growth_enabled: true
+  growth_rate: 0.2
+  max_neurons_per_layer: 512
+  bottleneck_threshold: 0.1
+  phantom_k: 8
+  phantom_threshold: 0.005
+  max_growth_per_update: 2
+  growth_cooldown_steps: 1000
+  newborn_gate_init: 0.0
+  newborn_protect_steps: 400
+  layer_insertion_enabled: true
+  layer_insertion_threshold: 2.0
+  max_blocks: 16
+  cooldown_steps: 50
+  anneal_structural_rate: false
+  anneal_start_step: 5000
+  anneal_factor: 0.95
+
 experiment:
   seeds: [42]
   device: auto

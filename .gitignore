@@ -36,3 +36,4 @@ data/cal_housing_py3.pkz
 data/covertype/
 data/HIGGS.csv.gz
 .DS_Store
+.commandcode

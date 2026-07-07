@@ -43,6 +43,7 @@ import torch.nn.functional as F
 
 from tsr.layers.tsr_linear import TSRLinear, ACTIVATION_FNS
 from tsr.layers.tsr_conv import TSRConv2d
+from tsr.layers.tsr_conv1d import TSRConv1d
 
 
 class PhantomProbe(nn.Module):
@@ -63,11 +64,18 @@ class PhantomProbe(nn.Module):
         self.k = k
         self.window = window
         self.is_conv = isinstance(host, TSRConv2d)
+        self.is_conv1d = isinstance(host, TSRConv1d)
 
         if self.is_conv:
             in_ch = host.in_channels
             kh, kw = host.kernel_size
             self.weight = nn.Parameter(torch.empty(k, in_ch, kh, kw))
+            self.stride = host.stride
+            self.padding = host.padding
+        elif self.is_conv1d:
+            in_ch = host.in_channels
+            ks = host.kernel_size
+            self.weight = nn.Parameter(torch.empty(k, in_ch, ks))
             self.stride = host.stride
             self.padding = host.padding
         else:
@@ -110,6 +118,8 @@ class PhantomProbe(nn.Module):
         """
         if self.is_conv:
             h = F.conv2d(x, self.weight, self.bias, self.stride, self.padding)
+        elif self.is_conv1d:
+            h = F.conv1d(x, self.weight, self.bias, self.stride, self.padding)
         else:
             h = F.linear(x, self.weight, self.bias)
 
@@ -128,6 +138,9 @@ class PhantomProbe(nn.Module):
         if self.is_conv:
             # a: (B, k, H, W) → weight each phantom channel by its coeff
             contrib = (a * coeff.view(1, -1, 1, 1)).sum()
+        elif self.is_conv1d:
+            # a: (B, k, L) → weight each phantom channel by its coeff
+            contrib = (a * coeff.view(1, -1, 1)).sum()
         else:
             contrib = (a * coeff.view(1, -1)).sum()
         return contrib
@@ -211,7 +224,7 @@ class PhantomManager(nn.Module):
 
     def _attach(self) -> None:
         for name, module in self.model.named_modules():
-            if isinstance(module, (TSRLinear, TSRConv2d)):
+            if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 key = self._key(name)
                 self.probes[key] = PhantomProbe(module, k=self.k, window=self.window)
                 self._name_map[key] = name
@@ -297,7 +310,7 @@ class PhantomManager(nn.Module):
         self._name_map = {}
         self._captured_input.clear()
         for name, module in self.model.named_modules():
-            if isinstance(module, (TSRLinear, TSRConv2d)):
+            if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 key = self._key(name)
                 # Reuse an existing probe only if its input shape still matches
                 # the host layer's; otherwise build a fresh one.

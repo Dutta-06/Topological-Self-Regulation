@@ -452,5 +452,149 @@ class TestTSRLSTMSequence:
         assert c.shape == (4, 8)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TSRConv1d Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from tsr.layers.tsr_conv1d import TSRConv1d
+
+
+class TestTSRConv1dForward:
+    """Test TSRConv1d forward pass shapes and basic behavior."""
+
+    def test_output_shape(self):
+        layer = TSRConv1d(3, 16, kernel_size=3, padding=1)
+        x = torch.randn(8, 3, 100)
+        out = layer(x)
+        assert out.shape == (8, 16, 100)
+
+    def test_gradient_flow(self):
+        layer = TSRConv1d(3, 8, kernel_size=3, padding=1)
+        x = torch.randn(4, 3, 50)
+        out = layer(x)
+        loss = out.sum()
+        loss.backward()
+        assert layer.weight.grad is not None
+        assert layer.gate.grad is not None
+
+    def test_gate_values(self):
+        layer = TSRConv1d(3, 8, kernel_size=3, padding=1)
+        gates = layer.gate_values()
+        assert gates.shape == (8,)
+        assert (gates > 0).all()
+
+
+class TestTSRConv1dStructural:
+    """Test TSRConv1d structural modifications."""
+
+    def test_prune_channels(self):
+        layer = TSRConv1d(3, 16, kernel_size=3, padding=1)
+        indices = torch.tensor([0, 2, 4])
+        layer.prune_channels(indices)
+        assert layer.out_channels == 13
+
+    def test_grow_channels(self):
+        layer = TSRConv1d(3, 16, kernel_size=3, padding=1)
+        layer.grow_channels(4, step=100)
+        assert layer.out_channels == 20
+
+    def test_prune_input_channels(self):
+        layer = TSRConv1d(8, 16, kernel_size=3, padding=1)
+        indices = torch.tensor([0, 1])
+        layer.prune_input_channels(indices)
+        assert layer.in_channels == 6
+
+    def test_grow_input_channels(self):
+        layer = TSRConv1d(8, 16, kernel_size=3, padding=1)
+        layer.grow_input_channels(4)
+        assert layer.in_channels == 12
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TSRMLP Tests (benchmarks/tabular/models)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from benchmarks.tabular.models.tsr_mlp import TSRMLP
+
+
+class TestTSRMLPForward:
+    """Test TSRMLP forward pass."""
+
+    def test_output_shape_classification(self):
+        model = TSRMLP(num_numeric=10, cat_cardinalities=[5, 3], num_out=4, seed_hidden=[16, 16])
+        x_num = torch.randn(8, 10)
+        x_cat = torch.stack([torch.randint(0, 5, (8,)), torch.randint(0, 3, (8,))], dim=1)
+        out = model(x_num, x_cat)
+        assert out.shape == (8, 4)
+
+    def test_output_shape_no_categoricals(self):
+        model = TSRMLP(num_numeric=20, cat_cardinalities=[], num_out=1, seed_hidden=[32, 32])
+        x_num = torch.randn(8, 20)
+        x_cat = torch.empty(8, 0, dtype=torch.long)
+        out = model(x_num, x_cat)
+        assert out.shape == (8, 1)
+
+    def test_insert_block(self):
+        model = TSRMLP(num_numeric=10, cat_cardinalities=[], num_out=2, seed_hidden=[16, 16])
+        assert len(model.blocks) == 2
+        model.insert_block(0)
+        assert len(model.blocks) == 3
+
+    def test_topology_state(self):
+        model = TSRMLP(num_numeric=10, cat_cardinalities=[], num_out=2, seed_hidden=[16, 32])
+        topo = model.topology_state()
+        assert topo["depth"] == 2
+        assert topo["hidden_sizes"] == [16, 32]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TSRTCN Tests (benchmarks/timeseries/models)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from benchmarks.timeseries.models.tsr_tcn import TSRTCNForecaster, TSRTCNClassifier
+
+
+class TestTSRTCNForecaster:
+    """Test TSRTCNForecaster forward pass."""
+
+    def test_output_shape(self):
+        model = TSRTCNForecaster(input_size=7, pred_len=96, seed_channels=32, num_levels=3)
+        x = torch.randn(8, 96, 7)
+        out = model(x)
+        assert out.shape == (8, 96, 7)
+
+    def test_insert_block(self):
+        model = TSRTCNForecaster(input_size=7, pred_len=96, seed_channels=32, num_levels=3)
+        assert len(model.encoder.blocks) == 3
+        model.insert_block(1)
+        assert len(model.encoder.blocks) == 4
+
+    def test_topology_state(self):
+        model = TSRTCNForecaster(input_size=7, pred_len=96, seed_channels=32, num_levels=3)
+        topo = model.topology_state()
+        assert topo["num_blocks"] == 3
+        assert topo["seed_channels"] == 32
+
+
+class TestTSRTCNClassifier:
+    """Test TSRTCNClassifier forward pass."""
+
+    def test_output_shape(self):
+        model = TSRTCNClassifier(input_size=9, num_classes=6, seed_channels=32, num_levels=3)
+        x = torch.randn(8, 100, 9)
+        out = model(x)
+        assert out.shape == (8, 6)
+
+    def test_insert_block(self):
+        model = TSRTCNClassifier(input_size=9, num_classes=6, seed_channels=32, num_levels=3)
+        assert len(model.encoder.blocks) == 3
+        model.insert_block(0)
+        assert len(model.encoder.blocks) == 4
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
