@@ -9,7 +9,7 @@
 # 7 channels from a seq_len window, report MSE/MAE over the full target.
 # pred_lens sweeps the standard ETT horizon set {96,192,336,720}.
 #
-# Each model has 4 size presets (s/m/l/xl) so results form a Pareto curve
+# Each model has 2 size presets (l/xl) so results form a Pareto curve
 # (accuracy vs params) instead of one arbitrary size per model.
 
 task: forecasting
@@ -34,32 +34,22 @@ training:
 models:
   lstm:
     presets:
-      s:  {hidden_size: 16, num_layers: 1, dropout: 0.1}
-      m:  {hidden_size: 32, num_layers: 1, dropout: 0.1}
       l:  {hidden_size: 64, num_layers: 2, dropout: 0.1}
       xl: {hidden_size: 128, num_layers: 2, dropout: 0.1}
   gru:
     presets:
-      s:  {hidden_size: 16, num_layers: 1, dropout: 0.1}
-      m:  {hidden_size: 32, num_layers: 1, dropout: 0.1}
       l:  {hidden_size: 64, num_layers: 2, dropout: 0.1}
       xl: {hidden_size: 128, num_layers: 2, dropout: 0.1}
   tcn:
     presets:
-      s:  {hidden_channels: 16, num_levels: 3, kernel_size: 3, dropout: 0.1}
-      m:  {hidden_channels: 32, num_levels: 3, kernel_size: 3, dropout: 0.1}
       l:  {hidden_channels: 64, num_levels: 4, kernel_size: 3, dropout: 0.1}
       xl: {hidden_channels: 128, num_levels: 4, kernel_size: 3, dropout: 0.1}
   patchtst:
     presets:
-      s:  {patch_len: 16, stride: 8, d_model: 16, n_heads: 2, num_layers: 2, dropout: 0.1}
-      m:  {patch_len: 16, stride: 8, d_model: 32, n_heads: 4, num_layers: 2, dropout: 0.1}
       l:  {patch_len: 16, stride: 8, d_model: 64, n_heads: 4, num_layers: 3, dropout: 0.1}
       xl: {patch_len: 16, stride: 8, d_model: 128, n_heads: 8, num_layers: 3, dropout: 0.1}
   mamba:
     presets:
-      s:  {d_model: 16, d_state: 8, num_layers: 2, expand: 2, dropout: 0.1}
-      m:  {d_model: 32, d_state: 16, num_layers: 2, expand: 2, dropout: 0.1}
       l:  {d_model: 64, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
       xl: {d_model: 128, d_state: 16, num_layers: 3, expand: 2, dropout: 0.1}
   # ── Reserved for TSR (not run here yet — see benchmarks/timeseries/README.md) ──

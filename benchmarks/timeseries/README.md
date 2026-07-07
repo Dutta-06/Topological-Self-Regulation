@@ -14,12 +14,13 @@ config/training conditions across 5 datasets.
 Electricity uses **321 client channels** (not a small subset) — the standard
 ECL benchmark scale, selected by earliest-install-date (see
 `data/electricity.py`'s docstring for why this rule, not the original
-papers' unpublished exact client list). At this scale, `s`→`xl` presets span
-**~535K → ~4.4M params** — genuinely large models, because 321 channels
-actually need it, not because anything was padded. Weather completes the
-standard 4-dataset LTSF-forecasting subset we cover (of the canonical 8:
-ETTh1/ETTh2/ETTm1/ETTm2/Electricity/Traffic/Weather/Exchange — we don't yet
-have ETTm1/ETTm2/Traffic/Exchange).
+papers' unpublished exact client list). At this scale, `l`→`xl` presets span
+**~2.1M → ~4.4M params** at the shortest horizon alone, and up to ~15M+ at
+longer horizons (see the 5-20M table below) — genuinely large models, because
+321 channels actually need it, not because anything was padded. Weather
+completes the standard 4-dataset LTSF-forecasting subset we cover (of the
+canonical 8: ETTh1/ETTh2/ETTm1/ETTm2/Electricity/Traffic/Weather/Exchange —
+we don't yet have ETTm1/ETTm2/Traffic/Exchange).
 
 **Traffic (862-sensor PEMS) and the PEMS-SF classification dataset are not
 included.** The continuous "Traffic" forecasting benchmark used by Informer/
@@ -41,11 +42,24 @@ full `(pred_len, channels)` target. `pred_len` sweeps the standard ETT horizon
 set `{96, 192, 336, 720}` — **not** a single scalar/single-channel target, so
 numbers are comparable to published results at the same operating point.
 
-**Every model runs at 4 size presets** (`s`/`m`/`l`/`xl`, see each config's
+**Every model runs at 2 size presets** (`l`/`xl`, see each config's
 `models.<name>.presets`) rather than one arbitrary size. This turns each
-(dataset, horizon) cell into an **accuracy-vs-params Pareto curve** instead of
-a single point per model — the right comparison for an efficiency claim, and
-the only way to avoid "you beat a smaller/undersized baseline" objections.
+(dataset, horizon) cell into an **accuracy-vs-params Pareto point pair**
+instead of a single point per model — the right comparison for an efficiency
+claim, and a way to avoid "you beat a smaller/undersized baseline" objections.
+(Configs originally also had `s`/`m` presets; dropped to keep the sweep
+tractable — `l`/`xl` are used everywhere now.)
+
+**Parallelism**: both runners train multiple (model, preset[, horizon])
+combinations **concurrently on the same GPU** (`--max-parallel`, default 4)
+rather than sequentially — each combination is a separate process (spawn
+context, required for CUDA), and since none of these models alone saturate a
+modern GPU, this gives real speedup rather than just time-slicing through a
+lock. Seeds are *not* parallelized (kept sequential within each process) —
+parallelizing at the (model, preset, horizon) level was simpler and covers
+the actual bottleneck (many small/medium training runs), so seed-level
+parallelism wasn't worth the added complexity. Safe to kill and resume:
+completed combinations are skipped before a process is even spawned for them.
 
 ## Setup
 
@@ -77,17 +91,21 @@ zips from MPI Jena, UCR/UEA subset datasets are similarly small).
 ### One command, everything
 
 ```bash
-bash run_timeseries_baselines.sh              # full sweep: 5 models x 4 presets x 4 horizons x 3 seeds
-bash run_timeseries_baselines.sh --smoke      # 1 seed/preset/horizon, 3 epochs, lstm only — fast pipeline check
+bash run_timeseries_baselines.sh              # full sweep: 5 models x 2 presets x 4 horizons x 3 seeds
+bash run_timeseries_baselines.sh --smoke      # 1 seed/horizon, 3 epochs, lstm/l only — fast pipeline check
 bash run_timeseries_baselines.sh --forecast-only   # etth1 + etth2 + electricity + weather only
 bash run_timeseries_baselines.sh --classify-only   # har + ucr_uea only
-bash run_timeseries_baselines.sh --presets l xl    # narrow the size sweep
+bash run_timeseries_baselines.sh --presets l       # narrow the size sweep further
 bash run_timeseries_baselines.sh --pred-lens 96 192   # narrow the horizon sweep (forecasting only)
+bash run_timeseries_baselines.sh --max-parallel 8     # more concurrent processes on the GPU
 ```
 
 **This is a much bigger sweep than a single-point run** — per forecasting
-dataset: 5 models × 4 presets × 4 horizons × 3 seeds = 240 training runs.
-Narrow with `--presets`/`--pred-lens`/`--models` if you need a faster pass.
+dataset: 5 models × 2 presets × 4 horizons × 3 seeds = 120 training runs, but
+most of that is (model, preset, horizon) combinations training **concurrently
+on the GPU**, not one-at-a-time — see Parallelism above. Narrow with
+`--presets`/`--pred-lens`/`--models` if you need an even faster pass, or raise
+`--max-parallel` if you have GPU headroom to spare.
 
 Or run each dataset individually:
 
@@ -99,8 +117,10 @@ python benchmarks/timeseries/run_forecasting.py --dataset etth1 \
     --results-dir benchmarks/timeseries/results/etth1
 ```
 
-Flags: `--models`, `--presets` (default: all of `s m l xl`), `--pred-lens`
-(default: config's `data.pred_lens`, i.e. `96 192 336 720`), `--seeds`, `--epochs`.
+Flags: `--models`, `--presets` (default: both `l xl`), `--pred-lens`
+(default: config's `data.pred_lens`, i.e. `96 192 336 720`), `--seeds`,
+`--epochs`, `--max-parallel` (default 4 — concurrent (model, preset, horizon)
+processes on the GPU).
 
 ### Classification (HAR / UCR-UEA)
 
@@ -117,7 +137,7 @@ archive coverage, or override per-run with `--ucr-datasets NAME1 NAME2`.
 
 ### Quick smoke test (any command above)
 
-Add `--models lstm --presets s --epochs 3` (plus `--pred-lens 96` for
+Add `--models lstm --presets l --epochs 3` (plus `--pred-lens 96` for
 forecasting) to run just one model at one size for a few epochs — confirms
 the pipeline runs end-to-end in under a minute before committing to the full
 sweep. **Don't point this at your real `--results-dir`** — the runner skips
@@ -188,28 +208,28 @@ Same convention as `scripts/gate_experiment.py`:
   a flatten-based head would make PatchTST alone balloon with no counterpart
   in the other baselines.
 - **TCN**: standard reference architecture (Bai et al.), not a novel variant.
-- **Size presets**: `s`/`m`/`l`/`xl` tiers are chosen per-architecture using
-  each model's natural scaling knob (`hidden_size` for RNNs, `hidden_channels`
-  for TCN, `d_model` for PatchTST/Mamba) — they are **not** hand-tuned to
-  produce identical param counts across model types at each tier. That's
-  intentional: the Pareto curve (accuracy vs. actual param count) is the
-  comparison that matters, not nominal tier labels.
+- **Size presets**: `l`/`xl` tiers are chosen per-architecture using each
+  model's natural scaling knob (`hidden_size` for RNNs, `hidden_channels` for
+  TCN, `d_model` for PatchTST/Mamba) — they are **not** hand-tuned to produce
+  identical param counts across model types at each tier. That's intentional:
+  the Pareto curve (accuracy vs. actual param count) is the comparison that
+  matters, not nominal tier labels.
 
-## Param counts (s → xl range, per dataset)
+## Param counts (l / xl, per dataset)
 
 Computed directly from each config (no training needed — pure architecture
 size). Forecasting counts are at `pred_len=96` (PatchTST's forecast head
 scales with horizon; see fidelity note above).
 
-| Dataset | LSTM | GRU | TCN | PatchTST | Mamba |
+| Dataset | LSTM (l/xl) | GRU (l/xl) | TCN (l/xl) | PatchTST (l/xl) | Mamba (l/xl) |
 |---|---|---|---|---|---|
-| ETTh1 / ETTh2 (7ch) | 13K – 289K | 13K – 238K | 16K – 437K | 24K – 734K | 17K – 452K |
-| **Electricity (321ch)** | **546K – 4.34M** | **540K – 4.25M** | **548K – 4.49M** | 24K – 734K | 535K – 4.38M* |
-| Weather (21ch) | 37K – 469K | 36K – 417K | 40K – 617K | 24K – 734K | 40K – 628K |
-| HAR (9ch, 6cls) | 1.8K – 204K | 1.4K – 153K | 4.7K – 352K | 7.4K – 616K | 5.8K – 367K |
-| ECG200 (1ch, 2cls) | 1.3K – 199K | 0.9K – 150K | 4.1K – 347K | 7.3K – 615K | 5.6K – 365K |
-| FordA (1ch, 2cls) | 1.3K – 199K | 0.9K – 150K | 4.1K – 347K | 8.1K – 622K | 5.6K – 365K |
-| BasicMotions (6ch, 4cls) | 1.6K – 202K | 1.2K – 152K | 4.5K – 350K | 7.3K – 615K | 5.7K – 366K |
+| ETTh1 / ETTh2 (7ch) | 95.6K / 289K | 82.7K / 238K | 133K / 437K | 219K / 734K | 147K / 452K |
+| **Electricity (321ch)** | **2.14M / 4.34M** | **2.10M / 4.25M** | **2.17M / 4.49M** | 219K / 734K | 2.13M / 4.38M* |
+| Weather (21ch) | 187K / 469K | 173K / 417K | 224K / 617K | 219K / 734K | 235K / 628K |
+| HAR (9ch, 6cls) | 52.9K / 204K | 39.8K / 153K | 89.8K / 352K | 157K / 616K | 103K / 367K |
+| ECG200 (1ch, 2cls) | 50.6K / 199K | 38.0K / 150K | 87.5K / 347K | 156K / 615K | 103K / 365K |
+| FordA (1ch, 2cls) | 50.6K / 199K | 38.0K / 150K | 87.5K / 347K | 159K / 622K | 103K / 365K |
+| BasicMotions (6ch, 4cls) | 52.0K / 202K | 39.0K / 152K | 88.9K / 350K | 156K / 615K | 103K / 366K |
 
 \* Mamba-on-Electricity params are correct but the model is currently
 untrained here — see the scaling caveat above.
@@ -232,7 +252,6 @@ size. At Electricity's 321 channels, the horizons we already sweep by default
 | 192 | xl | 8.31M | 8.22M | 8.46M | 8.36M |
 | 336 | l | 7.14M | 7.11M | 7.18M | 7.13M |
 | 336 | xl | 14.28M | 14.19M | 14.42M | 14.32M |
-| 720 | m | 7.67M | 7.66M | 7.68M | 7.66M |
 | 720 | l | 15.16M | 15.12M | 15.19M | 15.15M |
 
 (PatchTST stays at 134K–1.6M across these same cells — its channel-independent

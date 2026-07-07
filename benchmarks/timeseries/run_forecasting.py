@@ -14,6 +14,13 @@ next pred_len steps of ALL channels; report MSE and MAE averaged over the
 full (pred_len, channels) target. Horizons default to the standard ETT set
 {96, 192, 336, 720}.
 
+Parallelism: (model, preset, horizon) combinations train concurrently on the
+same GPU (--max-parallel, default 4) — each is a separate process (spawn
+context) that runs its own seed grid sequentially. Safe to re-run after a
+partial run/kill: already-completed (model, preset, horizon) triples are
+skipped before any process is spawned for them, and individual seed runs
+within an incomplete triple are skipped too (existing final.json).
+
 Usage:
     python benchmarks/timeseries/run_forecasting.py --dataset etth1 \
         --config benchmarks/timeseries/configs/etth1.yaml \
@@ -24,8 +31,10 @@ import argparse
 import json
 import logging
 import math
+import multiprocessing as mp
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -216,6 +225,38 @@ def run_one(
     return runner.run()
 
 
+def _task_fully_done(results_root: Path, model_name: str, preset_name: str, pred_len: int, seeds) -> bool:
+    return all(
+        (results_root / model_name / preset_name / f"h{pred_len}" / f"seed{s}" / "final.json").exists()
+        for s in seeds
+    )
+
+
+def _run_task_worker(
+    model_name: str, preset_name: str, pred_len: int, seeds, cfg: dict,
+    dataset_name: str, results_root_str: str, device_str: str,
+) -> None:
+    """Runs one (model, preset, horizon) combination's full seed grid, sequentially.
+
+    This is the unit of work dispatched to a separate process so multiple
+    (model, preset, horizon) combinations train concurrently on the same GPU —
+    each is a fresh Python interpreter (spawn context, required for CUDA) with
+    its own CUDA context; the driver time-slices them across the same physical
+    device. None of our models saturate a modern GPU alone, so this gets real
+    speedup rather than just serializing through a lock.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [%(levelname)s] {model_name}/{preset_name}/h{pred_len}: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    device = torch.device(device_str)
+    results_root = Path(results_root_str)
+    for seed in seeds:
+        run_one(model_name, preset_name, pred_len, seed, cfg, dataset_name, results_root, device)
+
+
 def aggregate_results(results_root: Path, models, presets, pred_lens, seeds) -> dict:
     summary = {}
     for model_name in models:
@@ -265,6 +306,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--results-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--max-parallel", type=int, default=4,
+                         help="Number of (model, preset) combinations to train concurrently on the GPU")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -289,12 +332,39 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
     logger.info(f"Device: {device}")
 
+    # Flatten to (model, preset) tasks — each trains its full pred_len x seed
+    # grid sequentially inside its own process, but different (model, preset,
+    # horizon) combinations all run concurrently on the same GPU.
+    tasks = []
     for model_name in models:
         presets = args.presets or list(cfg["models"][model_name]["presets"].keys())
         for preset_name in presets:
             for pred_len in pred_lens:
-                for seed in seeds:
-                    run_one(model_name, preset_name, pred_len, seed, cfg, args.dataset, results_root, device)
+                if _task_fully_done(results_root, model_name, preset_name, pred_len, seeds):
+                    logger.info(f"  [SKIP] {model_name}/{preset_name}/h{pred_len} — all seeds already complete")
+                    continue
+                tasks.append((model_name, preset_name, pred_len))
+
+    if tasks:
+        device_str = str(device)
+        ctx = mp.get_context("spawn")  # required for CUDA safety across processes
+        failed = []
+        with ProcessPoolExecutor(max_workers=args.max_parallel, mp_context=ctx) as executor:
+            futures = {
+                executor.submit(
+                    _run_task_worker, m, p, h, seeds, cfg, args.dataset, str(results_root), device_str
+                ): (m, p, h)
+                for m, p, h in tasks
+            }
+            for future in as_completed(futures):
+                m, p, h = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception(f"FAILED {m}/{p}/h{h}")
+                    failed.append((m, p, h))
+        if failed:
+            logger.warning(f"{len(failed)} (model, preset, horizon) combination(s) failed: {failed}")
 
     # presets may differ per model; for aggregation, take the union actually run
     all_presets = sorted({p for m in models for p in (args.presets or cfg["models"][m]["presets"].keys())})

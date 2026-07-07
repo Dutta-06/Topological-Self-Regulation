@@ -22,8 +22,10 @@ import argparse
 import json
 import logging
 import math
+import multiprocessing as mp
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -201,6 +203,36 @@ def run_one(
     return runner.run()
 
 
+def _preset_fully_done(results_root: Path, dataset_name: str, model_name: str, preset_name: str, seeds) -> bool:
+    return all(
+        (results_root / dataset_name / model_name / preset_name / f"seed{s}" / "final.json").exists()
+        for s in seeds
+    )
+
+
+def _run_preset_worker(
+    model_name: str, preset_name: str, seeds, cfg: dict, dataset_name: str,
+    results_root_str: str, device_str: str,
+) -> None:
+    """Runs one (model, preset) combination's full seed grid, sequentially.
+
+    Dispatched to a separate process so multiple presets train concurrently on
+    the same GPU — each is a fresh Python interpreter (spawn context, required
+    for CUDA) with its own CUDA context; the driver time-slices them across
+    the same physical device.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [%(levelname)s] {model_name}/{preset_name}: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    device = torch.device(device_str)
+    results_root = Path(results_root_str)
+    for seed in seeds:
+        run_one(model_name, preset_name, seed, cfg, dataset_name, results_root, device)
+
+
 def aggregate_results(results_root: Path, dataset_name: str, models, presets, seeds) -> dict:
     summary = {}
     for model_name in models:
@@ -246,6 +278,8 @@ def main():
                          help="Override the UCR/UEA dataset list from config.data.datasets")
     parser.add_argument("--results-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--max-parallel", type=int, default=4,
+                         help="Number of (model, preset) combinations to train concurrently on the GPU")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -276,11 +310,38 @@ def main():
 
     all_summaries = {}
     for dataset_name in dataset_names:
+        # Flatten to (model, preset) tasks — each trains its full seed grid
+        # sequentially inside its own process, but different (model, preset)
+        # combinations run concurrently on the same GPU.
+        tasks = []
         for model_name in models:
             presets = args.presets or list(cfg["models"][model_name]["presets"].keys())
             for preset_name in presets:
-                for seed in seeds:
-                    run_one(model_name, preset_name, seed, cfg, dataset_name, results_root, device)
+                if _preset_fully_done(results_root, dataset_name, model_name, preset_name, seeds):
+                    logger.info(f"  [SKIP] {dataset_name}/{model_name}/{preset_name} — all seeds already complete")
+                    continue
+                tasks.append((model_name, preset_name))
+
+        if tasks:
+            device_str = str(device)
+            ctx = mp.get_context("spawn")  # required for CUDA safety across processes
+            failed = []
+            with ProcessPoolExecutor(max_workers=args.max_parallel, mp_context=ctx) as executor:
+                futures = {
+                    executor.submit(
+                        _run_preset_worker, m, p, seeds, cfg, dataset_name, str(results_root), device_str
+                    ): (m, p)
+                    for m, p in tasks
+                }
+                for future in as_completed(futures):
+                    m, p = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception(f"FAILED {dataset_name}/{m}/{p}")
+                        failed.append((m, p))
+            if failed:
+                logger.warning(f"{len(failed)} (model, preset) combination(s) failed: {failed}")
 
         all_presets = sorted({p for m in models for p in (args.presets or cfg["models"][m]["presets"].keys())})
         summary = aggregate_results(results_root, dataset_name, models, all_presets, seeds)
