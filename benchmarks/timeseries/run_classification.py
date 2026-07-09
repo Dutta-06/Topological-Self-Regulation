@@ -94,7 +94,8 @@ def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int, seed: int):
 
 
 class ClassifyRunner:
-    def __init__(self, model, train_loader, val_loader, test_loader, run_dir, train_cfg, device):
+    def __init__(self, model, train_loader, val_loader, test_loader, run_dir, train_cfg, device,
+                 early_stopping_patience: int = 0):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -103,6 +104,9 @@ class ClassifyRunner:
         self.device = device
         self.max_epochs = train_cfg["max_epochs"]
         self.grad_clip = train_cfg.get("grad_clip", 0.0)
+        # 0/None disables early stopping — see run_forecasting.py's ForecastRunner
+        # for why (Mamba-only, via run_timeseries_mamba.sh).
+        self.early_stopping_patience = early_stopping_patience or 0
 
         # Mixed precision: only meaningful on CUDA (uses Tensor Cores where
         # available). GradScaler(enabled=False) is a documented no-op, so this
@@ -154,23 +158,36 @@ class ClassifyRunner:
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
+        epochs_without_improvement = 0
+        stopped_epoch = None
         for epoch in range(self.max_epochs):
             train_loss, train_acc = self._run_epoch(self.train_loader, train=True)
             val_loss, val_acc = self._run_epoch(self.val_loader, train=False)
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
                 _, self.best_test_acc = self._run_epoch(self.test_loader, train=False)
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
             m = {"epoch": epoch, "train_loss": train_loss, "train_acc": train_acc, "val_acc": val_acc}
             _write_jsonl(metrics_path, m)
             logger.info(
                 f"  epoch {epoch + 1}/{self.max_epochs} "
                 f"train_acc={train_acc:.4f} val_acc={val_acc:.4f}"
             )
+            if self.early_stopping_patience > 0 and epochs_without_improvement >= self.early_stopping_patience:
+                stopped_epoch = epoch + 1
+                logger.info(
+                    f"  early stopping at epoch {stopped_epoch}/{self.max_epochs} "
+                    f"(no val_acc improvement for {self.early_stopping_patience} epochs)"
+                )
+                break
 
         final = {
             "best_val_acc": self.best_val_acc,
             "test_acc": self.best_test_acc,
             "params": sum(p.numel() for p in self.model.parameters()),
+            "stopped_epoch": stopped_epoch,
         }
         with open(self.run_dir / "final.json", "w") as f:
             json.dump(final, f, indent=2)
@@ -179,7 +196,7 @@ class ClassifyRunner:
 
 def run_one(
     model_name: str, preset_name: str, seed: int, cfg: dict, dataset_name: str,
-    results_root: Path, device,
+    results_root: Path, device, early_stopping_patience: int = 0,
 ) -> dict:
     run_dir = results_root / dataset_name / model_name / preset_name / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -199,7 +216,10 @@ def run_one(
 
     preset_cfg = cfg["models"][model_name]["presets"][preset_name]
     model = build_model(model_name, preset_cfg, num_channels, seq_len, num_classes)
-    runner = ClassifyRunner(model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device)
+    runner = ClassifyRunner(
+        model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device,
+        early_stopping_patience=early_stopping_patience,
+    )
     return runner.run()
 
 
@@ -212,7 +232,7 @@ def _preset_fully_done(results_root: Path, dataset_name: str, model_name: str, p
 
 def _run_preset_worker(
     model_name: str, preset_name: str, seeds, cfg: dict, dataset_name: str,
-    results_root_str: str, device_str: str,
+    results_root_str: str, device_str: str, early_stopping_patience: int = 0,
 ) -> None:
     """Runs one (model, preset) combination's full seed grid, sequentially.
 
@@ -230,7 +250,10 @@ def _run_preset_worker(
     device = torch.device(device_str)
     results_root = Path(results_root_str)
     for seed in seeds:
-        run_one(model_name, preset_name, seed, cfg, dataset_name, results_root, device)
+        run_one(
+            model_name, preset_name, seed, cfg, dataset_name, results_root, device,
+            early_stopping_patience=early_stopping_patience,
+        )
 
 
 def aggregate_results(results_root: Path, dataset_name: str, models, presets, seeds) -> dict:
@@ -280,6 +303,10 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-parallel", type=int, default=4,
                          help="Number of (model, preset) combinations to train concurrently on the GPU")
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                         help="Stop a run early after this many epochs with no val_acc improvement "
+                              "(0 = disabled, the default; run_timeseries_mamba.sh sets it since Mamba "
+                              "is confirmed far slower than the other 4 baselines)")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -329,7 +356,8 @@ def main():
             with ProcessPoolExecutor(max_workers=args.max_parallel, mp_context=ctx) as executor:
                 futures = {
                     executor.submit(
-                        _run_preset_worker, m, p, seeds, cfg, dataset_name, str(results_root), device_str
+                        _run_preset_worker, m, p, seeds, cfg, dataset_name, str(results_root), device_str,
+                        args.early_stopping_patience,
                     ): (m, p)
                     for m, p in tasks
                 }

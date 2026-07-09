@@ -111,7 +111,8 @@ def get_loaders(dataset_name: str, data_cfg: dict, batch_size: int, pred_len: in
 
 
 class ForecastRunner:
-    def __init__(self, model, train_loader, val_loader, test_loader, run_dir, train_cfg, device):
+    def __init__(self, model, train_loader, val_loader, test_loader, run_dir, train_cfg, device,
+                 early_stopping_patience: int = 0):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -120,6 +121,11 @@ class ForecastRunner:
         self.device = device
         self.max_epochs = train_cfg["max_epochs"]
         self.grad_clip = train_cfg.get("grad_clip", 0.0)
+        # 0/None disables early stopping — the default for every model except
+        # Mamba (see run_timeseries_mamba.sh), which is confirmed far slower
+        # than the other 4 baselines and doesn't need the full fixed epoch
+        # budget once val_mse stops improving.
+        self.early_stopping_patience = early_stopping_patience or 0
 
         # Mixed precision: only meaningful on CUDA (uses Tensor Cores where
         # available). GradScaler(enabled=False) is a documented no-op, so this
@@ -174,24 +180,37 @@ class ForecastRunner:
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
+        epochs_without_improvement = 0
+        stopped_epoch = None
         for epoch in range(self.max_epochs):
             train_mse, train_mae = self._run_epoch(self.train_loader, train=True)
             val_mse, val_mae = self._run_epoch(self.val_loader, train=False)
             if val_mse < self.best_val_mse:
                 self.best_val_mse = val_mse
                 self.best_test_mse, self.best_test_mae = self._run_epoch(self.test_loader, train=False)
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
             m = {"epoch": epoch, "train_mse": train_mse, "train_mae": train_mae, "val_mse": val_mse}
             _write_jsonl(metrics_path, m)
             logger.info(
                 f"  epoch {epoch + 1}/{self.max_epochs} "
                 f"train_mse={train_mse:.4f} val_mse={val_mse:.4f}"
             )
+            if self.early_stopping_patience > 0 and epochs_without_improvement >= self.early_stopping_patience:
+                stopped_epoch = epoch + 1
+                logger.info(
+                    f"  early stopping at epoch {stopped_epoch}/{self.max_epochs} "
+                    f"(no val_mse improvement for {self.early_stopping_patience} epochs)"
+                )
+                break
 
         final = {
             "best_val_mse": self.best_val_mse,
             "test_mse": self.best_test_mse,
             "test_mae": self.best_test_mae,
             "params": sum(p.numel() for p in self.model.parameters()),
+            "stopped_epoch": stopped_epoch,
         }
         with open(self.run_dir / "final.json", "w") as f:
             json.dump(final, f, indent=2)
@@ -200,7 +219,7 @@ class ForecastRunner:
 
 def run_one(
     model_name: str, preset_name: str, pred_len: int, seed: int, cfg: dict,
-    dataset_name: str, results_root: Path, device,
+    dataset_name: str, results_root: Path, device, early_stopping_patience: int = 0,
 ) -> dict:
     run_dir = results_root / model_name / preset_name / f"h{pred_len}" / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -221,7 +240,10 @@ def run_one(
 
     preset_cfg = cfg["models"][model_name]["presets"][preset_name]
     model = build_model(model_name, preset_cfg, input_size, seq_len, pred_len)
-    runner = ForecastRunner(model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device)
+    runner = ForecastRunner(
+        model, train_loader, val_loader, test_loader, run_dir, cfg["training"], device,
+        early_stopping_patience=early_stopping_patience,
+    )
     return runner.run()
 
 
@@ -234,7 +256,7 @@ def _task_fully_done(results_root: Path, model_name: str, preset_name: str, pred
 
 def _run_task_worker(
     model_name: str, preset_name: str, pred_len: int, seeds, cfg: dict,
-    dataset_name: str, results_root_str: str, device_str: str,
+    dataset_name: str, results_root_str: str, device_str: str, early_stopping_patience: int = 0,
 ) -> None:
     """Runs one (model, preset, horizon) combination's full seed grid, sequentially.
 
@@ -254,7 +276,10 @@ def _run_task_worker(
     device = torch.device(device_str)
     results_root = Path(results_root_str)
     for seed in seeds:
-        run_one(model_name, preset_name, pred_len, seed, cfg, dataset_name, results_root, device)
+        run_one(
+            model_name, preset_name, pred_len, seed, cfg, dataset_name, results_root, device,
+            early_stopping_patience=early_stopping_patience,
+        )
 
 
 def aggregate_results(results_root: Path, models, presets, pred_lens, seeds) -> dict:
@@ -308,6 +333,11 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-parallel", type=int, default=4,
                          help="Number of (model, preset) combinations to train concurrently on the GPU")
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                         help="Stop a run early after this many epochs with no val_mse improvement "
+                              "(0 = disabled, the default — every model trains the full fixed epoch "
+                              "count unless this is set; run_timeseries_mamba.sh sets it since Mamba "
+                              "is confirmed far slower than the other 4 baselines)")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
@@ -352,7 +382,8 @@ def main():
         with ProcessPoolExecutor(max_workers=args.max_parallel, mp_context=ctx) as executor:
             futures = {
                 executor.submit(
-                    _run_task_worker, m, p, h, seeds, cfg, args.dataset, str(results_root), device_str
+                    _run_task_worker, m, p, h, seeds, cfg, args.dataset, str(results_root), device_str,
+                    args.early_stopping_patience,
                 ): (m, p, h)
                 for m, p, h in tasks
             }

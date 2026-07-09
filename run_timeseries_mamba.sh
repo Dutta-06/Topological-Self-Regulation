@@ -9,17 +9,25 @@
 # to print final results, and you can run this one separately (overnight,
 # lower priority, fewer epochs, whatever fits) without touching the other 4.
 #
+# Early stopping is ON by default here (patience 10 epochs, no val
+# improvement) — unlike run_timeseries_baselines.sh, which always trains the
+# other 4 models for the full fixed 100 epochs. Given how slow Mamba is,
+# there's no reason to keep training past convergence; the 4 fast baselines
+# don't need this since they finish the full budget quickly anyway.
+#
 # Same flags as run_timeseries_baselines.sh (this is the same script with
 # --models fixed to mamba and no --models override):
 #
 # Usage:
-#   bash run_timeseries_mamba.sh              # full sweep, 1 seed
+#   bash run_timeseries_mamba.sh              # full sweep, 1 seed, early stopping (patience 10)
 #   bash run_timeseries_mamba.sh --smoke      # 1 horizon, 3 epochs, l preset only
 #   bash run_timeseries_mamba.sh --forecast-only
 #   bash run_timeseries_mamba.sh --classify-only
 #   bash run_timeseries_mamba.sh --presets l      # narrow the size sweep further
 #   bash run_timeseries_mamba.sh --pred-lens 96 192  # narrow the horizon sweep
 #   bash run_timeseries_mamba.sh --max-parallel 2    # concurrent (preset, horizon) processes
+#   bash run_timeseries_mamba.sh --early-stopping-patience 20  # override the default patience
+#   bash run_timeseries_mamba.sh --early-stopping-patience 0   # disable early stopping
 
 set -e
 
@@ -27,6 +35,7 @@ SEEDS="42"
 DEVICE="auto"
 RESULTS_ROOT="benchmarks/timeseries/results"
 MODELS_ARGS=(--models mamba)
+EARLY_STOPPING_PATIENCE=10
 
 COMMON_ARGS=()
 PRED_LENS_ARGS=()
@@ -45,8 +54,9 @@ done
 FORECAST=${FORECAST:-true}
 CLASSIFY=${CLASSIFY:-true}
 
-# Pass through --presets / --pred-lens / --max-parallel if the user supplied
-# them explicitly (beyond --smoke, which already sets its own narrow defaults).
+# Pass through --presets / --pred-lens / --max-parallel / --early-stopping-patience
+# if the user supplied them explicitly (beyond --smoke, which already sets
+# its own narrow defaults).
 ARGS=("$@")
 for i in "${!ARGS[@]}"; do
     if [[ "${ARGS[$i]}" == "--presets" ]]; then
@@ -66,7 +76,11 @@ for i in "${!ARGS[@]}"; do
     if [[ "${ARGS[$i]}" == "--max-parallel" ]]; then
         COMMON_ARGS+=(--max-parallel "${ARGS[$((i+1))]}")
     fi
+    if [[ "${ARGS[$i]}" == "--early-stopping-patience" ]]; then
+        EARLY_STOPPING_PATIENCE="${ARGS[$((i+1))]}"
+    fi
 done
+COMMON_ARGS+=(--early-stopping-patience "$EARLY_STOPPING_PATIENCE")
 
 source .venv/bin/activate
 
