@@ -11,8 +11,10 @@ Returns (x, y):
     y: (batch,)  — integer class in [0, 5]
 """
 
+import fcntl
 import os
 import zipfile
+from contextlib import contextmanager
 from typing import Tuple
 from urllib.request import urlretrieve
 
@@ -29,36 +31,60 @@ _SIGNALS = [
 ]
 
 
+@contextmanager
+def _exclusive_lock(root: str):
+    """File lock so concurrent worker processes (run_classification.py's
+    ProcessPoolExecutor, --max-parallel > 1) don't race on the same
+    download/extract — without this, multiple processes call urlretrieve
+    into the same zip path simultaneously, corrupting it, and extraction
+    silently leaves a partial 'UCI HAR Dataset/' missing files."""
+    os.makedirs(root, exist_ok=True)
+    lock_path = os.path.join(root, ".har_download.lock")
+    with open(lock_path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 def _download_and_extract(root: str) -> str:
     """Ensure 'UCI HAR Dataset/' exists under root; download+extract if not."""
     dataset_dir = os.path.join(root, "UCI HAR Dataset")
     if os.path.isdir(dataset_dir):
         return dataset_dir
-    os.makedirs(root, exist_ok=True)
-    zip_path = os.path.join(root, "uci_har.zip")
-    if not os.path.exists(zip_path):
-        print(f"Downloading UCI HAR dataset to {zip_path} ...")
-        urlretrieve(_URL, zip_path)
-    print(f"Extracting {zip_path} ...")
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(root)
 
-    # The current UCI static-download URL wraps the real data one level deeper:
-    # uci_har.zip contains "UCI HAR Dataset.zip" (+ a .names file), not the
-    # extracted folder directly. Unwrap that inner zip if present.
-    if not os.path.isdir(dataset_dir):
-        inner_zip = os.path.join(root, "UCI HAR Dataset.zip")
-        if os.path.exists(inner_zip):
-            print(f"Extracting nested {inner_zip} ...")
-            with zipfile.ZipFile(inner_zip) as zf:
-                zf.extractall(root)
+    with _exclusive_lock(root):
+        # Re-check: another process may have finished the download+extract
+        # while we were waiting for the lock.
+        if os.path.isdir(dataset_dir):
+            return dataset_dir
 
-    if not os.path.isdir(dataset_dir):
-        raise FileNotFoundError(
-            f"Expected '{dataset_dir}' after extraction but it wasn't found. "
-            f"Check the archive layout under {root}."
-        )
-    return dataset_dir
+        zip_path = os.path.join(root, "uci_har.zip")
+        if not os.path.exists(zip_path):
+            print(f"Downloading UCI HAR dataset to {zip_path} ...")
+            urlretrieve(_URL, zip_path)
+        print(f"Extracting {zip_path} ...")
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(root)
+
+        # The current UCI static-download URL wraps the real data one level
+        # deeper: uci_har.zip contains "UCI HAR Dataset.zip" (+ a .names
+        # file), not the extracted folder directly. Unwrap that inner zip
+        # if present.
+        if not os.path.isdir(dataset_dir):
+            inner_zip = os.path.join(root, "UCI HAR Dataset.zip")
+            if os.path.exists(inner_zip):
+                print(f"Extracting nested {inner_zip} ...")
+                with zipfile.ZipFile(inner_zip) as zf:
+                    zf.extractall(root)
+
+        if not os.path.isdir(dataset_dir):
+            raise FileNotFoundError(
+                f"Expected '{dataset_dir}' after extraction but it wasn't found. "
+                f"Check the archive layout under {root}."
+            )
+        return dataset_dir
 
 
 def _load_split(dataset_dir: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
