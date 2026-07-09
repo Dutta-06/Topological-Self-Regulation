@@ -28,7 +28,7 @@ data:
   val_fraction: 0.1
 
 training:
-  batch_size: 256
+  batch_size: 64
   max_epochs: 100
   optimizer: adam
   learning_rate: 0.001

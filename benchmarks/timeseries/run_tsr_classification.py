@@ -399,7 +399,7 @@ class StaticFinalClassificationRunner:
             )
 
         final = {
-            "best_val_accuracy": self.best_val_acc,
+            "best_val_acc": self.best_val_acc,
             "params": count_parameters(self.model),
             **{f"test_{k}": v for k, v in self.best_test_metrics.items()},
         }
