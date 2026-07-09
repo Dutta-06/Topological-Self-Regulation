@@ -31,7 +31,12 @@ PARALLEL=3
 EPOCHS=""
 RESULTS_ROOT="benchmarks/timeseries/results"
 FORECAST_DATASETS=(etth1 etth2 electricity weather)
-CLASSIFY_DATASETS=(har ucr_uea)
+# run_tsr_classification.py has no internal loop over UCR/UEA sub-datasets
+# (unlike the baseline runner) — "ucr_uea" is not itself a valid --dataset,
+# each archive dataset name (from configs/ucr_uea.yaml's data.datasets) must
+# be submitted individually. CLASSIFY_DATASETS holds the literal --dataset
+# values; UCR_UEA_CONFIG maps the UCR ones back to the shared config file.
+CLASSIFY_DATASETS=(har ECG200 FordA BasicMotions)
 HORIZONS=(96 192 336 720)
 FORECAST=true
 CLASSIFY=true
@@ -75,7 +80,8 @@ for i in "${!ARGS[@]}"; do
                 d="${ARGS[$j]}"
                 case $d in
                     etth1|etth2|electricity|weather) FORECAST_DATASETS+=("$d") ;;
-                    har|ucr_uea) CLASSIFY_DATASETS+=("$d") ;;
+                    har|ECG200|FordA|BasicMotions) CLASSIFY_DATASETS+=("$d") ;;
+                    ucr_uea) CLASSIFY_DATASETS+=(ECG200 FordA BasicMotions) ;;
                     *) echo "Unknown dataset: $d"; exit 1 ;;
                 esac
                 j=$((j+1))
@@ -175,13 +181,25 @@ submit_classify() {
     local dataset=$1
     local tag="$dataset"
     local logfile="$LOG_DIR/tsr_ts_${dataset}.log"
+    local config="benchmarks/timeseries/configs/$dataset.yaml"
+    local results_dir="$RESULTS_ROOT/$dataset"
+
+    # ECG200/FordA/BasicMotions share configs/ucr_uea.yaml (no per-dataset
+    # config file exists) and live under results/ucr_uea/<name>, matching
+    # the baseline runner's layout.
+    case $dataset in
+        ECG200|FordA|BasicMotions)
+            config="benchmarks/timeseries/configs/ucr_uea.yaml"
+            results_dir="$RESULTS_ROOT/ucr_uea/$dataset"
+            ;;
+    esac
 
     echo "[START] $tag (log: $logfile)"
     python benchmarks/timeseries/run_tsr_classification.py \
         --dataset "$dataset" \
-        --config "benchmarks/timeseries/configs/$dataset.yaml" \
+        --config "$config" \
         --seeds $SEEDS \
-        --results-dir "$RESULTS_ROOT/$dataset" \
+        --results-dir "$results_dir" \
         --device "$DEVICE" \
         --max-parallel 1 \
         $EPOCHS \
@@ -260,7 +278,11 @@ if $CLASSIFY; then
     echo ""
     echo "------------------------------------------------------------------------"
     for dataset in "${CLASSIFY_DATASETS[@]}"; do
-        final="$RESULTS_ROOT/$dataset/tsr/default/seed42/final.json"
+        results_dir="$RESULTS_ROOT/$dataset"
+        case $dataset in
+            ECG200|FordA|BasicMotions) results_dir="$RESULTS_ROOT/ucr_uea/$dataset" ;;
+        esac
+        final="$results_dir/tsr/default/seed42/final.json"
         if [[ -f "$final" ]]; then
             read_params=$(python3 -c "
 import json
