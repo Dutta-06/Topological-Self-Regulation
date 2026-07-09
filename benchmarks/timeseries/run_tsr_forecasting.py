@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
@@ -301,7 +302,9 @@ class TSRForecastingRunner:
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
-        for epoch in range(self.max_epochs):
+        tag = "/".join(self.run_dir.parts[-3:])
+        pbar = tqdm(range(self.max_epochs), desc=tag, unit="epoch", dynamic_ncols=True)
+        for epoch in pbar:
             train_loss, train_m = self._run_epoch(self.train_loader, train=True)
             val_loss, val_m = self._run_epoch(self.val_loader, train=False)
 
@@ -320,10 +323,9 @@ class TSRForecastingRunner:
                 "num_structural_events": len(self.events),
             }
             _write_jsonl(metrics_path, m)
-            logger.info(
-                f"  epoch {epoch + 1}/{self.max_epochs} "
-                f"val_mse={val_m['mse']:.4f} val_mae={val_m['mae']:.4f} "
-                f"params={count_parameters(self.model):,} events={len(self.events)}"
+            pbar.set_postfix(
+                val_mse=f"{val_m['mse']:.4f}", val_mae=f"{val_m['mae']:.4f}",
+                params=f"{count_parameters(self.model):,}", events=len(self.events),
             )
 
         final = {
@@ -420,7 +422,9 @@ class StaticFinalForecastingRunner:
         return avg_loss, {"mse": mse, "mae": mae, "rmse": math.sqrt(mse)}
 
     def run(self) -> dict:
-        for epoch in range(self.max_epochs):
+        tag = "/".join(self.run_dir.parts[-3:])
+        pbar = tqdm(range(self.max_epochs), desc=f"[static] {tag}", unit="epoch", dynamic_ncols=True)
+        for epoch in pbar:
             self._run_epoch(self.train_loader, train=True)
             val_loss, val_m = self._run_epoch(self.val_loader, train=False)
 
@@ -429,10 +433,7 @@ class StaticFinalForecastingRunner:
                 self.best_val_mse = val_m["mse"]
                 _, self.best_test_metrics = self._run_epoch(self.test_loader, train=False)
 
-            logger.info(
-                f"  [static] epoch {epoch + 1}/{self.max_epochs} "
-                f"val_mse={val_m['mse']:.4f} val_mae={val_m['mae']:.4f}"
-            )
+            pbar.set_postfix(val_mse=f"{val_m['mse']:.4f}", val_mae=f"{val_m['mae']:.4f}")
 
         final = {
             "best_val_mse": self.best_val_mse,

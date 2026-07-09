@@ -131,7 +131,7 @@ run_dataset() {
         --max-parallel 1 \
         $EPOCHS \
         "${EXTRA_ARGS[@]}" \
-        > "$logfile" 2>&1 &
+        > >(tee "$logfile") 2>&1 &
     PIDS+=($!)
     NAMES+=("$dataset")
     RUNNING=$((RUNNING + 1))

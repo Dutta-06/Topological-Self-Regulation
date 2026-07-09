@@ -171,7 +171,7 @@ submit_forecast() {
         --max-parallel 1 \
         $EPOCHS \
         "${EXTRA_ARGS[@]}" \
-        > "$logfile" 2>&1 &
+        > >(tee "$logfile") 2>&1 &
     PIDS+=($!)
     NAMES+=("$tag")
     RUNNING=$((RUNNING + 1))
@@ -204,7 +204,7 @@ submit_classify() {
         --max-parallel 1 \
         $EPOCHS \
         "${EXTRA_ARGS[@]}" \
-        > "$logfile" 2>&1 &
+        > >(tee "$logfile") 2>&1 &
     PIDS+=($!)
     NAMES+=("$tag")
     RUNNING=$((RUNNING + 1))
