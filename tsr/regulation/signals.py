@@ -53,6 +53,13 @@ def gate_sparsity_penalty(model: nn.Module) -> torch.Tensor:
     gate_counts = 0
     for module in model.modules():
         if isinstance(module, (TSRLinear, TSRConv2d)):
+            # Skip the terminal output head: its gates are unused in forward
+            # (head=True), so penalizing them does nothing useful — and on a
+            # wide forecast head (Linear(hidden, pred_len*channels)) its
+            # hundreds of thousands of gates would otherwise dominate the
+            # global mean and swamp the real hidden-layer sparsity signal.
+            if getattr(module, "head", False):
+                continue
             # Differentiable: sigmoid of the raw gate logits (not gate_values(),
             # which detaches). Summing keeps a single graph across layers.
             open_frac = torch.sigmoid(module.gate)

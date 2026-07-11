@@ -44,10 +44,20 @@ class TSRLinear(nn.Module):
         bias: bool = True,
         gate_init: float = 3.0,
         act_init: str = "relu",
+        head: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+
+        # Terminal output layer: return the raw linear map (no gate multiply,
+        # no activation mixture). The gate/act_weights params still exist for
+        # shape compatibility and the regulation engine's introspection, but a
+        # regression/forecast readout must NOT pass its output through the
+        # ReLU-dominant activation mixture (that distorts the target). The
+        # engine already never grows/prunes the terminal layer, so its gates
+        # being unused in forward is harmless.
+        self.head = head
 
         # Core linear parameters
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
@@ -88,6 +98,10 @@ class TSRLinear(nn.Module):
         """
         # Linear transformation
         h = F.linear(x, self.weight, self.bias)  # (batch, out_features)
+
+        # Terminal head: raw linear output, no gating/activation mixing.
+        if self.head:
+            return h
 
         # Apply soft neuron gate
         gate_values = torch.sigmoid(self.gate)  # (out_features,)

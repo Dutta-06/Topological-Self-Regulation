@@ -40,9 +40,10 @@ from benchmarks.timeseries.data.ucr_uea import get_ucr_uea_loaders
 from benchmarks.timeseries.models.tsr_tcn import TSRTCNClassifier
 from tsr.regulation.phantom import PhantomManager
 from tsr.regulation.monitor import StructuralPlasticityMonitor
-from tsr.regulation.actions import apply_structural_update
+from tsr.regulation.actions import apply_structural_update, hard_prune_dead_gates
 from tsr.regulation.scheduler import StructuralUpdateScheduler
 from tsr.regulation.signals import gate_sparsity_penalty
+from tsr.flops import differentiable_effective_flops
 from tsr.topology import capture_topology
 from tsr.utils import count_parameters, count_effective_parameters, rebuild_optimizer
 
@@ -118,6 +119,11 @@ class TSRClassificationRunner:
         min_lr = train_cfg.get("min_lr", 1e-5)
 
         self.gate_sparsity_coeff = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+        self.flops_price = reg_cfg.get("flops_price", 0.0)
+        # (channels, seq_len) — seq_len isn't in cfg["data"] for classification
+        # (HAR/UCR window lengths vary), so read it off a real batch instead.
+        sample_x, _ = next(iter(self.train_loader))
+        self.flops_input_shape = (model.encoder.blocks[0].conv1.in_channels, sample_x.shape[1])
 
         self.reg_config = {
             "death_threshold": reg_cfg.get("death_threshold", 0.01),
@@ -170,6 +176,7 @@ class TSRClassificationRunner:
 
         self.step = 0
         self.events = []
+        self.structural_updates_enabled = True
         self.best_val_acc = 0.0
         self.best_test_metrics = {}
 
@@ -222,6 +229,10 @@ class TSRClassificationRunner:
 
                     if self.gate_sparsity_coeff > 0:
                         loss = loss + self.gate_sparsity_coeff * gate_sparsity_penalty(self.model)
+                    if self.flops_price > 0:
+                        loss = loss + self.flops_price * differentiable_effective_flops(
+                            self.model, self.flops_input_shape
+                        )
                     loss = loss + self.phantom_manager.aux_loss()
 
                     loss.backward()
@@ -231,7 +242,7 @@ class TSRClassificationRunner:
                     self.scheduler.step()
                     self.monitor.record_loss(task_loss.item())
 
-                    if self.structural_scheduler.should_update(self.step):
+                    if self.structural_updates_enabled and self.structural_scheduler.should_update(self.step):
                         new_events = apply_structural_update(
                             model=self.model,
                             monitor=self.monitor,
@@ -273,9 +284,45 @@ class TSRClassificationRunner:
                 n += bsz
                 correct += (logits_detached.argmax(-1) == y).sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead"
+            )
         avg_loss = total_loss / max(n, 1)
         acc = correct / max(n, 1)
         return avg_loss, {"acc": acc}
+
+    def _hard_prune_and_finetune(self, finetune_epochs: int = 10) -> int:
+        """B5: physically remove dead-gate (sigmoid(gate) < 0.5) channels, then
+        fine-tune (no structural updates) so survivors adjust. Returns the
+        pre-prune param count ("params_grown"); self.model ends up at the
+        post-prune size ("params_pruned")."""
+        params_grown = count_parameters(self.model)
+        min_neurons = self.reg_config.get("min_neurons", 4)
+        events = hard_prune_dead_gates(self.model, step=self.step, min_neurons=min_neurons)
+        if not events:
+            return params_grown
+
+        self.events.extend(events)
+        self.phantom_manager.refresh()
+        self.optimizer = rebuild_optimizer(
+            self.model, torch.optim.Adam, self.optimizer_kwargs,
+            old_optimizer=self.optimizer,
+            gate_lr_multiplier=self.gate_lr_mult, act_lr_multiplier=self.act_lr_mult,
+        )
+        self._add_phantom_group()
+
+        self.structural_updates_enabled = False
+        for _ in tqdm(range(finetune_epochs), desc="fine-tune (post-prune)", unit="epoch"):
+            self._run_epoch(self.train_loader, train=True)
+            _, val_m = self._run_epoch(self.val_loader, train=False)
+            is_better = val_m["acc"] > self.best_val_acc
+            if is_better:
+                self.best_val_acc = val_m["acc"]
+                _, self.best_test_metrics = self._run_epoch(self.test_loader, train=False)
+
+        return params_grown
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
@@ -304,9 +351,13 @@ class TSRClassificationRunner:
                 params=f"{count_parameters(self.model):,}", events=len(self.events),
             )
 
+        params_grown = self._hard_prune_and_finetune()
+
         final = {
             "best_val_acc": self.best_val_acc,
             "params": count_parameters(self.model),
+            "params_grown": params_grown,
+            "params_pruned": count_parameters(self.model),
             "effective_params": count_effective_parameters(self.model),
             "num_structural_events": len(self.events),
             "final_topology": self.model.topology_summary(),
@@ -381,6 +432,11 @@ class StaticFinalClassificationRunner:
                 n += bsz
                 correct += (logits.detach().argmax(-1) == y).sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead"
+            )
         avg_loss = total_loss / max(n, 1)
         acc = correct / max(n, 1)
         return avg_loss, {"acc": acc}
@@ -437,8 +493,8 @@ def run_tsr_classify(
     model = TSRTCNClassifier(
         input_size=input_size,
         num_classes=num_classes,
-        seed_channels=tsr_cfg.get("seed_channels", 64),
-        num_levels=tsr_cfg.get("num_levels", 4),
+        seed_channels=tsr_cfg.get("seed_channels", 32),
+        num_levels=tsr_cfg.get("num_levels", 2),
         kernel_size=tsr_cfg.get("kernel_size", 3),
         gate_init=tsr_cfg.get("gate_init", 3.0),
         act_init=tsr_cfg.get("act_init", "relu"),
@@ -510,8 +566,8 @@ def _run_classify_worker(
     elif variant == "tsr_static_final":
         if block_conv_widths is None:
             tsr_cfg = cfg.get("tsr", {})
-            ch = tsr_cfg.get("seed_channels", 64)
-            block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+            ch = tsr_cfg.get("seed_channels", 32)
+            block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
         return run_static_final_classify(
             seed, cfg, dataset_name, results_root, device,
             block_conv_widths=block_conv_widths,
@@ -625,14 +681,14 @@ def main():
                 block_conv_widths = topo.get("block_conv_widths")
                 if block_conv_widths is None:
                     tsr_cfg = cfg.get("tsr", {})
-                    ch = tsr_cfg.get("seed_channels", 64)
-                    block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+                    ch = tsr_cfg.get("seed_channels", 32)
+                    block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
                 else:
                     block_conv_widths = [tuple(w) for w in block_conv_widths]
             else:
                 tsr_cfg = cfg.get("tsr", {})
-                ch = tsr_cfg.get("seed_channels", 64)
-                block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+                ch = tsr_cfg.get("seed_channels", 32)
+                block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
 
             static_tasks.append(("tsr_static_final", seed, block_conv_widths))
 

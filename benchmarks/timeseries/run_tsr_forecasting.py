@@ -41,9 +41,10 @@ from benchmarks.timeseries.data.weather import get_weather_loaders
 from benchmarks.timeseries.models.tsr_tcn import TSRTCNForecaster
 from tsr.regulation.phantom import PhantomManager
 from tsr.regulation.monitor import StructuralPlasticityMonitor
-from tsr.regulation.actions import apply_structural_update
+from tsr.regulation.actions import apply_structural_update, hard_prune_dead_gates
 from tsr.regulation.scheduler import StructuralUpdateScheduler
 from tsr.regulation.signals import gate_sparsity_penalty
+from tsr.flops import differentiable_effective_flops
 from tsr.topology import capture_topology
 from tsr.utils import count_parameters, count_effective_parameters, rebuild_optimizer
 
@@ -130,6 +131,10 @@ class TSRForecastingRunner:
         min_lr = train_cfg.get("min_lr", 1e-5)
 
         self.gate_sparsity_coeff = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+        self.flops_price = reg_cfg.get("flops_price", 0.0)
+        # (encoder_input_channels, seq_len) — read live from the model so it's
+        # correct whether the encoder is channel-independent (1 channel) or joint.
+        self.flops_input_shape = (model.encoder.blocks[0].conv1.in_channels, cfg["data"]["seq_len"])
 
         self.reg_config = {
             "death_threshold": reg_cfg.get("death_threshold", 0.01),
@@ -182,6 +187,7 @@ class TSRForecastingRunner:
 
         self.step = 0
         self.events = []
+        self.structural_updates_enabled = True
         self.best_val_mse = float("inf")
         self.best_test_metrics = {}
 
@@ -234,6 +240,10 @@ class TSRForecastingRunner:
 
                     if self.gate_sparsity_coeff > 0:
                         loss = loss + self.gate_sparsity_coeff * gate_sparsity_penalty(self.model)
+                    if self.flops_price > 0:
+                        loss = loss + self.flops_price * differentiable_effective_flops(
+                            self.model, self.flops_input_shape
+                        )
                     loss = loss + self.phantom_manager.aux_loss()
 
                     loss.backward()
@@ -243,7 +253,7 @@ class TSRForecastingRunner:
                     self.scheduler.step()
                     self.monitor.record_loss(task_loss.item())
 
-                    if self.structural_scheduler.should_update(self.step):
+                    if self.structural_updates_enabled and self.structural_scheduler.should_update(self.step):
                         new_events = apply_structural_update(
                             model=self.model,
                             monitor=self.monitor,
@@ -295,10 +305,48 @@ class TSRForecastingRunner:
                 se_sum += ((pred_orig - y_orig) ** 2).sum().item()
                 ae_sum += (pred_orig - y_orig).abs().sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead. "
+                "Check seq_len+pred_len against the split length (e.g. Electricity's "
+                "_VAL_HOURS/_TEST_HOURS vs. a long horizon)."
+            )
         avg_loss = total_loss / max(n, 1)
         mse = se_sum / max(n, 1)
         mae = ae_sum / max(n, 1)
         return avg_loss, {"mse": mse, "mae": mae, "rmse": math.sqrt(mse)}
+
+    def _hard_prune_and_finetune(self, finetune_epochs: int = 10) -> int:
+        """B5: physically remove dead-gate (sigmoid(gate) < 0.5) channels, then
+        fine-tune (no structural updates) so survivors adjust. Returns the
+        pre-prune param count ("params_grown"); self.model ends up at the
+        post-prune size ("params_pruned")."""
+        params_grown = count_parameters(self.model)
+        min_neurons = self.reg_config.get("min_neurons", 4)
+        events = hard_prune_dead_gates(self.model, step=self.step, min_neurons=min_neurons)
+        if not events:
+            return params_grown
+
+        self.events.extend(events)
+        self.phantom_manager.refresh()
+        self.optimizer = rebuild_optimizer(
+            self.model, torch.optim.Adam, self.optimizer_kwargs,
+            old_optimizer=self.optimizer,
+            gate_lr_multiplier=self.gate_lr_mult, act_lr_multiplier=self.act_lr_mult,
+        )
+        self._add_phantom_group()
+
+        self.structural_updates_enabled = False
+        for _ in tqdm(range(finetune_epochs), desc="fine-tune (post-prune)", unit="epoch"):
+            self._run_epoch(self.train_loader, train=True)
+            _, val_m = self._run_epoch(self.val_loader, train=False)
+            is_better = val_m["mse"] < self.best_val_mse
+            if is_better:
+                self.best_val_mse = val_m["mse"]
+                _, self.best_test_metrics = self._run_epoch(self.test_loader, train=False)
+
+        return params_grown
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
@@ -328,9 +376,13 @@ class TSRForecastingRunner:
                 params=f"{count_parameters(self.model):,}", events=len(self.events),
             )
 
+        params_grown = self._hard_prune_and_finetune()
+
         final = {
             "best_val_mse": self.best_val_mse,
             "params": count_parameters(self.model),
+            "params_grown": params_grown,
+            "params_pruned": count_parameters(self.model),
             "effective_params": count_effective_parameters(self.model),
             "num_structural_events": len(self.events),
             "final_topology": self.model.topology_summary(),
@@ -416,6 +468,13 @@ class StaticFinalForecastingRunner:
                 se_sum += ((pred_orig - y_orig) ** 2).sum().item()
                 ae_sum += (pred_orig - y_orig).abs().sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead. "
+                "Check seq_len+pred_len against the split length (e.g. Electricity's "
+                "_VAL_HOURS/_TEST_HOURS vs. a long horizon)."
+            )
         avg_loss = total_loss / max(n, 1)
         mse = se_sum / max(n, 1)
         mae = ae_sum / max(n, 1)
@@ -473,12 +532,13 @@ def run_tsr_forecast(
     model = TSRTCNForecaster(
         input_size=input_size,
         pred_len=pred_len,
-        seed_channels=tsr_cfg.get("seed_channels", 64),
-        num_levels=tsr_cfg.get("num_levels", 4),
+        seed_channels=tsr_cfg.get("seed_channels", 32),
+        num_levels=tsr_cfg.get("num_levels", 2),
         kernel_size=tsr_cfg.get("kernel_size", 3),
         gate_init=tsr_cfg.get("gate_init", 3.0),
         act_init=tsr_cfg.get("act_init", "relu"),
         norm_group_size=tsr_cfg.get("norm_group_size", 8),
+        channel_independent=tsr_cfg.get("channel_independent", True),
     )
     runner = TSRForecastingRunner(model, loaders, run_dir, cfg, device, pred_len)
     return runner.run()
@@ -492,6 +552,7 @@ def run_static_final_forecast(
     results_root: Path,
     device: torch.device,
     block_conv_widths: List[tuple],
+    channel_independent: bool = True,
 ) -> dict:
     run_dir = results_root / "tsr_static_final" / f"pred{pred_len}" / f"seed{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -517,6 +578,7 @@ def run_static_final_forecast(
         act_init=tsr_cfg.get("act_init", "relu"),
         norm_group_size=tsr_cfg.get("norm_group_size", 8),
         block_conv_widths=block_conv_widths,
+        channel_independent=channel_independent,
     )
     runner = StaticFinalForecastingRunner(model, loaders, run_dir, cfg, device)
     return runner.run()
@@ -531,6 +593,7 @@ def _run_forecast_worker(
     results_root_str: str,
     device_str: str,
     block_conv_widths: Optional[List[tuple]] = None,
+    channel_independent: Optional[bool] = None,
 ) -> dict:
     """Worker function for parallel execution."""
     logging.basicConfig(
@@ -545,13 +608,16 @@ def _run_forecast_worker(
     if variant == "tsr":
         return run_tsr_forecast(seed, cfg, dataset_name, pred_len, results_root, device)
     elif variant == "tsr_static_final":
+        tsr_cfg = cfg.get("tsr", {})
         if block_conv_widths is None:
-            tsr_cfg = cfg.get("tsr", {})
-            ch = tsr_cfg.get("seed_channels", 64)
-            block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+            ch = tsr_cfg.get("seed_channels", 32)
+            block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
+        if channel_independent is None:
+            channel_independent = tsr_cfg.get("channel_independent", True)
         return run_static_final_forecast(
             seed, cfg, dataset_name, pred_len, results_root, device,
             block_conv_widths=block_conv_widths,
+            channel_independent=channel_independent,
         )
     else:
         raise ValueError(f"Unknown variant: {variant}")
@@ -666,21 +732,22 @@ def main():
                     continue
 
                 # Get discovered topology from TSR run
+                tsr_cfg = cfg.get("tsr", {})
                 if seed in tsr_results:
                     topo = tsr_results[seed].get("topology_state", {})
                     block_conv_widths = topo.get("block_conv_widths")
+                    channel_independent = topo.get("channel_independent", tsr_cfg.get("channel_independent", True))
                     if block_conv_widths is None:
-                        tsr_cfg = cfg.get("tsr", {})
-                        ch = tsr_cfg.get("seed_channels", 64)
-                        block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+                        ch = tsr_cfg.get("seed_channels", 32)
+                        block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
                     else:
                         block_conv_widths = [tuple(w) for w in block_conv_widths]
                 else:
-                    tsr_cfg = cfg.get("tsr", {})
-                    ch = tsr_cfg.get("seed_channels", 64)
-                    block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 4)
+                    ch = tsr_cfg.get("seed_channels", 32)
+                    block_conv_widths = [(ch, ch)] * tsr_cfg.get("num_levels", 2)
+                    channel_independent = tsr_cfg.get("channel_independent", True)
 
-                static_tasks.append(("tsr_static_final", seed, block_conv_widths))
+                static_tasks.append(("tsr_static_final", seed, block_conv_widths, channel_independent))
 
             if static_tasks:
                 ctx = mp.get_context("spawn")
@@ -690,8 +757,9 @@ def main():
                             _run_forecast_worker, variant, seed, cfg, args.dataset,
                             horizon, str(results_root), str(device),
                             block_conv_widths=block_conv_widths,
+                            channel_independent=channel_independent,
                         ): (variant, seed)
-                        for variant, seed, block_conv_widths in static_tasks
+                        for variant, seed, block_conv_widths, channel_independent in static_tasks
                     }
                     for future in as_completed(futures):
                         variant, seed = futures[future]

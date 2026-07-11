@@ -46,9 +46,10 @@ from benchmarks.tabular.data.fashion_mnist import get_fashion_mnist_loaders
 from benchmarks.tabular.models.tsr_mlp import TSRMLP
 from tsr.regulation.phantom import PhantomManager
 from tsr.regulation.monitor import StructuralPlasticityMonitor
-from tsr.regulation.actions import apply_structural_update
+from tsr.regulation.actions import apply_structural_update, hard_prune_dead_gates
 from tsr.regulation.scheduler import StructuralUpdateScheduler
 from tsr.regulation.signals import gate_sparsity_penalty
+from tsr.flops import differentiable_effective_flops
 from tsr.topology import capture_topology
 from tsr.utils import count_parameters, count_effective_parameters, rebuild_optimizer
 
@@ -132,6 +133,12 @@ class TSRTabularRunner:
         min_lr = train_cfg.get("min_lr", 1e-5)
 
         self.gate_sparsity_coeff = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+        self.flops_price = reg_cfg.get("flops_price", 0.0)
+        # Flat input width to the first TSR layer (numeric + categorical
+        # embeddings) — the input_shape differentiable_effective_flops needs.
+        self.flops_input_shape = (
+            model.blocks[0].linear.in_features if len(model.blocks) > 0 else model.head.in_features,
+        )
 
         self.reg_config = {
             "death_threshold": reg_cfg.get("death_threshold", 0.01),
@@ -184,6 +191,7 @@ class TSRTabularRunner:
 
         self.step = 0
         self.events = []
+        self.structural_updates_enabled = True
         if self.task == "classification":
             self.best_val_metric = 0.0
         else:
@@ -247,6 +255,10 @@ class TSRTabularRunner:
 
                     if self.gate_sparsity_coeff > 0:
                         loss = loss + self.gate_sparsity_coeff * gate_sparsity_penalty(self.model)
+                    if self.flops_price > 0:
+                        loss = loss + self.flops_price * differentiable_effective_flops(
+                            self.model, self.flops_input_shape
+                        )
                     loss = loss + self.phantom_manager.aux_loss()
 
                     loss.backward()
@@ -256,7 +268,7 @@ class TSRTabularRunner:
                     self.scheduler.step()
                     self.monitor.record_loss(task_loss.item())
 
-                    if self.structural_scheduler.should_update(self.step):
+                    if self.structural_updates_enabled and self.structural_scheduler.should_update(self.step):
                         new_events = apply_structural_update(
                             model=self.model,
                             monitor=self.monitor,
@@ -305,10 +317,50 @@ class TSRTabularRunner:
                     se_sum += ((pred - target) ** 2).sum().item()
                     ae_sum += (pred - target).abs().sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead"
+            )
         avg_loss = total_loss / max(n, 1)
         if self.task == "classification":
             return avg_loss, {"acc": correct / max(n, 1)}
         return avg_loss, {"mse": se_sum / max(n, 1), "mae": ae_sum / max(n, 1), "rmse": math.sqrt(se_sum / max(n, 1))}
+
+
+    def _hard_prune_and_finetune(self, finetune_epochs: int = 10) -> int:
+        """B5: physically remove dead-gate (sigmoid(gate) < 0.5) neurons, then
+        fine-tune (no structural updates) so survivors adjust. Returns the
+        pre-prune param count ("params_grown"); self.model ends up at the
+        post-prune size ("params_pruned")."""
+        params_grown = count_parameters(self.model)
+        min_neurons = self.reg_config.get("min_neurons", 4)
+        events = hard_prune_dead_gates(self.model, step=self.step, min_neurons=min_neurons)
+        if not events:
+            return params_grown
+
+        self.events.extend(events)
+        self.phantom_manager.refresh()
+        self.optimizer = rebuild_optimizer(
+            self.model, torch.optim.Adam, self.optimizer_kwargs,
+            old_optimizer=self.optimizer,
+            gate_lr_multiplier=self.gate_lr_mult, act_lr_multiplier=self.act_lr_mult,
+        )
+        self._add_phantom_group()
+
+        self.structural_updates_enabled = False
+        for _ in tqdm(range(finetune_epochs), desc="fine-tune (post-prune)", unit="epoch"):
+            self._run_epoch(self.train_loader, train=True)
+            _, val_m = self._run_epoch(self.val_loader, train=False)
+            if self.task == "classification":
+                val_metric, is_better = val_m["acc"], val_m["acc"] > self.best_val_metric
+            else:
+                val_metric, is_better = val_m["mse"], val_m["mse"] < self.best_val_metric
+            if is_better:
+                self.best_val_metric = val_metric
+                _, self.best_test_metrics = self._run_epoch(self.test_loader, train=False)
+
+        return params_grown
 
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
@@ -341,9 +393,13 @@ class TSRTabularRunner:
                  "params": f"{count_parameters(self.model):,}", "events": len(self.events)}
             )
 
+        params_grown = self._hard_prune_and_finetune()
+
         final = {
             "best_val_metric": self.best_val_metric,
             "params": count_parameters(self.model),
+            "params_grown": params_grown,
+            "params_pruned": count_parameters(self.model),
             "effective_params": count_effective_parameters(self.model),
             "num_structural_events": len(self.events),
             "final_topology": self.model.topology_summary(),
@@ -439,6 +495,11 @@ class StaticFinalRunner:
                     se_sum += ((pred - target) ** 2).sum().item()
                     ae_sum += (pred - target).abs().sum().item()
 
+        if n == 0:
+            raise RuntimeError(
+                "empty loader (0 samples) — silently returning a 0.0 metric here would "
+                "look like a perfect score and get selected as 'best'; failing loudly instead"
+            )
         avg_loss = total_loss / max(n, 1)
         if self.task == "classification":
             return avg_loss, {"acc": correct / max(n, 1)}
@@ -487,6 +548,7 @@ def build_tsr_mlp(
         gate_init=tsr_cfg.get("gate_init", 3.0),
         act_init=tsr_cfg.get("act_init", "relu"),
         norm_group_size=tsr_cfg.get("norm_group_size", 8),
+        dropout=tsr_cfg.get("dropout", 0.1),
     )
 
 
@@ -549,6 +611,7 @@ def run_static_final(
         gate_init=tsr_cfg.get("gate_init", 3.0),
         act_init=tsr_cfg.get("act_init", "relu"),
         norm_group_size=tsr_cfg.get("norm_group_size", 8),
+        dropout=tsr_cfg.get("dropout", 0.1),
     )
     runner = StaticFinalRunner(model, loaders, run_dir, cfg, device)
     return runner.run()

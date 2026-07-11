@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
+from tsr.layers.tsr_conv1d import TSRConv1d
 
 
 def compute_layer_flops(module: nn.Module, input_shape: tuple) -> int:
@@ -152,9 +153,16 @@ def differentiable_effective_flops(model: nn.Module, input_shape: tuple):
     product). That is sufficient for a penalty term: it monotonically rewards
     closing output units, which is the lever we want.
 
+    Terminal output heads (module.head == True, see TSRLinear's head flag) are
+    skipped: their gates are inert in forward (no gating happens on a head),
+    so pricing them wouldn't reduce any real compute — the head can't shrink
+    (the regulation engine's terminal-layer guard never grows/prunes it) —
+    and would just add an uncontrollable constant offset to the loss term.
+
     Args:
         model: The TSR model.
-        input_shape: Input shape (C, H, W).
+        input_shape: Input shape (C, H, W) for a 2D-conv model, (C, L) for a
+            1D-conv (TSRConv1d/TCN) model, or (F,) for a flat MLP.
 
     Returns:
         Scalar tensor (effective FLOPs per sample), differentiable w.r.t. gates.
@@ -167,6 +175,8 @@ def differentiable_effective_flops(model: nn.Module, input_shape: tuple):
 
     for name, module in model.named_modules():
         if isinstance(module, TSRLinear):
+            if getattr(module, "head", False):
+                continue
             open_mass = torch.sigmoid(module.gate).sum()  # ~effective out neurons
             per_out = 2 * module.in_features + (1 if module.bias is not None else 0)
             total = total + open_mass * per_out
@@ -186,6 +196,18 @@ def differentiable_effective_flops(model: nn.Module, input_shape: tuple):
             per_out = 2 * module.in_channels * kh * kw * h_out * w_out
             total = total + open_mass * per_out
             current_shape = (module.out_channels, h_out, w_out)
+
+        elif isinstance(module, TSRConv1d):
+            k = module.kernel_size
+            if len(current_shape) >= 1:
+                l_in = current_shape[-1]
+                l_out = (l_in + 2 * module.padding - module.dilation * (k - 1) - 1) // module.stride + 1
+            else:
+                l_out = 1
+            open_mass = torch.sigmoid(module.gate).sum()  # ~effective out channels
+            per_out = 2 * module.in_channels * k * l_out
+            total = total + open_mass * per_out
+            current_shape = (module.out_channels, l_out)
 
     return total
 

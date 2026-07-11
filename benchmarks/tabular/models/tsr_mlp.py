@@ -18,16 +18,17 @@ from .common import CatEmbedding
 
 
 class _TSRLinearBlock(nn.Module):
-    """TSRLinear + TSRGroupNorm, wrapped as a single module for correct module-tree ordering."""
+    """TSRLinear + TSRGroupNorm + Dropout, wrapped as a single module for correct module-tree ordering."""
 
     def __init__(self, in_features: int, out_features: int, gate_init: float = 3.0,
-                 act_init: str = "relu", norm_group_size: int = 8):
+                 act_init: str = "relu", norm_group_size: int = 8, dropout: float = 0.1):
         super().__init__()
         self.linear = TSRLinear(in_features, out_features, gate_init=gate_init, act_init=act_init)
         self.norm = TSRGroupNorm(out_features, norm_group_size)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.linear(x))
+        return self.drop(self.norm(self.linear(x)))
 
 
 class TSRMLP(nn.Module):
@@ -54,6 +55,7 @@ class TSRMLP(nn.Module):
         gate_init: float = 3.0,
         act_init: str = "relu",
         norm_group_size: int = 8,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.cat_embedding = CatEmbedding(cat_cardinalities, cat_emb_dim)
@@ -61,11 +63,12 @@ class TSRMLP(nn.Module):
 
         self.blocks = nn.ModuleList()
         for hidden in seed_hidden:
-            self.blocks.append(_TSRLinearBlock(d_in, hidden, gate_init, act_init, norm_group_size))
+            self.blocks.append(_TSRLinearBlock(d_in, hidden, gate_init, act_init, norm_group_size, dropout))
             d_in = hidden
 
         self.norm_group_size = norm_group_size
-        self.head = TSRLinear(d_in, num_out, gate_init=gate_init, act_init=act_init)
+        self.dropout = dropout
+        self.head = TSRLinear(d_in, num_out, gate_init=gate_init, act_init=act_init, head=True)
 
     def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
         x = torch.cat([x_num, self.cat_embedding(x_cat)], dim=-1)
@@ -89,7 +92,7 @@ class TSRMLP(nn.Module):
         d = ref.linear.out_features
 
         new_block = _TSRLinearBlock(d, d, gate_init=5.0, act_init="relu",
-                                    norm_group_size=self.norm_group_size)
+                                    norm_group_size=self.norm_group_size, dropout=self.dropout)
         with torch.no_grad():
             nn.init.eye_(new_block.linear.weight)
             if new_block.linear.bias is not None:

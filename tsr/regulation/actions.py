@@ -628,3 +628,66 @@ def apply_structural_update(
         logger.debug(f"Step {step}: No structural events (scores below threshold)")
 
     return events
+
+
+def hard_prune_dead_gates(
+    model: nn.Module,
+    step: int,
+    min_neurons: int = 4,
+) -> List[StructuralEvent]:
+    """One-shot end-of-training prune: physically remove every non-terminal
+    neuron/channel whose gate has converged closed (sigmoid(gate) < 0.5).
+
+    Unlike apply_structural_update's Phase 1 pruning (which fires periodically
+    DURING training, gated by monitor/newborn-protection/death-signal timing),
+    this is meant to run exactly once after training converges — it trusts the
+    gates' final values directly and physically removes the mass gate_sparsity_
+    penalty has already pushed toward closed, converting "dead but still
+    allocated" params into an actually smaller model. Follow with a short
+    fine-tune (no structural updates) to let the survivors adjust.
+
+    The terminal output layer (last TSRLinear/TSRConv2d/TSRConv1d in module
+    order — the same detection apply_structural_update uses) is never touched:
+    its width is fixed to the task's output size.
+
+    Args:
+        model: The trained TSR model.
+        step: Current step, recorded on prune events (and on neuron_birth_step
+            bookkeeping, though nothing survives to be "born" here).
+        min_neurons: Never prune a layer below this many surviving neurons.
+
+    Returns:
+        List of StructuralEvents, one per layer actually pruned.
+    """
+    tsr_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
+            tsr_layers[name] = module
+    terminal_layer = next(reversed(tsr_layers)) if tsr_layers else None
+
+    events: List[StructuralEvent] = []
+    for name in list(tsr_layers.keys()):
+        if name == terminal_layer:
+            continue
+        # Re-resolve the module each iteration: an earlier prune in this same
+        # loop may have already touched this layer's neighbor.
+        module = dict(model.named_modules())[name]
+        gate_vals = module.gate_values()
+        current_size = gate_vals.shape[0]
+        if current_size <= min_neurons:
+            continue
+
+        dead = (gate_vals < 0.5).nonzero(as_tuple=True)[0]
+        # Respect the floor: if pruning all dead neurons would drop below
+        # min_neurons, keep the least-dead ones (highest remaining gate value).
+        max_prunable = current_size - min_neurons
+        if len(dead) > max_prunable:
+            dead_sorted = dead[torch.argsort(gate_vals[dead])]  # ascending: most-dead first
+            dead = dead_sorted[:max_prunable]
+
+        event = prune_neurons_paired(model, name, dead, step)
+        if event is not None:
+            events.append(event)
+            logger.info(f"Hard prune: {name} removed {len(dead)}/{current_size} dead neurons")
+
+    return events

@@ -98,8 +98,8 @@ class TSRTCNEncoder(nn.Module):
     def __init__(
         self,
         input_size: int,
-        seed_channels: int = 64,
-        num_levels: int = 4,
+        seed_channels: int = 32,
+        num_levels: int = 2,
         kernel_size: int = 3,
         gate_init: float = 3.0,
         act_init: str = "relu",
@@ -196,36 +196,63 @@ class TSRTCNEncoder(nn.Module):
 
 
 class TSRTCNForecaster(nn.Module):
-    """TSR-TCN for time-series forecasting."""
+    """TSR-TCN for time-series forecasting.
+
+    channel_independent (default True): PatchTST-style — one shared encoder is
+    applied per channel by folding channels into the batch dimension
+    ((B, L, C) -> (B*C, L, 1)), and the head predicts a single channel's
+    horizon (TSRLinear(hidden, pred_len)). Head params are then INDEPENDENT of
+    channel count: at electricity's 321 channels this is ~pred_len*hidden vs
+    the joint head's pred_len*channels*hidden (~15M -> ~46K at h720). The
+    channel-independence also matches how PatchTST wins the params-vs-accuracy
+    tradeoff on multichannel forecasting.
+
+    channel_independent=False: the original joint head
+    (TSRLinear(hidden, pred_len*input_size)) predicting all channels at once.
+    """
 
     def __init__(
         self,
         input_size: int,
         pred_len: int,
-        seed_channels: int = 64,
-        num_levels: int = 4,
+        seed_channels: int = 32,
+        num_levels: int = 2,
         kernel_size: int = 3,
         gate_init: float = 3.0,
         act_init: str = "relu",
         norm_group_size: int = 8,
+        channel_independent: bool = True,
         block_widths: Optional[List[int]] = None,
         block_conv_widths: Optional[List[tuple]] = None,
     ):
         super().__init__()
+        self.channel_independent = channel_independent
+        self.pred_len = pred_len
+        self.input_size = input_size
+
+        # Channel-independent: the encoder sees single-channel series.
+        encoder_input = 1 if channel_independent else input_size
         self.encoder = TSRTCNEncoder(
-            input_size, seed_channels, num_levels, kernel_size,
+            encoder_input, seed_channels, num_levels, kernel_size,
             gate_init=gate_init, act_init=act_init, norm_group_size=norm_group_size,
             block_widths=block_widths,
             block_conv_widths=block_conv_widths,
         )
-        self.pred_len = pred_len
-        self.input_size = input_size
         head_in = self.encoder.hidden_channels
-        self.head = TSRLinear(head_in, pred_len * input_size,
-                              gate_init=gate_init, act_init=act_init)
+        head_out = pred_len if channel_independent else pred_len * input_size
+        self.head = TSRLinear(head_in, head_out,
+                              gate_init=gate_init, act_init=act_init, head=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, L, C) -> (B, pred_len, C)."""
+        if self.channel_independent:
+            b, l, c = x.shape
+            # Fold channels into the batch: each channel is its own single-var
+            # series through the shared encoder.
+            x = x.permute(0, 2, 1).reshape(b * c, l, 1)  # (B*C, L, 1)
+            out = self.head(self.encoder(x))              # (B*C, pred_len)
+            out = out.reshape(b, c, self.pred_len)        # (B, C, pred_len)
+            return out.permute(0, 2, 1)                   # (B, pred_len, C)
         out = self.head(self.encoder(x))
         return out.view(-1, self.pred_len, self.input_size)
 
@@ -237,6 +264,7 @@ class TSRTCNForecaster(nn.Module):
         return {
             "seed_channels": self.encoder.hidden_channels,
             "num_blocks": len(blocks),
+            "channel_independent": self.channel_independent,
             "block_widths": [b.conv2.out_channels for b in blocks],
             "block_conv_widths": [(b.conv1.out_channels, b.conv2.out_channels) for b in blocks],
             "layers": [
@@ -247,18 +275,24 @@ class TSRTCNForecaster(nn.Module):
 
     def topology_summary(self) -> str:
         widths = [b.conv2.out_channels for b in self.encoder.blocks]
-        return f"TCN(blocks={len(self.encoder.blocks)}, widths={widths})"
+        ci = "CI" if self.channel_independent else "joint"
+        return f"TCN({ci}, blocks={len(self.encoder.blocks)}, widths={widths})"
 
 
 class TSRTCNClassifier(nn.Module):
-    """TSR-TCN for time-series classification."""
+    """TSR-TCN for time-series classification.
+
+    Always joint (whole-window, all-channel) — channel-independence is a
+    forecasting-specific trick (per-channel horizon head); a classification
+    label describes the whole multivariate window, not one channel.
+    """
 
     def __init__(
         self,
         input_size: int,
         num_classes: int,
-        seed_channels: int = 64,
-        num_levels: int = 4,
+        seed_channels: int = 32,
+        num_levels: int = 2,
         kernel_size: int = 3,
         gate_init: float = 3.0,
         act_init: str = "relu",
@@ -275,7 +309,7 @@ class TSRTCNClassifier(nn.Module):
         )
         head_in = self.encoder.hidden_channels
         self.head = TSRLinear(head_in, num_classes,
-                              gate_init=gate_init, act_init=act_init)
+                              gate_init=gate_init, act_init=act_init, head=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, L, C) -> (B, num_classes)."""

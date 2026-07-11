@@ -71,8 +71,8 @@ tsr:
   min_neurons_per_layer: 4
   gate_sparsity_coeff: 0.0001
   growth_enabled: true
-  growth_rate: 0.2
-  max_neurons_per_layer: 512
+  growth_rate: 0.1
+  max_neurons_per_layer: 256
   bottleneck_threshold: 0.1
   phantom_k: 8
   phantom_threshold: 0.005
@@ -82,11 +82,13 @@ tsr:
   newborn_protect_steps: 400
   layer_insertion_enabled: true
   layer_insertion_threshold: 2.0
-  max_blocks: 16
+  max_blocks: 6
   cooldown_steps: 50
   anneal_structural_rate: false
   anneal_start_step: 5000
   anneal_factor: 0.95
+  dropout: 0.1
+  flops_price: 0.0  # compute-price loss term (tsr/flops.py); 0 = off, sweep small values
 
 experiment:
   seeds: [42]
