@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from tsr.regulation.monitor import LayerStats, StructuralPlasticityMonitor
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
+from tsr.layers.tsr_conv1d import TSRConv1d
 
 
 def gate_sparsity_penalty(model: nn.Module) -> torch.Tensor:
@@ -79,12 +80,23 @@ def compute_death_signal(
     min_neurons: int = 4,
     current_step: int = 0,
     newborn_protect_steps: int = 400,
+    prune_gate_threshold: float = 0.15,
 ) -> torch.Tensor:
     """Identify dead neurons/channels that should be pruned.
 
-    A neuron is "dead" if:
-      1. Its gate activation is below threshold (it's nearly off), AND
-      2. Its mean activation magnitude over the monitoring window is below threshold
+    A neuron is "dead" if EITHER:
+      1. Its gate has converged mostly closed (sigmoid(gate) < prune_gate_threshold)
+         — the dominant signal: gate_sparsity_penalty pushes unneeded gates down
+         over the course of training, and this is what actually converts that
+         pressure into a physically smaller model. prune_gate_threshold is
+         deliberately looser than the old activation-magnitude threshold (0.15
+         vs 0.01) — a gate around 0.3-0.5 is already contributing little to the
+         forward pass (h * sigmoid(gate)) and gate_sparsity's L1-style pressure
+         rarely drives logits all the way to the old cutoff (sigmoid<0.01 needs
+         logit < -4.6), which is why pruning previously almost never fired.
+      2. Its mean activation magnitude over the monitoring window is below
+         `threshold` — a weak secondary catch (OR, not AND) for a neuron whose
+         gate hasn't decayed much yet but is already contributing ~nothing.
 
     Neurons grown during training (neuron_birth_step >= 0) are protected from pruning
     for newborn_protect_steps steps after birth — enough time for the task gradient
@@ -92,11 +104,12 @@ def compute_death_signal(
 
     Args:
         layer_stats: Statistics from the monitoring window.
-        layer: The TSR layer to inspect.
-        threshold: Activation/gate threshold below which a neuron is dead.
+        layer: The TSR layer to inspect (TSRLinear, TSRConv2d, or TSRConv1d).
+        threshold: Activation-magnitude threshold for the secondary OR-catch.
         min_neurons: Minimum neurons to keep in the layer (never prune below this).
         current_step: Current training step.
         newborn_protect_steps: Steps after birth during which a neuron cannot be pruned.
+        prune_gate_threshold: Gate threshold for the primary death criterion.
 
     Returns:
         1D tensor of indices of dead neurons. Empty tensor if none are dead.
@@ -105,7 +118,7 @@ def compute_death_signal(
     if isinstance(layer, TSRLinear):
         gate_vals = layer.gate_values()
         num_neurons = layer.out_features
-    elif isinstance(layer, TSRConv2d):
+    elif isinstance(layer, (TSRConv2d, TSRConv1d)):
         gate_vals = layer.gate_values()
         num_neurons = layer.out_channels
     else:
@@ -120,8 +133,8 @@ def compute_death_signal(
     if mean_act.shape[0] != num_neurons:
         return torch.tensor([], dtype=torch.long)
 
-    # Dead = gate low AND activation low
-    is_dead = (gate_vals.cpu() < threshold) & (mean_act < threshold)
+    # Dead = gate mostly closed (dominant) OR activation negligible (secondary)
+    is_dead = (gate_vals.cpu() < prune_gate_threshold) | (mean_act < threshold)
 
     # Protect newborns: neurons with birth_step >= 0 are grown neurons; skip them
     # until they've had newborn_protect_steps to earn their keep (or confirm uselessness).

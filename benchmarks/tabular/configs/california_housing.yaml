@@ -46,8 +46,20 @@ models:
   # ── Reserved for TSR (see benchmarks/tabular/README.md) ──
 
 # TSR configuration — Topological Self-Regulating MLP
+#
+# California-specific tuning (small, clean, 8-feature regression set — see
+# [[tsr-core-claim]]'s matched-param ablation): the static_final control
+# proves this architecture reaches mse~0.35 on pure task loss alone, so any
+# TSR-only regularization tax shows up directly as a worse number. Two
+# changes vs. the other datasets:
+#   - seed_hidden shrunk from [64,64] (== the baseline mlp/m preset size) to
+#     [16,16]: seeding AT the eventual target size gives growth nothing to
+#     do — it's a curriculum, not a decoration, only if there's real
+#     headroom to grow into.
+#   - dropout 0 (was 0.1): static_final already reaches its number without
+#     it; on 14K training rows dropout has real bite, not just insurance.
 tsr:
-  seed_hidden: [64, 64]
+  seed_hidden: [16, 16]
   cat_emb_dim: 8
   gate_init: 3.0
   act_init: relu
@@ -55,8 +67,11 @@ tsr:
   update_interval: 200
   monitor_window: 100
   death_threshold: 0.01
+  prune_gate_threshold: 0.15  # primary/dominant death signal (sigmoid(gate) below this = dead); death_threshold above is now a weak secondary activation-magnitude OR-catch
   min_neurons_per_layer: 4
   gate_sparsity_coeff: 0.0001
+  gate_sparsity_final: 0.0
+  gate_sparsity_warmup_frac: 0.1
   growth_enabled: true
   growth_rate: 0.1
   max_neurons_per_layer: 256
@@ -74,7 +89,7 @@ tsr:
   anneal_structural_rate: false
   anneal_start_step: 5000
   anneal_factor: 0.95
-  dropout: 0.1
+  dropout: 0.0
   flops_price: 0.0  # compute-price loss term (tsr/flops.py); 0 = off, sweep small values
 
 experiment:

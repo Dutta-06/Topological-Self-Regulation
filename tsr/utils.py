@@ -102,52 +102,55 @@ def _transfer_optimizer_state(
     old_optimizer: Optimizer,
     new_optimizer: Optimizer,
 ) -> None:
-    """Transfer optimizer state from old to new for parameters with matching shapes.
+    """Transfer optimizer state from old to new for parameters that are
+    literally the same object (identity match), not just same-shape-at-the-
+    same-position.
 
-    Matches parameters by their position and shape. If a parameter has the
-    same shape in both optimizers, its momentum buffers and adaptive learning
-    rate accumulators are copied over. Parameters with changed shapes get
-    fresh state (the optimizer's default initialization).
+    A structural event (grow/prune/insert) only reassigns `self.weight = nn.
+    Parameter(...)` etc. on the LAYER(S) IT ACTUALLY TOUCHES — every other
+    layer's parameter tensors are untouched Python objects. But
+    `rebuild_optimizer` re-walks `model.named_parameters()` from scratch, so
+    if a layer is inserted/grown BEFORE another layer in module order, every
+    param after it shifts position within its param group's `params` list.
+    The previous (group_name, position_index, shape) key was therefore
+    silently matching an untouched param's old momentum to the WRONG
+    (different, coincidentally same-shape) param whenever an event landed
+    upstream of it — corrupting Adam state on nearly every structural event
+    instead of just re-initializing it. Matching by `id(param)` instead is
+    exact: an unchanged layer's weight is the same object before and after,
+    so its state transfers; a grown/replaced layer's weight is a brand new
+    object, so it correctly falls through to fresh optimizer-default state.
 
-    This is a best-effort transfer — it's okay if some state is lost. The
+    This is still best-effort — it's okay if some state is lost. The
     optimizer will re-accumulate momentum/adaptive stats within a few steps.
     """
     old_state = old_optimizer.state
+    old_state_by_id: Dict[int, dict] = {
+        id(param): state for param, state in old_state.items()
+    }
 
-    # Build a map from (group_name, param_shape) → optimizer state
-    # This is approximate but works well in practice
-    old_shape_map: Dict[Tuple, dict] = {}
-    for group in old_optimizer.param_groups:
-        group_name = group.get("group_name", "default")
-        for i, param in enumerate(group["params"]):
-            if param in old_state:
-                key = (group_name, i, tuple(param.shape))
-                old_shape_map[key] = old_state[param]
-
-    # Try to match new parameters to old state
     transferred = 0
     for group in new_optimizer.param_groups:
-        group_name = group.get("group_name", "default")
-        for i, param in enumerate(group["params"]):
-            key = (group_name, i, tuple(param.shape))
-            if key in old_shape_map:
-                # Copy state entries that match in shape
-                old_entry = old_shape_map[key]
-                new_entry = {}
-                for state_key, state_val in old_entry.items():
-                    if isinstance(state_val, torch.Tensor):
-                        if state_val.dim() == 0:
-                            # Scalar tensor (e.g., 'step' in Adam) — always copy
-                            new_entry[state_key] = state_val.clone()
-                        elif state_val.shape == param.shape:
-                            new_entry[state_key] = state_val.clone()
-                        # If shape doesn't match, skip (let optimizer re-init)
-                    else:
-                        # Non-tensor state (int, float, etc.) — always copy
-                        new_entry[state_key] = state_val
-                if new_entry:
-                    new_optimizer.state[param] = new_entry
-                    transferred += 1
+        for param in group["params"]:
+            old_entry = old_state_by_id.get(id(param))
+            if old_entry is None:
+                continue
+            new_entry = {}
+            for state_key, state_val in old_entry.items():
+                if isinstance(state_val, torch.Tensor):
+                    if state_val.dim() == 0:
+                        # Scalar tensor (e.g., 'step' in Adam) — always copy
+                        new_entry[state_key] = state_val.clone()
+                    elif state_val.shape == param.shape:
+                        new_entry[state_key] = state_val.clone()
+                    # If shape doesn't match, skip (let optimizer re-init) —
+                    # shouldn't happen under identity match, but stay safe.
+                else:
+                    # Non-tensor state (int, float, etc.) — always copy
+                    new_entry[state_key] = state_val
+            if new_entry:
+                new_optimizer.state[param] = new_entry
+                transferred += 1
 
 
 def count_parameters(model: nn.Module) -> int:

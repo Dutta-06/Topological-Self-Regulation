@@ -40,7 +40,7 @@ from benchmarks.timeseries.data.ucr_uea import get_ucr_uea_loaders
 from benchmarks.timeseries.models.tsr_tcn import TSRTCNClassifier
 from tsr.regulation.phantom import PhantomManager
 from tsr.regulation.monitor import StructuralPlasticityMonitor
-from tsr.regulation.actions import apply_structural_update, hard_prune_dead_gates
+from tsr.regulation.actions import apply_structural_update
 from tsr.regulation.scheduler import StructuralUpdateScheduler
 from tsr.regulation.signals import gate_sparsity_penalty
 from tsr.flops import differentiable_effective_flops
@@ -118,7 +118,10 @@ class TSRClassificationRunner:
         warmup = train_cfg.get("warmup_steps", 500)
         min_lr = train_cfg.get("min_lr", 1e-5)
 
-        self.gate_sparsity_coeff = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+        # Annealed, not flat — see TSRTabularRunner._gate_sparsity_coeff for why.
+        self.gate_sparsity_peak = reg_cfg.get("gate_sparsity_coeff", 1e-4)
+        self.gate_sparsity_final = reg_cfg.get("gate_sparsity_final", 0.0)
+        self.gate_sparsity_warmup_frac = reg_cfg.get("gate_sparsity_warmup_frac", 0.1)
         self.flops_price = reg_cfg.get("flops_price", 0.0)
         # (channels, seq_len) — seq_len isn't in cfg["data"] for classification
         # (HAR/UCR window lengths vary), so read it off a real batch instead.
@@ -127,6 +130,7 @@ class TSRClassificationRunner:
 
         self.reg_config = {
             "death_threshold": reg_cfg.get("death_threshold", 0.01),
+            "prune_gate_threshold": reg_cfg.get("prune_gate_threshold", 0.15),
             "min_neurons": reg_cfg.get("min_neurons_per_layer", 4),
             "newborn_protect_steps": reg_cfg.get("newborn_protect_steps", 400),
             "growth_enabled": reg_cfg.get("growth_enabled", True),
@@ -176,9 +180,18 @@ class TSRClassificationRunner:
 
         self.step = 0
         self.events = []
-        self.structural_updates_enabled = True
         self.best_val_acc = 0.0
         self.best_test_metrics = {}
+
+    def _gate_sparsity_coeff(self) -> float:
+        """Warm up linearly to the peak, then cosine-decay to the floor."""
+        warmup_steps = self.gate_sparsity_warmup_frac * self.total_steps
+        if self.step < warmup_steps:
+            return self.gate_sparsity_peak * (self.step / max(warmup_steps, 1))
+        progress = min((self.step - warmup_steps) / max(self.total_steps - warmup_steps, 1), 1.0)
+        return self.gate_sparsity_final + 0.5 * (self.gate_sparsity_peak - self.gate_sparsity_final) * (
+            1 + math.cos(math.pi * progress)
+        )
 
     def _build_scheduler(self, last_epoch: int = -1) -> LambdaLR:
         lr, min_lr, warmup, total_steps = self.lr, self.min_lr, self.warmup, self.total_steps
@@ -209,6 +222,11 @@ class TSRClassificationRunner:
             self.optimizer.add_param_group({
                 "params": params,
                 "lr": self.optimizer_kwargs["lr"],
+                # See TSRTabularRunner._add_phantom_group: phantom weight/bias
+                # get zero gradient from aux_loss, so without this override
+                # Adam's coupled weight_decay would shrink them to zero
+                # regardless of task relevance, flatlining the growth signal.
+                "weight_decay": 0.0,
                 "group_name": "phantom",
             })
 
@@ -227,8 +245,9 @@ class TSRClassificationRunner:
                     task_loss = F.cross_entropy(logits, y)
                     loss = task_loss
 
-                    if self.gate_sparsity_coeff > 0:
-                        loss = loss + self.gate_sparsity_coeff * gate_sparsity_penalty(self.model)
+                    gate_sparsity_coeff = self._gate_sparsity_coeff()
+                    if gate_sparsity_coeff > 0:
+                        loss = loss + gate_sparsity_coeff * gate_sparsity_penalty(self.model)
                     if self.flops_price > 0:
                         loss = loss + self.flops_price * differentiable_effective_flops(
                             self.model, self.flops_input_shape
@@ -242,7 +261,7 @@ class TSRClassificationRunner:
                     self.scheduler.step()
                     self.monitor.record_loss(task_loss.item())
 
-                    if self.structural_updates_enabled and self.structural_scheduler.should_update(self.step):
+                    if self.structural_scheduler.should_update(self.step):
                         new_events = apply_structural_update(
                             model=self.model,
                             monitor=self.monitor,
@@ -293,37 +312,6 @@ class TSRClassificationRunner:
         acc = correct / max(n, 1)
         return avg_loss, {"acc": acc}
 
-    def _hard_prune_and_finetune(self, finetune_epochs: int = 10) -> int:
-        """B5: physically remove dead-gate (sigmoid(gate) < 0.5) channels, then
-        fine-tune (no structural updates) so survivors adjust. Returns the
-        pre-prune param count ("params_grown"); self.model ends up at the
-        post-prune size ("params_pruned")."""
-        params_grown = count_parameters(self.model)
-        min_neurons = self.reg_config.get("min_neurons", 4)
-        events = hard_prune_dead_gates(self.model, step=self.step, min_neurons=min_neurons)
-        if not events:
-            return params_grown
-
-        self.events.extend(events)
-        self.phantom_manager.refresh()
-        self.optimizer = rebuild_optimizer(
-            self.model, torch.optim.Adam, self.optimizer_kwargs,
-            old_optimizer=self.optimizer,
-            gate_lr_multiplier=self.gate_lr_mult, act_lr_multiplier=self.act_lr_mult,
-        )
-        self._add_phantom_group()
-
-        self.structural_updates_enabled = False
-        for _ in tqdm(range(finetune_epochs), desc="fine-tune (post-prune)", unit="epoch"):
-            self._run_epoch(self.train_loader, train=True)
-            _, val_m = self._run_epoch(self.val_loader, train=False)
-            is_better = val_m["acc"] > self.best_val_acc
-            if is_better:
-                self.best_val_acc = val_m["acc"]
-                _, self.best_test_metrics = self._run_epoch(self.test_loader, train=False)
-
-        return params_grown
-
     def run(self) -> dict:
         metrics_path = self.run_dir / "metrics.jsonl"
         tag = "/".join(self.run_dir.parts[-3:])
@@ -351,13 +339,9 @@ class TSRClassificationRunner:
                 params=f"{count_parameters(self.model):,}", events=len(self.events),
             )
 
-        params_grown = self._hard_prune_and_finetune()
-
         final = {
             "best_val_acc": self.best_val_acc,
             "params": count_parameters(self.model),
-            "params_grown": params_grown,
-            "params_pruned": count_parameters(self.model),
             "effective_params": count_effective_parameters(self.model),
             "num_structural_events": len(self.events),
             "final_topology": self.model.topology_summary(),
