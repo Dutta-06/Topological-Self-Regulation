@@ -97,24 +97,46 @@ class PhantomProbe(nn.Module):
         # Windowed accumulator of per-phantom gate-gradient (filled by a hook).
         self._grad_window: List[torch.Tensor] = []
 
+        # Cross-step cache of the host's own output-gradient (∂Loss/∂h_host),
+        # captured on step t's backward and consumed on step t+1's forward as
+        # a fixed (detached) regression target — see forward()'s docstring.
+        object.__setattr__(self, "_prev_grad_output", None)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Auxiliary phantom output, hard-zeroed but gradient-carrying.
+        """Auxiliary phantom output: hard-zeroed timing signal + a real
+        direction-learning loss, summed into one scalar for the trainer's
+        auxiliary loss term.
 
-        Returns a tensor shaped like a *pooled* phantom contribution that the
-        trainer adds into the model's auxiliary loss term. The value is
-        identically zero (so it never changes the live output); only its
-        gradient w.r.t. ``self.gate`` is meaningful.
+        Component 1 (unchanged) — hard-zeroed growth-timing signal: value is
+        identically zero (never changes the live output); only its gradient
+        w.r.t. ``self.gate`` is meaningful. This decides WHEN a layer needs
+        more capacity.
+
+        Component 2 (new) — Cascade-Correlation-style direction loss (Fahlman
+        & Lebiere, 1990): trains phantom weight/bias to make the candidate's
+        own output correlate with the host layer's *current* error signal
+        (∂Loss/∂h_host, captured on the previous step's backward and used
+        here as a detached, fixed regression target). This is what decides
+        WHICH direction a new neuron should point. It is necessary because
+        the timing signal alone gives phantom weight/bias exactly zero
+        gradient — by the product rule, d(a*coeff)/d(weight) =
+        d(a)/d(weight) * coeff_VALUE, and coeff's value is always 0 by
+        construction, regardless of where the term is injected. Maximizing
+        correlation with the real error is a second, independent objective
+        that does not touch the live forward pass (still zero FLOPs/zero
+        effect on real output) but does give weight/bias a real, task-
+        coupled gradient.
 
         Args:
             x: The host layer's input for this batch.
 
         Returns:
-            Scalar tensor (sum of the hard-zeroed phantom activations).
+            Scalar tensor: hard-zero timing contribution + direction loss.
         """
         if self.is_conv:
             h = F.conv2d(x, self.weight, self.bias, self.stride, self.padding)
@@ -143,7 +165,77 @@ class PhantomProbe(nn.Module):
             contrib = (a * coeff.view(1, -1, 1)).sum()
         else:
             contrib = (a * coeff.view(1, -1)).sum()
-        return contrib
+
+        # Separate activation for the direction loss, built from a DETACHED
+        # copy of the mixture weights. `a` (above) is only ever multiplied by
+        # a zero-valued coeff, so its live act_mix never actually leaks
+        # gradient into host.act_weights — but the direction loss below has
+        # no such zeroing, so without detaching here its gradient would flow
+        # straight into the host's real, shared activation-mixture parameter
+        # (a genuine trained parameter, not phantom-only). Recomputing `a`
+        # from a detached mixture keeps the correlation objective confined to
+        # this probe's own weight/bias, exactly like the timing signal is.
+        act_mix_const = act_mix.detach()
+        a_dir = torch.zeros_like(h)
+        for i, act_fn in enumerate(ACTIVATION_FNS):
+            a_dir = a_dir + act_mix_const[i] * act_fn(h)
+
+        direction_loss = self._correlation_loss(a_dir)
+        return contrib + direction_loss
+
+    def _correlation_loss(self, a: torch.Tensor) -> torch.Tensor:
+        """Cascade-Correlation-style objective for phantom weight/bias.
+
+        Pools each candidate's activation and the host's cached prior-step
+        error signal down to one scalar per example per channel, then
+        maximizes the (normalized) correlation between every candidate and
+        every host output channel — summed as absolute correlation, exactly
+        Fahlman & Lebiere's S-score. A candidate correlated with the host's
+        error in either direction is useful: whichever sign, the downstream
+        weight learned at materialization time can exploit it.
+
+        Returns a zero-valued (skipped) loss on the first step of training,
+        immediately after any structural event (shape mismatch — cache is
+        invalidated), or on a ragged final batch (batch-size mismatch).
+        """
+        target = self._prev_grad_output
+        if target is None or target.shape[0] != a.shape[0]:
+            return torch.zeros((), device=a.device, dtype=a.dtype)
+
+        if a.dim() == 4:      # (B, k, H, W)
+            a_pooled = a.mean(dim=(2, 3))
+        elif a.dim() == 3:    # (B, k, L)
+            a_pooled = a.mean(dim=2)
+        else:                 # (B, k)
+            a_pooled = a
+
+        if target.dim() == 4:      # (B, host_out, H, W)
+            e_pooled = target.mean(dim=(2, 3))
+        elif target.dim() == 3:    # (B, host_out, L)
+            e_pooled = target.mean(dim=2)
+        else:                      # (B, host_out)
+            e_pooled = target
+
+        if e_pooled.dim() != 2:
+            return torch.zeros((), device=a.device, dtype=a.dtype)
+
+        eps = 1e-6
+        a_center = a_pooled - a_pooled.mean(dim=0, keepdim=True)
+        e_center = (e_pooled - e_pooled.mean(dim=0, keepdim=True)).detach()
+
+        a_std = a_center.std(dim=0, keepdim=True).clamp_min(eps)
+        e_std = e_center.std(dim=0, keepdim=True).clamp_min(eps)
+
+        batch = a.shape[0]
+        # (k, host_out) correlation matrix, each entry in ~[-1, 1].
+        corr = (a_center / a_std).t() @ (e_center / e_std) / batch
+        # Maximize summed |correlation| ⇒ minimize its negative.
+        return -corr.abs().sum()
+
+    def set_prev_grad_output(self, grad_output: Optional[torch.Tensor]) -> None:
+        """Cache the host's output-gradient from this step for next step's
+        correlation loss. Called by PhantomManager after backward."""
+        object.__setattr__(self, "_prev_grad_output", grad_output)
 
     def record_gate_grad(self) -> None:
         """Snapshot the current phantom gate gradient into the window.
@@ -212,6 +304,7 @@ class PhantomManager(nn.Module):
 
         self.probes = nn.ModuleDict()
         self._captured_input: Dict[str, torch.Tensor] = {}
+        self._captured_grad_output: Dict[str, torch.Tensor] = {}
         self._hooks = []
         self._name_map: Dict[str, str] = {}  # sanitized key -> real layer name
 
@@ -230,11 +323,23 @@ class PhantomManager(nn.Module):
                 self._name_map[key] = name
                 h = module.register_forward_pre_hook(self._make_capture_hook(key))
                 self._hooks.append(h)
+                gh = module.register_full_backward_hook(self._make_grad_capture_hook(key))
+                self._hooks.append(gh)
 
     def _make_capture_hook(self, key: str):
         def hook(module, inputs):
             # inputs is a tuple; the layer input is inputs[0].
             self._captured_input[key] = inputs[0]
+        return hook
+
+    def _make_grad_capture_hook(self, key: str):
+        def hook(module, grad_input, grad_output):
+            # grad_output is a tuple; the host's own output-gradient is [0].
+            # Detached and cached for the NEXT step's correlation loss (see
+            # PhantomProbe._correlation_loss) — this step's backward is
+            # already in flight, so it can't be used within the same step.
+            if grad_output[0] is not None:
+                self._captured_grad_output[key] = grad_output[0].detach()
         return hook
 
     def aux_loss(self) -> torch.Tensor:
@@ -254,9 +359,12 @@ class PhantomManager(nn.Module):
         return total
 
     def record_gradients(self) -> None:
-        """Snapshot phantom gate gradients into each probe's window (post-backward)."""
-        for probe in self.probes.values():
+        """Post-backward bookkeeping: snapshot phantom gate gradients into
+        each probe's window, and hand each probe this step's host
+        grad_output for use as next step's correlation-loss target."""
+        for key, probe in self.probes.items():
             probe.record_gate_grad()
+            probe.set_prev_grad_output(self._captured_grad_output.get(key))
 
     def growth_signals(self) -> Dict[str, float]:
         """Measured per-layer growth signal (strongest phantom), keyed by real layer name."""
@@ -309,6 +417,7 @@ class PhantomManager(nn.Module):
         self.probes = nn.ModuleDict()
         self._name_map = {}
         self._captured_input.clear()
+        self._captured_grad_output.clear()
         for name, module in self.model.named_modules():
             if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 key = self._key(name)
@@ -319,10 +428,13 @@ class PhantomManager(nn.Module):
                     probe = PhantomProbe(module, k=self.k, window=self.window)
                     device = next(self.model.parameters()).device
                     probe = probe.to(device)
+                probe.set_prev_grad_output(None)  # stale target after reshape
                 self.probes[key] = probe
                 self._name_map[key] = name
                 h = module.register_forward_pre_hook(self._make_capture_hook(key))
                 self._hooks.append(h)
+                gh = module.register_full_backward_hook(self._make_grad_capture_hook(key))
+                self._hooks.append(gh)
 
     def remove_hooks(self) -> None:
         for h in self._hooks:

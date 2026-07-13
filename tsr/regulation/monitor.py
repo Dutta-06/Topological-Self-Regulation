@@ -26,6 +26,7 @@ import torch.nn as nn
 
 from tsr.layers.tsr_linear import TSRLinear
 from tsr.layers.tsr_conv import TSRConv2d
+from tsr.layers.tsr_conv1d import TSRConv1d
 
 
 class LayerStats:
@@ -171,7 +172,7 @@ class StructuralPlasticityMonitor:
     def _register_hooks(self) -> None:
         """Register forward and backward hooks on all TSR layers."""
         for name, module in self.model.named_modules():
-            if isinstance(module, (TSRLinear, TSRConv2d)):
+            if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 self.layer_stats[name] = LayerStats(self.window)
                 self._tsr_layers[name] = module
 
@@ -188,10 +189,14 @@ class StructuralPlasticityMonitor:
         def hook(module, input, output):
             with torch.no_grad():
                 if output.dim() == 4:
-                    # Conv output: (batch, channels, H, W) → per-channel stats
+                    # Conv2d output: (batch, channels, H, W) → per-channel stats
                     # Reduce over batch + spatial dims
                     mean_mag = output.abs().mean(dim=(0, 2, 3))  # (channels,)
                     var = output.var(dim=(0, 2, 3))               # (channels,)
+                elif output.dim() == 3:
+                    # Conv1d output: (batch, channels, L) → per-channel stats
+                    mean_mag = output.abs().mean(dim=(0, 2))  # (channels,)
+                    var = output.var(dim=(0, 2))               # (channels,)
                 elif output.dim() == 2:
                     # Linear output: (batch, features) → per-neuron stats
                     mean_mag = output.abs().mean(dim=0)  # (features,)
@@ -213,6 +218,9 @@ class StructuralPlasticityMonitor:
                 if grad.dim() == 4:
                     mean_mag = grad.abs().mean(dim=(0, 2, 3))
                     var = grad.var(dim=(0, 2, 3))
+                elif grad.dim() == 3:
+                    mean_mag = grad.abs().mean(dim=(0, 2))
+                    var = grad.var(dim=(0, 2))
                 elif grad.dim() == 2:
                     mean_mag = grad.abs().mean(dim=0)
                     var = grad.var(dim=0)
@@ -290,7 +298,7 @@ class StructuralPlasticityMonitor:
         self._tsr_layers = {}
 
         for name, module in self.model.named_modules():
-            if isinstance(module, (TSRLinear, TSRConv2d)):
+            if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
                 # Preserve accumulated stats if this name persists, else fresh.
                 self.layer_stats[name] = old_stats.get(name, LayerStats(self.window))
                 self._tsr_layers[name] = module

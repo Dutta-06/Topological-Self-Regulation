@@ -99,6 +99,34 @@ def _unpack_loaders(loaders, batch_size):
     }
 
 
+def _get_loaders_ci_aware(dataset_name: str, cfg: dict, pred_len: int, channel_independent: bool) -> dict:
+    """Build loaders, adjusting batch_size for channel-independent mode.
+
+    Channel-independence folds channels into the batch: (B, L, C) -> (B*C, L,
+    1). The configured training.batch_size is the number of raw (multichannel)
+    windows per step, so under CI the ENCODER actually sees an effective batch
+    of size B*C — unbounded in the dataset's channel count if the loader batch
+    size is left as-is. Electricity's 321 channels at batch_size=128 gives an
+    effective batch of 41,088 and OOMs regardless of horizon; Weather's 21
+    channels survives at h=96 but not longer horizons where activations are
+    also bigger. We instead treat the configured batch_size as the desired
+    EFFECTIVE (post-fold) batch under CI, and reduce the loader's real batch
+    size so B*C stays close to it, independent of channel count.
+    """
+    batch_size = cfg["training"]["batch_size"]
+    raw_loaders = get_loaders(dataset_name, cfg["data"], batch_size, pred_len)
+    loaders = _unpack_loaders(raw_loaders, batch_size)
+    input_size = loaders["input_size"]
+
+    if channel_independent and input_size > 1:
+        adjusted_batch = max(1, batch_size // input_size)
+        if adjusted_batch != batch_size:
+            raw_loaders = get_loaders(dataset_name, cfg["data"], adjusted_batch, pred_len)
+            loaders = _unpack_loaders(raw_loaders, adjusted_batch)
+
+    return loaders
+
+
 class TSRForecastingRunner:
     """TSR training loop for time-series forecasting with structural plasticity."""
 
@@ -246,7 +274,7 @@ class TSRForecastingRunner:
     def _run_epoch(self, loader, train: bool):
         self.model.train(train)
         total_loss, n = 0.0, 0
-        se_sum, ae_sum = 0.0, 0.0
+        se_sum, ae_sum, elem_n = 0.0, 0.0, 0
 
         with torch.set_grad_enabled(train):
             for x, y in loader:
@@ -325,6 +353,7 @@ class TSRForecastingRunner:
 
                 se_sum += ((pred_orig - y_orig) ** 2).sum().item()
                 ae_sum += (pred_orig - y_orig).abs().sum().item()
+                elem_n += y_orig.numel()
 
         if n == 0:
             raise RuntimeError(
@@ -334,8 +363,8 @@ class TSRForecastingRunner:
                 "_VAL_HOURS/_TEST_HOURS vs. a long horizon)."
             )
         avg_loss = total_loss / max(n, 1)
-        mse = se_sum / max(n, 1)
-        mae = ae_sum / max(n, 1)
+        mse = se_sum / max(elem_n, 1)
+        mae = ae_sum / max(elem_n, 1)
         return avg_loss, {"mse": mse, "mae": mae, "rmse": math.sqrt(mse)}
 
     def run(self) -> dict:
@@ -424,7 +453,7 @@ class StaticFinalForecastingRunner:
     def _run_epoch(self, loader, train: bool):
         self.model.train(train)
         total_loss, n = 0.0, 0
-        se_sum, ae_sum = 0.0, 0.0
+        se_sum, ae_sum, elem_n = 0.0, 0.0, 0
 
         with torch.set_grad_enabled(train):
             for x, y in loader:
@@ -453,6 +482,7 @@ class StaticFinalForecastingRunner:
 
                 se_sum += ((pred_orig - y_orig) ** 2).sum().item()
                 ae_sum += (pred_orig - y_orig).abs().sum().item()
+                elem_n += y_orig.numel()
 
         if n == 0:
             raise RuntimeError(
@@ -462,8 +492,8 @@ class StaticFinalForecastingRunner:
                 "_VAL_HOURS/_TEST_HOURS vs. a long horizon)."
             )
         avg_loss = total_loss / max(n, 1)
-        mse = se_sum / max(n, 1)
-        mae = ae_sum / max(n, 1)
+        mse = se_sum / max(elem_n, 1)
+        mae = ae_sum / max(elem_n, 1)
         return avg_loss, {"mse": mse, "mae": mae, "rmse": math.sqrt(mse)}
 
     def run(self) -> dict:
@@ -509,12 +539,12 @@ def run_tsr_forecast(
     set_seed(seed)
     logger.info(f">>> tsr pred_len={pred_len} seed={seed} dir={run_dir}")
 
-    raw_loaders = get_loaders(dataset_name, cfg["data"], cfg["training"]["batch_size"], pred_len)
-    loaders = _unpack_loaders(raw_loaders, cfg["training"]["batch_size"])
+    tsr_cfg = cfg.get("tsr", {})
+    channel_independent = tsr_cfg.get("channel_independent", True)
+    loaders = _get_loaders_ci_aware(dataset_name, cfg, pred_len, channel_independent)
     input_size = loaders["input_size"]
     seq_len = cfg["data"]["seq_len"]
 
-    tsr_cfg = cfg.get("tsr", {})
     model = TSRTCNForecaster(
         input_size=input_size,
         pred_len=pred_len,
@@ -524,7 +554,7 @@ def run_tsr_forecast(
         gate_init=tsr_cfg.get("gate_init", 3.0),
         act_init=tsr_cfg.get("act_init", "relu"),
         norm_group_size=tsr_cfg.get("norm_group_size", 8),
-        channel_independent=tsr_cfg.get("channel_independent", True),
+        channel_independent=channel_independent,
     )
     runner = TSRForecastingRunner(model, loaders, run_dir, cfg, device, pred_len)
     return runner.run()
@@ -551,8 +581,7 @@ def run_static_final_forecast(
     set_seed(seed)
     logger.info(f">>> tsr_static_final pred_len={pred_len} seed={seed} widths={block_conv_widths} dir={run_dir}")
 
-    raw_loaders = get_loaders(dataset_name, cfg["data"], cfg["training"]["batch_size"], pred_len)
-    loaders = _unpack_loaders(raw_loaders, cfg["training"]["batch_size"])
+    loaders = _get_loaders_ci_aware(dataset_name, cfg, pred_len, channel_independent)
     input_size = loaders["input_size"]
 
     tsr_cfg = cfg.get("tsr", {})

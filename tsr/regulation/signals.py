@@ -53,7 +53,7 @@ def gate_sparsity_penalty(model: nn.Module) -> torch.Tensor:
     gate_sums = []
     gate_counts = 0
     for module in model.modules():
-        if isinstance(module, (TSRLinear, TSRConv2d)):
+        if isinstance(module, (TSRLinear, TSRConv2d, TSRConv1d)):
             # Skip the terminal output head: its gates are unused in forward
             # (head=True), so penalizing them does nothing useful — and on a
             # wide forecast head (Linear(hidden, pred_len*channels)) its
@@ -196,7 +196,7 @@ def compute_bottleneck_signal(
         total = layer.out_features
         effective = layer.effective_neurons()
         gate_vals = layer.gate_values()
-    elif isinstance(layer, TSRConv2d):
+    elif isinstance(layer, (TSRConv2d, TSRConv1d)):
         total = layer.out_channels
         effective = layer.effective_channels()
         gate_vals = layer.gate_values()
