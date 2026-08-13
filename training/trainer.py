@@ -21,6 +21,7 @@ The trainer also handles:
 
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -187,8 +188,19 @@ class TSRTrainer:
         Returns:
             Dict with final metrics and training history.
         """
-        logger.info(f"Starting TSR training: {self.model.topology_summary()}")
-        logger.info(f"Total params: {count_parameters(self.model):,}")
+        # ── Configure logging to stdout so it appears in the terminal ──
+        if not logging.root.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+            logging.root.addHandler(handler)
+            logging.root.setLevel(logging.INFO)
+
+        init_params = count_parameters(self.model)
+        print(f"\n{'='*70}")
+        print(f"  TSR Training Start")
+        print(f"  Initial params : {init_params:,}")
+        print(f"  Initial topology: {self.model.topology_summary()}")
+        print(f"{'='*70}\n")
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
@@ -199,6 +211,21 @@ class TSRTrainer:
             self.epoch = epoch
             epoch_loss = self._train_epoch()
 
+            # ── Per-epoch summary ──
+            val_metrics = self.evaluate()
+            params     = count_parameters(self.model)
+            effective  = count_effective_parameters(self.model)
+            lr         = self.optimizer.param_groups[0]["lr"]
+            n_events   = len(self.structural_events)
+            val_acc    = val_metrics["val_accuracy"]
+            best_acc   = val_metrics["best_val_accuracy"]
+            print(
+                f"Epoch {epoch+1:3d}/{self.max_epochs}  "
+                f"loss={epoch_loss:.4f}  val={val_acc:.4f}  best={best_acc:.4f}  "
+                f"params={params:,}  eff={effective:,}  "
+                f"events={n_events}  lr={lr:.2e}"
+            )
+
             if self.max_steps and self.global_step >= self.max_steps:
                 break
 
@@ -208,6 +235,14 @@ class TSRTrainer:
         final_metrics["structural_overhead_pct"] = self.flops_tracker.overhead_percentage
         final_metrics["num_structural_events"] = len(self.structural_events)
         final_metrics["final_topology"] = self.model.topology_summary()
+
+        print(f"\n{'='*70}")
+        print(f"  TSR Training Complete")
+        print(f"  best_val_acc  : {self.best_val_acc:.4f}")
+        print(f"  total events  : {len(self.structural_events)}")
+        print(f"  final params  : {count_parameters(self.model):,}")
+        print(f"  final topology: {self.model.topology_summary()}")
+        print(f"{'='*70}\n")
 
         logger.info(f"Training complete: {final_metrics}")
         return final_metrics
@@ -270,8 +305,14 @@ class TSRTrainer:
             loss_val = task_loss.item()
             epoch_loss += loss_val
             num_batches += 1
-            
-            pbar.set_postfix({"loss": f"{loss_val:.4f}", "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"})
+
+            pbar.set_postfix({
+                "loss":   f"{loss_val:.4f}",
+                "lr":     f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                "params": f"{count_parameters(self.model):,}",
+                "eff":    f"{count_effective_parameters(self.model):,}",
+                "events": len(self.structural_events),
+            })
 
             # Record loss for monitor
             self.monitor.record_loss(loss_val)
@@ -338,6 +379,22 @@ class TSRTrainer:
         if events:
             self.structural_events.extend(events)
 
+            # ── Live event banner (visible through tqdm) ──
+            from tqdm import tqdm as _tqdm
+            overhead_ms = (time.time() - t0) * 1000
+            for e in events:
+                action_sym = {"grow": "⬆ GROW", "prune": "⬇ PRUNE", "insert_layer": "➕ INSERT"}.get(e.action, e.action.upper())
+                old_sz = getattr(e, "old_size", "?")
+                new_sz = getattr(e, "new_size", "?")
+                _tqdm.write(
+                    f"  [{self.global_step:>6}] {action_sym:12s}  "
+                    f"layer={e.layer_name}  "
+                    f"{old_sz} → {new_sz}  "
+                    f"total_params={count_parameters(self.model):,}  "
+                    f"eff={count_effective_parameters(self.model):,}  "
+                    f"({overhead_ms:.0f}ms)"
+                )
+
             # If a new block was inserted, the monitor's hooks don't cover it
             # (and layer names may have shifted). Re-register hooks against the
             # current module tree before rebuilding the optimizer so the new
@@ -385,13 +442,6 @@ class TSRTrainer:
             # Record topology snapshot
             self.topology_history.append(
                 capture_topology(self.model, self.global_step)
-            )
-
-            # Log structural overhead
-            overhead_ms = (time.time() - t0) * 1000
-            logger.info(
-                f"Step {self.global_step}: Structural update took {overhead_ms:.1f}ms, "
-                f"new topology: {self.model.topology_summary()}"
             )
 
             # Record modified layers for scheduler cooldown

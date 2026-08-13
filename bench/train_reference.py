@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import time
+from tqdm import tqdm
 from pathlib import Path
 
 import torch
@@ -28,7 +29,7 @@ def build_model(arch: str, num_classes: int) -> nn.Module:
 def evaluate(model, loader, device) -> float:
     model.eval()
     correct, total = 0, 0
-    for x, y in loader:
+    for x, y in tqdm(loader, desc="Eval", leave=False):
         x, y = x.to(device), y.to(device)
         pred = model(x).argmax(1)
         correct += (pred == y).sum().item()
@@ -73,7 +74,7 @@ def main():
         model.train()
         t0 = time.time()
         total_loss, n = 0.0, 0
-        for x, y in train_loader:
+        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
             x, y = x.to(args.device), y.to(args.device)
             opt.zero_grad(set_to_none=True)
             loss = nn.functional.cross_entropy(model(x), y)
