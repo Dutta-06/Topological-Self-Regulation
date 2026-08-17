@@ -100,12 +100,17 @@ def main():
     model = model.to(args.device)
 
     baseline_params = count_params(model)
-    budget_params = int(baseline_params * args.budget_ratio)
+    if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:
+        budget_params = None
+        cap_str = "None (Unconstrained Capacity Discovery)"
+    else:
+        budget_params = int(baseline_params * args.budget_ratio)
+        cap_str = f"{budget_params:,} ({args.budget_ratio*100:.0f}% of baseline)"
 
     print(f"\n{'='*70}")
     print(f"  TSR-X Dynamic Plasticity Training: {args.arch.upper()} on {args.dataset.upper()}")
     print(f"  Baseline Architecture Params : {baseline_params:,}")
-    print(f"  Target Parameter Budget Cap  : {budget_params:,} ({args.budget_ratio*100:.0f}% of baseline)")
+    print(f"  Target Parameter Budget Cap  : {cap_str}")
     print(f"  Candidate Bank Size (k)      : {args.k}")
     print(f"  Structural Update Interval   : Every {args.update_interval} steps")
     print(f"{'='*70}\n")
