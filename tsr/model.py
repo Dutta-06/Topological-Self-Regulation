@@ -259,7 +259,7 @@ class TSRNetwork(nn.Module):
 
         total = sum(p.numel() for p in self.parameters())
         return (
-            f"TSR[conv={'→'.join(channels)}, "
-            f"fc={'→'.join(classifier_info)}, "
+            f"TSR[conv={'->'.join(channels)}, "
+            f"fc={'->'.join(classifier_info)}, "
             f"params={total:,}]"
         )

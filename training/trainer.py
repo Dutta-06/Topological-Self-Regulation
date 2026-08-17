@@ -25,6 +25,11 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -383,13 +388,13 @@ class TSRTrainer:
             from tqdm import tqdm as _tqdm
             overhead_ms = (time.time() - t0) * 1000
             for e in events:
-                action_sym = {"grow": "⬆ GROW", "prune": "⬇ PRUNE", "insert_layer": "➕ INSERT"}.get(e.action, e.action.upper())
+                action_sym = {"grow": "[GROW]", "prune": "[PRUNE]", "insert_layer": "[INSERT]"}.get(e.action, e.action.upper())
                 old_sz = getattr(e, "old_size", "?")
                 new_sz = getattr(e, "new_size", "?")
                 _tqdm.write(
-                    f"  [{self.global_step:>6}] {action_sym:12s}  "
+                    f"  [{self.global_step:>6}] {action_sym:10s}  "
                     f"layer={e.layer_name}  "
-                    f"{old_sz} → {new_sz}  "
+                    f"{old_sz} -> {new_sz}  "
                     f"total_params={count_parameters(self.model):,}  "
                     f"eff={count_effective_parameters(self.model):,}  "
                     f"({overhead_ms:.0f}ms)"
