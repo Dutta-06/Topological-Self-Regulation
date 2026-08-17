@@ -64,25 +64,41 @@ def main():
     train_loader, val_loader = loader_fn(root=args.data_root, batch_size=args.batch_size,
                                           augmentation=args.augmentation)
 
+    dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
     model = build_model(args.arch, num_classes).to(args.device)
+    baseline_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print(f"\n{'='*70}")
+    print(f"  Standard Static Reference Training: {args.arch.upper()} on {args.dataset.upper()}")
+    print(f"  Compute Device               : {dev_name} ({args.device})")
+    print(f"  Total Parameters             : {baseline_params:,} (Fixed Static)")
+    print(f"  Epochs                       : {args.epochs}")
+    print(f"{'='*70}\n")
+
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
                            weight_decay=args.weight_decay, nesterov=True)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    total_steps = args.epochs * len(train_loader)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     best_acc = 0.0
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
         total_loss, n = 0.0, 0
-        for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        for x, y in pbar:
             x, y = x.to(args.device), y.to(args.device)
             opt.zero_grad(set_to_none=True)
             loss = nn.functional.cross_entropy(model(x), y)
             loss.backward()
             opt.step()
+            sched.step()
             total_loss += loss.item() * x.size(0)
             n += x.size(0)
-        sched.step()
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "lr": f"{opt.param_groups[0]['lr']:.2e}",
+            })
 
         val_acc = evaluate(model, val_loader, args.device)
         is_best = val_acc > best_acc
@@ -97,6 +113,7 @@ def main():
                 "val_acc": val_acc,
                 "arch": args.arch,
                 "dataset": args.dataset,
+                "params": baseline_params,
                 "args": vars(args),
             }, out_path)
 
@@ -109,7 +126,14 @@ def main():
                 "val_acc": val_acc,
             }, out_path.with_name(out_path.stem + f"_epoch{epoch+1}.pt"))
 
-    print(f"\nDONE. best val_acc={best_acc:.4f}  checkpoint={out_path}")
+    print(f"\n{'='*70}")
+    print(f"  Reference Baseline Training Complete")
+    print(f"  Model Architecture        : {args.arch.upper()}")
+    print(f"  Dataset                   : {args.dataset.upper()}")
+    print(f"  Fixed Parameters          : {baseline_params:,}")
+    print(f"  Best Validation Accuracy  : {best_acc:.4f}")
+    print(f"  Checkpoint Saved To       : {out_path}")
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
