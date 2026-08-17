@@ -24,6 +24,18 @@ def _modules_by_name(model: nn.Module) -> Dict[str, nn.Module]:
     return dict(model.named_modules())
 
 
+def _bump_out_attr(mod: nn.Module, delta: int) -> None:
+    for attr in ("out_channels", "out_features"):
+        if hasattr(mod, attr):
+            setattr(mod, attr, getattr(mod, attr) + delta)
+
+
+def _bump_in_attr(mod: nn.Module, delta: int) -> None:
+    for attr in ("in_channels", "in_features"):
+        if hasattr(mod, attr):
+            setattr(mod, attr, getattr(mod, attr) + delta)
+
+
 def reindex_optimizer_state(
     optimizer: torch.optim.Optimizer,
     old_param: nn.Parameter,
@@ -181,9 +193,9 @@ def materialize_candidate(
 ) -> None:
     """Materialize candidate `cand_idx` (0 <= cand_idx < k) into a real channel.
 
-    1. Moves the candidate from the candidate slice to index `base_size` in the real set.
+    1. Moves candidate `cand_idx` into the real channel set at index `base_size`.
     2. Initializes consumer port weights along optimal descent direction v* = -eps * u_c / ||u_c|| (Theorem 3.4).
-    3. Refills a new random candidate at the vacated slot with zeroed port.
+    3. Expands tensors so exactly `k` candidate slots remain available for subsequent steps.
     4. Increments base_size and bundle.size.
     """
     h = bank.handles[tap]
@@ -193,79 +205,132 @@ def materialize_candidate(
     base_size = h.base_size
     cand_slot_idx = base_size + cand_idx
 
-    # 1. Shift candidate to be the new last real channel (at index base_size)
-    # If cand_idx > 0, swap cand_slot_idx with base_size so the new real channel is at base_size
-    if cand_idx > 0:
-        # Swap in producers
-        for slot in h.bundle.producer_slots:
-            mod = modules[slot.module_name]
-            w = mod.weight.data
-            w[[base_size, cand_slot_idx]] = w[[cand_slot_idx, base_size]].clone()
-            if getattr(mod, "bias", None) is not None:
-                b = mod.bias.data
-                b[[base_size, cand_slot_idx]] = b[[cand_slot_idx, base_size]].clone()
-
-        # Swap in affines
-        for slot in h.bundle.affine_slots:
-            mod = modules[slot.module_name]
-            for pname in ("weight", "bias"):
-                p = getattr(mod, pname, None)
-                if p is not None:
-                    p.data[[base_size, cand_slot_idx]] = p.data[[cand_slot_idx, base_size]].clone()
-            for bname in ("running_mean", "running_var"):
-                buf = getattr(mod, bname, None)
-                if buf is not None:
-                    buf[[base_size, cand_slot_idx]] = buf[[cand_slot_idx, base_size]].clone()
-
-    # 2. Wire the consumer port weights for the newly materialized channel (at index base_size)
-    # Direction v* = -eps * u_c / ||u_c|| (Theorem 3.4 & Remark 3.5)
-    for slot in h.bundle.consumer_slots:
+    # 1. Expand Producer Slots
+    producers_seen = set()
+    for slot in h.bundle.producer_slots:
+        if slot.module_name in producers_seen:
+            continue
+        producers_seen.add(slot.module_name)
         mod = modules[slot.module_name]
+
+        w = mod.weight
+        device, dtype = w.device, w.dtype
+        real_w = w.data[:base_size]
+        promoted_w = w.data[cand_slot_idx : cand_slot_idx + 1].clone()
+        cands_w = w.data[base_size:].clone()
+
+        # Refill candidate at cand_idx with new Kaiming weights
+        new_cand_row = torch.empty(1, *w.shape[1:], device=device, dtype=dtype)
+        if new_cand_row.numel():
+            nn.init.kaiming_uniform_(new_cand_row.view(1, -1), a=math.sqrt(5))
+        cands_w[cand_idx] = new_cand_row[0]
+
+        w_new = torch.cat([real_w, promoted_w, cands_w], dim=0)
+        new_param = nn.Parameter(w_new)
+        reindex_optimizer_state(optimizer, mod.weight, new_param, axis=0, action="grow", idx=base_size, count=1)
+        mod.weight = new_param
+
+        # Bias
+        if getattr(mod, "bias", None) is not None:
+            b = mod.bias
+            real_b = b.data[:base_size]
+            promoted_b = b.data[cand_slot_idx : cand_slot_idx + 1].clone()
+            cands_b = b.data[base_size:].clone()
+            cands_b[cand_idx] = 0.0
+            b_new = torch.cat([real_b, promoted_b, cands_b], dim=0)
+            new_b = nn.Parameter(b_new)
+            reindex_optimizer_state(optimizer, mod.bias, new_b, axis=0, action="grow", idx=base_size, count=1)
+            mod.bias = new_b
+
+        _bump_out_attr(mod, 1)
+
+    # 2. Expand Affine Slots (BatchNorm)
+    affines_seen = set()
+    for slot in h.bundle.affine_slots:
+        if slot.module_name in affines_seen:
+            continue
+        affines_seen.add(slot.module_name)
+        mod = modules[slot.module_name]
+        device = mod.weight.device if getattr(mod, "weight", None) is not None else "cpu"
+        dtype = mod.weight.dtype if getattr(mod, "weight", None) is not None else torch.float32
+
+        if getattr(mod, "weight", None) is not None:
+            pw = mod.weight
+            real_pw = pw.data[:base_size]
+            promoted_pw = pw.data[cand_slot_idx : cand_slot_idx + 1].clone()
+            cands_pw = pw.data[base_size:].clone()
+            cands_pw[cand_idx] = 1.0
+            pw_new = torch.cat([real_pw, promoted_pw, cands_pw], dim=0)
+            new_param = nn.Parameter(pw_new)
+            reindex_optimizer_state(optimizer, mod.weight, new_param, axis=0, action="grow", idx=base_size, count=1)
+            mod.weight = new_param
+
+        if getattr(mod, "bias", None) is not None:
+            pb = mod.bias
+            real_pb = pb.data[:base_size]
+            promoted_pb = pb.data[cand_slot_idx : cand_slot_idx + 1].clone()
+            cands_pb = pb.data[base_size:].clone()
+            cands_pb[cand_idx] = 0.0
+            pb_new = torch.cat([real_pb, promoted_pb, cands_pb], dim=0)
+            new_param = nn.Parameter(pb_new)
+            reindex_optimizer_state(optimizer, mod.bias, new_param, axis=0, action="grow", idx=base_size, count=1)
+            mod.bias = new_param
+
+        if getattr(mod, "running_mean", None) is not None:
+            rm = mod.running_mean
+            real_rm = rm[:base_size]
+            promoted_rm = rm[cand_slot_idx : cand_slot_idx + 1].clone()
+            cands_rm = rm[base_size:].clone()
+            cands_rm[cand_idx] = 0.0
+            mod.running_mean = torch.cat([real_rm, promoted_rm, cands_rm], dim=0)
+
+        if getattr(mod, "running_var", None) is not None:
+            rv = mod.running_var
+            real_rv = rv[:base_size]
+            promoted_rv = rv[cand_slot_idx : cand_slot_idx + 1].clone()
+            cands_rv = rv[base_size:].clone()
+            cands_rv[cand_idx] = 1.0
+            mod.running_var = torch.cat([real_rv, promoted_rv, cands_rv], dim=0)
+
+        for attr in ("num_features", "num_channels"):
+            if hasattr(mod, attr):
+                setattr(mod, attr, getattr(mod, attr) + 1)
+
+    # 3. Expand Consumer Slots and Wire Port Direction v* = -eps * u_c / ||u_c||
+    consumers_seen = set()
+    for slot in h.bundle.consumer_slots:
+        if slot.module_name in consumers_seen:
+            continue
+        consumers_seen.add(slot.module_name)
+        mod = modules[slot.module_name]
+
         mult = slot.multiplicity
         w = mod.weight
+        device, dtype = w.device, w.dtype
         g = mod.weight.grad
-        target_cols = slice(base_size * mult, (base_size + 1) * mult)
+
+        real_cols = w.data[:, : base_size * mult]
+        cand_cols = slice(cand_slot_idx * mult, (cand_slot_idx + 1) * mult)
 
         if g is not None:
-            # Sensed gradient slice from the candidate
-            cand_g = g.data[:, target_cols]
+            cand_g = g.data[:, cand_cols]
             norm = cand_g.norm().clamp_min(1e-12)
             v_star = -eps * (cand_g / norm)
-            w.data[:, target_cols] = v_star
         else:
-            # Fallback if no grad available: small random init
-            nn.init.kaiming_uniform_(w.data[:, target_cols].reshape(w.shape[0], -1), a=math.sqrt(5))
-            w.data[:, target_cols] *= eps
+            v_star = torch.empty(w.shape[0], mult, *w.shape[2:], device=device, dtype=dtype)
+            nn.init.kaiming_uniform_(v_star.reshape(w.shape[0], -1), a=math.sqrt(5))
+            v_star *= eps
 
-    # 3. Refill the candidate slot (now at base_size + cand_idx)
-    # Re-randomize producer weights for the candidate
-    for slot in h.bundle.producer_slots:
-        mod = modules[slot.module_name]
-        w = mod.weight.data
-        cand_row = w[cand_slot_idx]
-        nn.init.kaiming_uniform_(cand_row.unsqueeze(0).view(1, -1), a=math.sqrt(5))
+        cands_all = w.data[:, base_size * mult :].clone()
+        # Zero out the refilled candidate slot
+        cands_all[:, cand_idx * mult : (cand_idx + 1) * mult] = 0.0
 
-        if getattr(mod, "bias", None) is not None:
-            mod.bias.data[cand_slot_idx] = 0.0
+        w_new = torch.cat([real_cols, v_star, cands_all], dim=1)
+        new_param = nn.Parameter(w_new)
+        reindex_optimizer_state(optimizer, mod.weight, new_param, axis=1, action="grow", idx=base_size * mult, count=mult)
+        mod.weight = new_param
 
-    # Reset affine stats for candidate
-    for slot in h.bundle.affine_slots:
-        mod = modules[slot.module_name]
-        if getattr(mod, "weight", None) is not None:
-            mod.weight.data[cand_slot_idx] = 1.0
-        if getattr(mod, "bias", None) is not None:
-            mod.bias.data[cand_slot_idx] = 0.0
-        if getattr(mod, "running_mean", None) is not None:
-            mod.running_mean.data[cand_slot_idx] = 0.0
-        if getattr(mod, "running_var", None) is not None:
-            mod.running_var.data[cand_slot_idx] = 1.0
-
-    # Zero out consumer port weights for the refilled candidate
-    for slot in h.bundle.consumer_slots:
-        mod = modules[slot.module_name]
-        mult = slot.multiplicity
-        cand_cols = slice(cand_slot_idx * mult, (cand_slot_idx + 1) * mult)
-        mod.weight.data[:, cand_cols] = 0.0
+        _bump_in_attr(mod, mult)
 
     # 4. Increment sizes
     h.base_size += 1
