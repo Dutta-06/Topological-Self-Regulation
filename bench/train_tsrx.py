@@ -107,8 +107,10 @@ def main():
         budget_params = int(baseline_params * args.budget_ratio)
         cap_str = f"{budget_params:,} ({args.budget_ratio*100:.0f}% of baseline)"
 
+    dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
     print(f"\n{'='*70}")
     print(f"  TSR-X Dynamic Plasticity Training: {args.arch.upper()} on {args.dataset.upper()}")
+    print(f"  Compute Device               : {dev_name} ({args.device})")
     print(f"  Baseline Architecture Params : {baseline_params:,}")
     print(f"  Target Parameter Budget Cap  : {cap_str}")
     print(f"  Candidate Bank Size (k)      : {args.k}")
