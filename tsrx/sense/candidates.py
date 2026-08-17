@@ -169,3 +169,85 @@ class CandidateBank(nn.Module):
     def candidate_slice(self, tap: int) -> slice:
         h = self.handles[tap]
         return slice(h.base_size, h.base_size + h.k)
+
+    def deployed_params(self) -> int:
+        """Return the parameter count of the deployed model excluding candidate slices."""
+        total = 0
+        modules = _modules_by_name(self.model)
+        # Compute params from modules taking base_size into account
+        seen_params = set()
+        for h in self.handles.values():
+            for slot in h.bundle.producer_slots:
+                mod = modules.get(slot.module_name)
+                if mod is None or id(mod.weight) in seen_params:
+                    continue
+                seen_params.add(id(mod.weight))
+                # mod.weight shape is (base_size + k, in_dim, *k_shape)
+                in_size = getattr(mod, "in_channels", getattr(mod, "in_features", mod.weight.shape[1]))
+                # If consumer is in another bundle, in_size is that bundle's base_size
+                kernel_prod = 1
+                for d in mod.weight.shape[2:]:
+                    kernel_prod *= d
+                # Producer real weight: base_size * real_in * kernel
+                # Real count for this module:
+                pass
+        # Even simpler: total model params minus the candidate parameter slices
+        total_p = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        cand_p = 0
+        from tsrx.alloc.cost import kappa_params
+        for h in self.handles.values():
+            cand_p += int(h.k * kappa_params(h.bundle, self.model))
+        return total_p - cand_p
+
+    def detach(self) -> nn.Module:
+        """Strip all candidate rows and columns from the model, leaving the pure deployed model."""
+        modules = _modules_by_name(self.model)
+        for h in self.handles.values():
+            k = h.k
+            base_size = h.base_size
+
+            # 1. Producers
+            producers_seen = set()
+            for s in h.bundle.producer_slots:
+                if s.module_name in producers_seen:
+                    continue
+                producers_seen.add(s.module_name)
+                mod = modules[s.module_name]
+                mod.weight = nn.Parameter(mod.weight.data[:base_size])
+                if getattr(mod, "bias", None) is not None:
+                    mod.bias = nn.Parameter(mod.bias.data[:base_size])
+                _bump_out_attr(mod, -k)
+
+            # 2. Affines
+            affines_seen = set()
+            for s in h.bundle.affine_slots:
+                if s.module_name in affines_seen:
+                    continue
+                affines_seen.add(s.module_name)
+                mod = modules[s.module_name]
+                if getattr(mod, "weight", None) is not None:
+                    mod.weight = nn.Parameter(mod.weight.data[:base_size])
+                if getattr(mod, "bias", None) is not None:
+                    mod.bias = nn.Parameter(mod.bias.data[:base_size])
+                if getattr(mod, "running_mean", None) is not None:
+                    mod.running_mean = mod.running_mean[:base_size]
+                if getattr(mod, "running_var", None) is not None:
+                    mod.running_var = mod.running_var[:base_size]
+                for attr in ("num_features", "num_channels"):
+                    if hasattr(mod, attr):
+                        setattr(mod, attr, getattr(mod, attr) - k)
+
+            # 3. Consumers
+            consumers_seen = set()
+            for s in h.bundle.consumer_slots:
+                if s.module_name in consumers_seen:
+                    continue
+                consumers_seen.add(s.module_name)
+                mod = modules[s.module_name]
+                mult = s.multiplicity
+                mod.weight = nn.Parameter(mod.weight.data[:, : base_size * mult])
+                _bump_in_attr(mod, -(k * mult))
+
+        self.handles.clear()
+        return self.model
+

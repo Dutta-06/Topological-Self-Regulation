@@ -165,7 +165,7 @@ def main():
             loss_val = loss.item()
             total_loss += loss_val * xb.size(0)
             n_samples += xb.size(0)
-            current_params = count_params(model)
+            current_params = bank.deployed_params()
 
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
@@ -193,7 +193,7 @@ def main():
                     apply_exchange(dec, bank, optimizer=opt, eps=1e-3)
                     structural_events_count += 1
                     overhead_ms = (time.time() - t0_struct) * 1000
-                    new_p = count_params(model)
+                    new_p = bank.deployed_params()
 
                     if dec.action == "exchange":
                         g_name = bank.handles[dec.grow_tap].bundle.producer_slots[0].module_name
@@ -230,7 +230,7 @@ def main():
         val_acc = evaluate(model, val_loader, args.device)
         is_best = val_acc > best_acc
         best_acc = max(best_acc, val_acc)
-        curr_p = count_params(model)
+        curr_p = bank.deployed_params()
         pct_saved = (1.0 - curr_p / baseline_params) * 100.0
 
         print(
@@ -255,7 +255,7 @@ def main():
         if args.max_steps and global_step >= args.max_steps:
             break
 
-    final_p = count_params(model)
+    final_p = bank.deployed_params()
     final_saved = (1.0 - final_p / baseline_params) * 100.0
     print(f"\n{'='*70}")
     print(f"  TSR-X Training Complete")
