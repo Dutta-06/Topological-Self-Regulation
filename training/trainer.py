@@ -389,8 +389,9 @@ class TSRTrainer:
             overhead_ms = (time.time() - t0) * 1000
             for e in events:
                 action_sym = {"grow": "[GROW]", "prune": "[PRUNE]", "insert_layer": "[INSERT]"}.get(e.action, e.action.upper())
-                old_sz = getattr(e, "old_size", "?")
-                new_sz = getattr(e, "new_size", "?")
+                details = getattr(e, "details", {}) or {}
+                old_sz = details.get("old_size", getattr(e, "old_size", "?"))
+                new_sz = details.get("new_size", getattr(e, "new_size", "?"))
                 _tqdm.write(
                     f"  [{self.global_step:>6}] {action_sym:10s}  "
                     f"layer={e.layer_name}  "
