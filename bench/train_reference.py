@@ -20,9 +20,7 @@ import torch.nn as nn
 import torchvision
 
 
-def build_model(arch: str, num_classes: int) -> nn.Module:
-    fn = {"resnet18": torchvision.models.resnet18, "vgg16_bn": torchvision.models.vgg16_bn}[arch]
-    return fn(num_classes=num_classes)
+from bench.models import build_model, describe
 
 
 @torch.no_grad()
@@ -48,6 +46,10 @@ def main():
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=5e-4)
     ap.add_argument("--augmentation", default="standard")
+    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=True,
+                    help="3x3 stride-1 stem, no maxpool (REQUIRED for correct CIFAR accuracy)")
+    ap.add_argument("--imagenet-stem", dest="cifar_stem", action="store_false",
+                    help="keep torchvision 7x7 stride-2 stem (crushes 32x32 to 8x8; ~87 pct ceiling)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True, help="checkpoint path (.pt)")
@@ -65,13 +67,15 @@ def main():
                                           augmentation=args.augmentation)
 
     dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
-    model = build_model(args.arch, num_classes).to(args.device)
+    model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
     baseline_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print(f"\n{'='*70}")
     print(f"  Standard Static Reference Training: {args.arch.upper()} on {args.dataset.upper()}")
     print(f"  Compute Device               : {dev_name} ({args.device})")
     print(f"  Total Parameters             : {baseline_params:,} (Fixed Static)")
+    print(f"  CIFAR stem (3x3 s1, no pool) : {args.cifar_stem}")
+    print(f"  Stage spatial sizes          : {describe(model, args.arch)['spatial']}")
     print(f"  Epochs                       : {args.epochs}")
     print(f"{'='*70}\n")
 
@@ -114,6 +118,7 @@ def main():
                 "arch": args.arch,
                 "dataset": args.dataset,
                 "params": baseline_params,
+                "cifar_stem": args.cifar_stem,
                 "args": vars(args),
             }, out_path)
 

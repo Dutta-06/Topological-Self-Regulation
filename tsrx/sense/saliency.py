@@ -36,6 +36,71 @@ def first_order_saliency(model: nn.Module, bundle, group_base_size: int) -> torc
     return total.abs()
 
 
+class ActivationStats:
+    """Running per-channel E[a_j^2] for each group's producing tensor.
+
+    Needed for the second-order half of Eq. (14). Registers a forward hook
+    on one producer module per group and accumulates the mean square of
+    each channel over the batch and any spatial/temporal axes.
+    """
+
+    def __init__(self, model: nn.Module, bank) -> None:
+        self.sums: dict = {}
+        self.counts: dict = {}
+        self._handles = []
+        modules = dict(model.named_modules())
+        for tap, h in bank.handles.items():
+            prod = h.bundle.producer_slots[0].module_name
+            mod = modules.get(prod)
+            if mod is None:
+                continue
+            self._handles.append(mod.register_forward_hook(self._make_hook(tap)))
+
+    def _make_hook(self, tap: int):
+        def hook(mod, inp, out):
+            if not torch.is_tensor(out) or out.dim() < 2:
+                return
+            with torch.no_grad():
+                # mean square per channel (axis 1), over batch + all trailing axes
+                dims = [0] + list(range(2, out.dim()))
+                ms = out.detach().pow(2).mean(dim=dims)
+            prev = self.sums.get(tap)
+            self.sums[tap] = ms if prev is None or prev.shape != ms.shape else prev + ms
+            self.counts[tap] = 1 if prev is None or prev.shape != ms.shape else self.counts[tap] + 1
+        return hook
+
+    def mean_sq(self, tap: int) -> Optional[torch.Tensor]:
+        s = self.sums.get(tap)
+        if s is None:
+            return None
+        return s / max(self.counts.get(tap, 1), 1)
+
+    def reset(self) -> None:
+        self.sums.clear()
+        self.counts.clear()
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+
+def port_norm_sq(model: nn.Module, bundle, group_base_size: int) -> torch.Tensor:
+    """||v_j||^2 per real unit j: the squared norm of unit j's outgoing
+    weights, summed over every consumer of the group."""
+    modules = dict(model.named_modules())
+    device = next(model.parameters()).device
+    total = torch.zeros(group_base_size, device=device)
+    for slot in bundle.consumer_slots:
+        mod = modules[slot.module_name]
+        w = mod.weight
+        mult = slot.multiplicity
+        real = w.data[:, : group_base_size * mult]
+        real = real.reshape(w.shape[0], group_base_size, mult, *w.shape[2:])
+        total = total + real.pow(2).sum(dim=tuple(d for d in range(real.dim()) if d != 1))
+    return total
+
+
 def removal_score(first_order: torch.Tensor, mean_sq_activation: Optional[torch.Tensor],
                    H_max: Optional[float], v_j_norm_sq: Optional[torch.Tensor]) -> torch.Tensor:
     """Full RHS of (14): |<u_j,v_j>| + (H_max/2) E[a_j^2] ||v_j||^2.

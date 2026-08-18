@@ -125,6 +125,16 @@ class CandidateBank(nn.Module):
                 continue
             self._attach(bd)
 
+        # Final pass: zero every port block AFTER all groups are attached.
+        # Per-group zeroing during _attach is not sufficient — attaching
+        # group B adds Kaiming rows to a module whose candidate columns
+        # group A already zeroed, repopulating the candidate x candidate
+        # corner. Function preservation survives that (the corner exits
+        # through B's own zeroed port), but it leaves a nonzero block that
+        # makes the dormancy invariant non-uniform and lets candidates wire
+        # into each other. Zeroing once at the end is simpler and safer.
+        self.zero_ports()
+
     def _has_ln_gn(self, bd: IndexBundle) -> bool:
         modules = _modules_by_name(self.model)
         for s in bd.affine_slots:
@@ -170,34 +180,114 @@ class CandidateBank(nn.Module):
         h = self.handles[tap]
         return slice(h.base_size, h.base_size + h.k)
 
-    def deployed_params(self) -> int:
-        """Return the parameter count of the deployed model excluding candidate slices."""
-        total = 0
+    # ------------------------------------------------------------------
+    # Dormancy enforcement (Definition 3.2 / Lemma 2.2)
+    # ------------------------------------------------------------------
+
+    def _port_columns(self):
+        """Yield (module, column_slice) for every candidate port block.
+
+        A consumer's input axis is laid out [ real (base*mult) |
+        candidates (k*mult) ], so the candidate port is always the
+        trailing k*mult columns.
+        """
         modules = _modules_by_name(self.model)
-        # Compute params from modules taking base_size into account
-        seen_params = set()
+        for h in self.handles.values():
+            seen = set()
+            for slot in h.bundle.consumer_slots:
+                if slot.module_name in seen:
+                    continue
+                seen.add(slot.module_name)
+                mod = modules.get(slot.module_name)
+                if mod is None or getattr(mod, "weight", None) is None:
+                    continue
+                n = h.k * slot.multiplicity
+                total_cols = mod.weight.shape[1]
+                yield mod, slice(total_cols - n, total_cols)
+
+    @torch.no_grad()
+    def zero_ports(self) -> None:
+        """Re-zero every candidate port column. MUST be called after every
+        optimizer.step().
+
+        The whole construction depends on candidates being SILENT: u_c is
+        defined (Definition 3.2) as the port gradient evaluated at
+        v_c = 0, and Lemma 2.2's function-preservation holds only there.
+        But the port columns carry a real, nonzero gradient (u_c IS that
+        gradient), so any ordinary optimizer will happily train them away
+        from zero — after which the "candidates" are just extra live
+        channels, u_c degenerates into an ordinary weight gradient, and
+        the model being evaluated no longer matches the model being
+        counted. Measured drift without this call: logits move by 5.3
+        after ONE SGD step and ~1e6 after ten.
+
+        Masking after the step (rather than excluding the columns from
+        the optimizer) is deliberate: the port is a SLICE of a shared
+        weight tensor, not a standalone parameter, so it cannot be put in
+        its own param group. Momentum/weight-decay may still accumulate
+        for those entries, but re-zeroing the values each step makes the
+        forward pass exactly dormant regardless.
+        """
+        for mod, cols in self._port_columns():
+            mod.weight.data[:, cols] = 0.0
+
+    @torch.no_grad()
+    def max_port_magnitude(self) -> float:
+        """Largest |port weight| across all groups — 0.0 iff fully dormant.
+        Cheap assertion for tests and for a periodic training-time check."""
+        worst = 0.0
+        for mod, cols in self._port_columns():
+            block = mod.weight.data[:, cols]
+            if block.numel():
+                worst = max(worst, float(block.abs().max().item()))
+        return worst
+
+    # ------------------------------------------------------------------
+    # Accounting
+    # ------------------------------------------------------------------
+
+    def deployed_params(self) -> int:
+        """Trainable parameter count of the DEPLOYED model, i.e. what
+        remains after `detach()` strips every candidate row/column.
+
+        Computed by measuring each tensor's real extent per axis rather
+        than by subtracting a per-group candidate cost. The subtractive
+        form double-counts the candidate x candidate corner block of any
+        module that is simultaneously a consumer of one candidate-bearing
+        group (axis 1) and a producer of another (axis 0) — it removes
+        k_in*(out) and k_out*(in) but the true candidate mass is
+        k_in*base_out + k_out*base_in + k_in*k_out, so the corner is
+        subtracted twice. Measured error on resnet18/k=4: -2,352 params,
+        growing as O(k^2), always in the flattering direction.
+        """
+        modules = _modules_by_name(self.model)
+
+        # real output extent per producing module, real input extent per consuming module
+        real_out: Dict[str, int] = {}
+        real_in: Dict[str, int] = {}
         for h in self.handles.values():
             for slot in h.bundle.producer_slots:
-                mod = modules.get(slot.module_name)
-                if mod is None or id(mod.weight) in seen_params:
+                real_out[slot.module_name] = h.base_size
+            for slot in h.bundle.affine_slots:
+                real_out[slot.module_name] = h.base_size
+            for slot in h.bundle.consumer_slots:
+                real_in[slot.module_name] = h.base_size * slot.multiplicity
+
+        total = 0
+        for name, mod in modules.items():
+            for pname, p in list(mod.named_parameters(recurse=False)):
+                if not p.requires_grad:
                     continue
-                seen_params.add(id(mod.weight))
-                # mod.weight shape is (base_size + k, in_dim, *k_shape)
-                in_size = getattr(mod, "in_channels", getattr(mod, "in_features", mod.weight.shape[1]))
-                # If consumer is in another bundle, in_size is that bundle's base_size
-                kernel_prod = 1
-                for d in mod.weight.shape[2:]:
-                    kernel_prod *= d
-                # Producer real weight: base_size * real_in * kernel
-                # Real count for this module:
-                pass
-        # Even simpler: total model params minus the candidate parameter slices
-        total_p = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        cand_p = 0
-        from tsrx.alloc.cost import kappa_params
-        for h in self.handles.values():
-            cand_p += int(h.k * kappa_params(h.bundle, self.model))
-        return total_p - cand_p
+                dims = list(p.shape)
+                if len(dims) >= 1 and name in real_out:
+                    dims[0] = real_out[name]
+                if len(dims) >= 2 and name in real_in:
+                    dims[1] = real_in[name]
+                n = 1
+                for d in dims:
+                    n *= d
+                total += n
+        return total
 
     def detach(self) -> nn.Module:
         """Strip all candidate rows and columns from the model, leaving the pure deployed model."""

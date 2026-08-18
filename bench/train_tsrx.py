@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import torchvision
 from tqdm import tqdm
 
+from bench.models import build_model, describe
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
 from tsrx.alloc.cost import kappa_params
 from tsrx.alloc.exchange import evaluate_exchange, apply_exchange, ExchangeDecision
@@ -35,7 +36,7 @@ from tsrx.graph.bundle import build_all_bundles
 from tsrx.graph.groups import discover_groups
 from tsrx.graph.trace import trace_model
 from tsrx.sense.candidates import CandidateBank, UnsupportedGroupError
-from tsrx.sense.saliency import first_order_saliency
+from tsrx.sense.saliency import ActivationStats, first_order_saliency
 from tsrx.sense.topo import WindowedSignal, compute_uc_norms
 
 
@@ -71,8 +72,12 @@ def main():
     ap.add_argument("--update-interval", type=int, default=100, help="Steps between structural updates")
     ap.add_argument("--budget-ratio", type=float, default=0.85, help="Max param budget as ratio of baseline (e.g. 0.85)")
     ap.add_argument("--delta", type=float, default=1e-7, help="Exchange acceptance margin")
-    ap.add_argument("--prune-tol", type=float, default=1e-8, help="Pure pruning tolerance")
+    ap.add_argument("--prune-tol", type=float, default=1e-3,
+                    help="RELATIVE pure-prune tolerance (fraction of group median saliency)")
     ap.add_argument("--min-size", type=int, default=8, help="Min channels per group")
+    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=True)
+    ap.add_argument("--imagenet-stem", dest="cifar_stem", action="store_false")
+    ap.add_argument("--H-max", type=float, default=1.0, help="curvature bound for Eq.14 removal score")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-workers", type=int, default=0)
@@ -95,9 +100,7 @@ def main():
     )
 
     # 1. Build Reference Model
-    model = {"resnet18": torchvision.models.resnet18,
-             "vgg16_bn": torchvision.models.vgg16_bn}[args.arch](num_classes=num_classes)
-    model = model.to(args.device)
+    model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
 
     baseline_params = count_params(model)
     if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:
@@ -134,8 +137,12 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     win = WindowedSignal(window=args.update_interval)
+    act_stats = ActivationStats(model, bank)   # E[a_j^2] for Eq.(14)'s 2nd-order term
     saliency_sum: Dict[int, torch.Tensor] = {tap: None for tap in bank.handles}
     n_saliency_seen = 0
+
+    # Assert dormancy holds before training starts (should be exactly 0.0).
+    assert bank.max_port_magnitude() == 0.0, "candidate ports must start dormant"
 
     global_step = 0
     best_acc = 0.0
@@ -167,6 +174,13 @@ def main():
 
             n_saliency_seen += 1
             opt.step()
+            # CRITICAL (Definition 3.2 / Lemma 2.2): candidate ports carry a
+            # real gradient (u_c IS that gradient), so opt.step() trains them
+            # away from zero unless we re-zero. Without this the "candidates"
+            # become live channels, u_c stops being the topological derivative
+            # at the silent point, and accuracy gets measured on a model that
+            # deployed_params() does not count.
+            bank.zero_ports()
             sched.step()
 
             loss_val = loss.item()
@@ -194,10 +208,18 @@ def main():
                     delta=args.delta,
                     prune_tolerance=args.prune_tol,
                     min_size_per_group=args.min_size,
+                    act_stats=act_stats,
+                    H_max=args.H_max,
                 )
 
                 if dec.action != "none":
                     apply_exchange(dec, bank, optimizer=opt, eps=1e-3)
+                    # materialize_candidate writes a NONZERO port for the
+                    # promoted unit (that is the point: v* = -eps*u_c/||u_c||),
+                    # but every REMAINING candidate must stay dormant.
+                    bank.zero_ports()
+                    act_stats.remove()
+                    act_stats = ActivationStats(model, bank)
                     structural_events_count += 1
                     overhead_ms = (time.time() - t0_struct) * 1000
                     new_p = bank.deployed_params()
@@ -227,9 +249,10 @@ def main():
                         "details": dec.details,
                     })
 
-                # Reset saliency accumulator for next window
+                # Reset saliency + activation accumulators for next window
                 saliency_sum = {tap: None for tap in bank.handles}
                 n_saliency_seen = 0
+                act_stats.reset()
 
             global_step += 1
 
@@ -256,6 +279,8 @@ def main():
                 "baseline_params": baseline_params,
                 "param_saving_pct": pct_saved,
                 "structural_events": events_log,
+                "discovered_widths": {str(t): h.base_size for t, h in bank.handles.items()},
+                "max_port_magnitude": bank.max_port_magnitude(),
                 "args": vars(args),
             }, out_path)
 
