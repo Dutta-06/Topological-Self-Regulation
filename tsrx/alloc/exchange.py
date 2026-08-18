@@ -178,7 +178,14 @@ def evaluate_exchange(
         cost = worst_p["kappa"] * worst_p["rho"]
 
         net_delta = current_params + best_g["kappa"] - worst_p["kappa"]
-        budget_ok = (budget_params is None) or (net_delta <= budget_params)
+        if budget_params is None:
+            budget_ok = True
+        elif current_params > budget_params:
+            # Over budget: allow any exchange that reduces total parameter count toward the budget
+            budget_ok = net_delta < current_params
+        else:
+            # Within budget: enforce hard budget cap
+            budget_ok = net_delta <= budget_params
 
         if gain > cost + delta and budget_ok:
             return ExchangeDecision(
