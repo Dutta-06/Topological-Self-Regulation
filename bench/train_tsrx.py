@@ -181,11 +181,12 @@ def main():
             loss.backward()
 
             # Sense candidate gradients u_c and compute removal saliency
-            for tap, h in bank.handles.items():
-                u = compute_uc_norms(bank, tap)
-                win.record(tap, u)
-                sal = first_order_saliency(model, h.bundle, h.base_size)
-                saliency_sum[tap] = sal if saliency_sum[tap] is None else saliency_sum[tap] + sal
+            with torch.no_grad():
+                for tap, h in bank.handles.items():
+                    u = compute_uc_norms(bank, tap)
+                    win.record(tap, u)
+                    sal = first_order_saliency(model, h.bundle, h.base_size)
+                    saliency_sum[tap] = sal if saliency_sum[tap] is None else saliency_sum[tap] + sal
 
             n_saliency_seen += 1
             opt.step()
@@ -252,6 +253,8 @@ def main():
                     act_stats.remove()
                     act_stats = ActivationStats(model, bank)
                     structural_events_count += len(applied)
+                    if args.device.startswith("cuda"):
+                        torch.cuda.empty_cache()
 
                 overhead_ms = (time.time() - t0_struct) * 1000
                 new_p = bank.deployed_params()
@@ -307,6 +310,8 @@ def main():
 
         # Per-epoch evaluation
         val_acc = evaluate(model, val_loader, args.device)
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         is_best = val_acc > best_acc
         best_acc = max(best_acc, val_acc)
         curr_p = bank.deployed_params()

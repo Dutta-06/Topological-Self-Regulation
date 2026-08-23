@@ -29,7 +29,7 @@ def _consumer_candidate_grad(mod: nn.Module, base_size: int, k: int, multiplicit
     # regardless of what precedes them (real channels, possibly through
     # their own multiplicity from the SAME reshape).
     n = k * multiplicity
-    cand = g.index_select(1, torch.arange(g.shape[1] - n, g.shape[1], device=g.device))
+    cand = g[:, -n:]
     # cand: (n_next, k*mult, *spatial_kernel...) -> group by candidate index c
     rest_shape = cand.shape[2:]
     cand = cand.reshape(cand.shape[0], k, multiplicity, *rest_shape)
