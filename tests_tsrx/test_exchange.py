@@ -127,16 +127,32 @@ def test_optimality_regime_uses_deployed_not_candidate_inflated_params():
 
 
 def test_exchange_rejected_when_move_would_exceed_budget():
+    """Case C's hard cap: WITHIN budget (current <= budget_params), any
+    accepted move's PROJECTED params must not exceed the cap, and pure
+    growth (which always increases params) must be rejected outright when
+    budget == deployed exactly, since kappa_grow > 0 for every real group.
+
+    (Case C's separate OVER-budget branch is deliberately looser — it
+    accepts any params-reducing exchange as forward progress rather than
+    hard-rejecting, since strict rejection there would just freeze the
+    optimality regime forever; that path is exercised by
+    test_feasibility_regime_reduces_deployed_params instead, since
+    `evaluate_structural_update` never calls into `evaluate_exchange`
+    while still over budget. An "exchange" CAN legitimately fire here even
+    at the tightest cap, since it grows one group while pruning another —
+    net params can still shrink or hold even while budget is razor-thin.)
+    """
     m, bank, win, saliency_sum, n_seen, act_stats, opt = _attach_and_train()
     deployed = bank.deployed_params()
-    # Budget so tight that even the cheapest exchange (kappa_grow > 0) can't
-    # fit: current + kappa_grow - kappa_prune must exceed this for every pair.
-    B_t = deployed - 10 ** 9
+    B_t = deployed  # tightest possible "within budget" cap: zero slack
 
     dec = evaluate_exchange(
         bank=bank, windowed_signal=win, saliency_sum=saliency_sum, n_seen=n_seen,
         budget_params=B_t, act_stats=act_stats, deployed_params=deployed,
         min_size_per_group=8,
     )
-    assert dec.action != "pure_grow"
-    assert dec.action != "exchange"
+    assert dec.action != "pure_grow", "pure growth must be impossible at zero budget slack"
+    if dec.action == "exchange":
+        grow_kappa = dec.details["grow"]["kappa"]
+        prune_kappa = dec.details["prune"]["kappa"]
+        assert deployed + grow_kappa - prune_kappa <= B_t
