@@ -31,11 +31,13 @@ from tqdm import tqdm
 from bench.models import build_model, describe
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
 from tsrx.alloc.cost import kappa_params
-from tsrx.alloc.exchange import evaluate_exchange, apply_exchange, ExchangeDecision
+from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange
+from tsrx.alloc.schedule import budget_at
 from tsrx.graph.bundle import build_all_bundles
 from tsrx.graph.groups import discover_groups
 from tsrx.graph.trace import trace_model
 from tsrx.sense.candidates import CandidateBank, UnsupportedGroupError
+from tsrx.sense.curvature import calibrate_h_max
 from tsrx.sense.saliency import ActivationStats, first_order_saliency
 from tsrx.sense.topo import WindowedSignal, compute_uc_norms
 
@@ -78,6 +80,16 @@ def main():
     ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=True)
     ap.add_argument("--imagenet-stem", dest="cifar_stem", action="store_false")
     ap.add_argument("--H-max", type=float, default=1.0, help="curvature bound for Eq.14 removal score")
+    ap.add_argument("--calibrate-hmax", action="store_true",
+                    help="Replace --H-max with a data-driven estimate (curvature.calibrate_h_max), "
+                         "refreshed every structural-update window")
+    ap.add_argument("--budget-end-frac", type=float, default=0.5,
+                    help="Fraction of total steps over which the budget anneals from baseline to target; "
+                         "held at target after. Stretch toward 0.7 for aggressive (tight) budgets.")
+    ap.add_argument("--max-prunes-per-update", type=int, default=4,
+                    help="Feasibility-regime cap: at most this many groups pruned (one index each) per update")
+    ap.add_argument("--verbose-decisions", action="store_true",
+                    help="Print a compact line for every structural-update decision, including no-ops")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-workers", type=int, default=0)
@@ -140,6 +152,9 @@ def main():
     act_stats = ActivationStats(model, bank)   # E[a_j^2] for Eq.(14)'s 2nd-order term
     saliency_sum: Dict[int, torch.Tensor] = {tap: None for tap in bank.handles}
     n_saliency_seen = 0
+    h_max_value = args.H_max
+    decisions_path = out_path.parent / f"{out_path.stem}_decisions.jsonl"
+    decisions_file = open(decisions_path, "a")
 
     # Assert dormancy holds before training starts (should be exactly 0.0).
     assert bank.max_port_magnitude() == 0.0, "candidate ports must start dormant"
@@ -196,57 +211,91 @@ def main():
                 "events": structural_events_count,
             })
 
-            # Slow timescale: Evaluate Exchange Operator (Definition 4.5)
+            # Slow timescale: Two-regime structural update (feasibility vs
+            # optimality — see tsrx/alloc/exchange.py module docstring)
             if global_step > 0 and global_step % args.update_interval == 0:
                 t0_struct = time.time()
-                dec = evaluate_exchange(
+                deployed_before = bank.deployed_params()
+                B_t = budget_at(global_step, total_steps, baseline_params, budget_params,
+                                 end_frac=args.budget_end_frac)
+
+                if args.calibrate_hmax:
+                    def _loss_fn(m, b):
+                        return F.cross_entropy(m(b[0]), b[1])
+                    h_max_value = calibrate_h_max(bank, _loss_fn, (xb, yb))
+
+                decisions = evaluate_structural_update(
                     bank=bank,
                     windowed_signal=win,
                     saliency_sum=saliency_sum,
                     n_seen=n_saliency_seen,
-                    budget_params=budget_params,
+                    deployed_params=deployed_before,
+                    budget_at_t=B_t,
                     delta=args.delta,
                     prune_tolerance=args.prune_tol,
                     min_size_per_group=args.min_size,
                     act_stats=act_stats,
-                    H_max=args.H_max,
+                    H_max=h_max_value,
+                    max_prunes_per_update=args.max_prunes_per_update,
                 )
 
-                if dec.action != "none":
+                applied = [d for d in decisions if d.action != "none"]
+                for dec in applied:
                     apply_exchange(dec, bank, optimizer=opt, eps=1e-3)
+
+                if applied:
                     # materialize_candidate writes a NONZERO port for the
                     # promoted unit (that is the point: v* = -eps*u_c/||u_c||),
-                    # but every REMAINING candidate must stay dormant.
+                    # but every REMAINING candidate must stay dormant. One
+                    # zero_ports() call after the WHOLE batch, not per-edit.
                     bank.zero_ports()
                     act_stats.remove()
                     act_stats = ActivationStats(model, bank)
-                    structural_events_count += 1
-                    overhead_ms = (time.time() - t0_struct) * 1000
-                    new_p = bank.deployed_params()
+                    structural_events_count += len(applied)
 
-                    if dec.action == "exchange":
-                        g_name = bank.handles[dec.grow_tap].bundle.producer_slots[0].module_name
-                        p_name = bank.handles[dec.prune_tap].bundle.producer_slots[0].module_name
-                        tqdm.write(
-                            f"  [{global_step:>6}] [EXCHANGE]  prune={p_name} (idx {dec.prune_idx}) "
-                            f"-> grow={g_name}  params={new_p:,} ({(1-new_p/baseline_params)*100:.1f}% saved) ({overhead_ms:.0f}ms)"
-                        )
-                    elif dec.action == "pure_grow":
-                        g_name = bank.handles[dec.grow_tap].bundle.producer_slots[0].module_name
-                        tqdm.write(
-                            f"  [{global_step:>6}] [GROW]      grow={g_name}  params={new_p:,} ({overhead_ms:.0f}ms)"
-                        )
-                    elif dec.action == "pure_prune":
-                        p_name = bank.handles[dec.prune_tap].bundle.producer_slots[0].module_name
-                        tqdm.write(
-                            f"  [{global_step:>6}] [PRUNE]     prune={p_name} (idx {dec.prune_idx})  params={new_p:,} ({overhead_ms:.0f}ms)"
-                        )
+                overhead_ms = (time.time() - t0_struct) * 1000
+                new_p = bank.deployed_params()
 
+                for dec in decisions:
+                    if args.verbose_decisions or dec.action != "none":
+                        tag = {"exchange": "EXCHANGE", "pure_grow": "GROW",
+                               "pure_prune": "PRUNE", "none": "NONE"}[dec.action]
+                        name = ""
+                        if dec.grow_tap is not None:
+                            name += f" grow={bank.handles.get(dec.grow_tap, None) and bank.handles[dec.grow_tap].bundle.producer_slots[0].module_name}"
+                        if dec.prune_tap is not None:
+                            name += f" prune={bank.handles.get(dec.prune_tap, None) and bank.handles[dec.prune_tap].bundle.producer_slots[0].module_name}(idx {dec.prune_idx})"
+                        tqdm.write(
+                            f"  [{global_step:>6}] [{dec.regime:>11}:{tag:<8}]{name}  "
+                            f"reason={dec.reason}  B_t={B_t}  params={new_p:,} ({overhead_ms:.0f}ms)"
+                        )
+                    decisions_file.write(json.dumps({
+                        "step": global_step,
+                        "regime": dec.regime,
+                        "action": dec.action,
+                        "reason": dec.reason,
+                        "deployed_before": deployed_before,
+                        "deployed_after": new_p,
+                        "budget_at_t": B_t,
+                        "H_max": h_max_value,
+                        "grow_tap": dec.grow_tap,
+                        "grow_cand_idx": dec.grow_cand_idx,
+                        "grow_gamma": dec.grow_gamma,
+                        "prune_tap": dec.prune_tap,
+                        "prune_idx": dec.prune_idx,
+                        "prune_rho": dec.prune_rho,
+                        "delta_loss_bound": dec.delta_loss_bound,
+                        "details": {k: v for k, v in dec.details.items()
+                                    if not isinstance(v, (dict, list)) or k in ("grow", "prune")},
+                    }, default=str) + "\n")
+                decisions_file.flush()
+
+                if applied:
                     events_log.append({
                         "step": global_step,
-                        "action": dec.action,
+                        "actions": [d.action for d in applied],
                         "params": new_p,
-                        "details": dec.details,
+                        "decisions": [d.details for d in applied],
                     })
 
                 # Reset saliency + activation accumulators for next window
@@ -287,6 +336,8 @@ def main():
         if args.max_steps and global_step >= args.max_steps:
             break
 
+    decisions_file.close()
+
     final_p = bank.deployed_params()
     final_saved = (1.0 - final_p / baseline_params) * 100.0
     print(f"\n{'='*70}")
@@ -296,6 +347,7 @@ def main():
     print(f"  Best Validation Accuracy  : {best_acc:.4f}")
     print(f"  Total Structural Events   : {structural_events_count}")
     print(f"  Checkpoint Saved To       : {out_path}")
+    print(f"  Decision Trace Saved To   : {decisions_path}")
     print(f"{'='*70}\n")
 
 

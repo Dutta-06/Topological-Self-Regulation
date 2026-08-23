@@ -10,7 +10,7 @@ under torch.no_grad(); this is Prediction 9.1's use case too (a pure
 forward-pass measurement, no training).
 """
 
-from typing import Dict
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -85,3 +85,29 @@ def estimate_hc(bank: CandidateBank, tap: int, loss_fn, batch,
         out[c] = hc if hc > 0 else float("nan")
 
     return out
+
+
+@torch.no_grad()
+def calibrate_h_max(bank: CandidateBank, loss_fn, batch, taps: Optional[List[int]] = None,
+                     t_probe: float = 1e-4) -> float:
+    """Replace the arbitrary H_max=1.0 default in `saliency.removal_score`
+    with a data-driven bound: the max finite h_c (Remark 3.11's single-probe
+    estimate, `estimate_hc` above) over every group's candidates. Expensive
+    (one extra forward pass per live candidate per group) — call it
+    periodically (e.g. once per structural-update window), not every step.
+
+    Falls back to 1.0 if no candidate yields a valid (positive) quadratic
+    model at this probe size, matching the previous hardcoded default.
+    """
+    from tsrx.sense.topo import compute_uc_norms
+
+    vals: List[float] = []
+    for tap in (taps if taps is not None else list(bank.handles.keys())):
+        uc = compute_uc_norms(bank, tap)
+        if uc.numel() == 0 or float(uc.max().item()) == 0.0:
+            continue
+        hc = estimate_hc(bank, tap, loss_fn, batch, uc, t_probe=t_probe)
+        finite = hc[torch.isfinite(hc)]
+        if finite.numel():
+            vals.append(float(finite.max().item()))
+    return max(vals) if vals else 1.0
