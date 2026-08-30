@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--use-best-val-widths", action="store_true",
+                    help="Use the best-val-epoch architecture instead of the converged final one "
+                         "(only valid if the budget anneal completed before the best-val epoch)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -57,11 +60,21 @@ def main():
     seq_len = ck.get("seq_len", ck_args.get("seq_len", 96))
     pred_len = ck.get("pred_len", ck_args.get("pred_len", 96))
     hidden = ck.get("hidden", ck_args.get("hidden", 64))
-    widths = ck.get("discovered_widths")
+    # Prefer the FINAL architecture (search converged) over the best-val
+    # snapshot: on LTSF the best-val epoch lands at 1-9 while the budget
+    # anneal is still ramping, so `discovered_widths` can be a barely-pruned
+    # model (measured: 1.4% vs the run's actual 16.1%). See the note in
+    # train_ts_tsrx.py. `--use-best-val-widths` restores the old behaviour.
+    widths = None if args.use_best_val_widths else ck.get("final_widths")
+    width_source = "final_widths (search converged)"
+    if not widths:
+        widths = ck.get("discovered_widths")
+        width_source = "discovered_widths (best-val snapshot)"
     if not widths:
         raise SystemExit(
-            "checkpoint has no 'discovered_widths' — rerun train_ts_tsrx.py after the "
-            "fix that records them, or this control cannot be built."
+            "checkpoint has no 'final_widths' or 'discovered_widths' — rerun "
+            "train_ts_tsrx.py after the fix that records them, or this control "
+            "cannot be built."
         )
 
     torch.manual_seed(args.seed)
@@ -84,7 +97,8 @@ def main():
     print(f"  C2 CONTROL: discovered TCN architecture trained FROM SCRATCH")
     print(f"  Arch / dataset            : {arch} / {dataset}  (pred_len={pred_len})")
     print(f"  Reference params          : {ref_params:,}")
-    print(f"  Matched (discovered)      : {matched_params:,}")
+    print(f"  Matched (discovered)      : {matched_params:,}  ({(1-matched_params/ref_params)*100:.1f}% reduction)")
+    print(f"  Width source              : {width_source}")
     print(f"  TSR-X best val MSE        : {ck.get('best_val_mse', 'n/a')}")
     print(f"  => discovered-shape MSE vs this run separates the shape from")
     print(f"     the plasticity contribution (Theorem 8.1); TSR-X is not")

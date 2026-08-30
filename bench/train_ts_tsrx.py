@@ -342,7 +342,26 @@ def main():
 
     final_p = bank.deployed_params()
     final_saved = (1.0 - final_p / baseline_params) * 100.0
+    final_widths = {str(t): h.base_size for t, h in bank.handles.items()}
+
+    # The FINAL architecture, recorded separately from the best-val
+    # checkpoint above. These differ, and the difference is not cosmetic:
+    # `is_best` freezes discovered_widths at the lowest-val-MSE epoch, but
+    # LTSF models bottom out in 1-9 epochs while the budget anneal is still
+    # mid-ramp (end_frac=0.5 => epoch 25 of 50). Measured consequence on the
+    # first full sweep: weather_h96 reached 16.1% reduction by the end of
+    # training but its best-val checkpoint recorded only 1.4%, so the C2
+    # control trained a 1.4%-smaller model while the run was reported as
+    # 15%. Shortening the anneal does NOT fix this — nothing beats an
+    # epoch-1 early stop except pruning at init, which removes the gradual
+    # signal-driven discovery entirely. The architecture search is what must
+    # run to convergence; C2 then trains THESE widths from scratch with its
+    # own normal early stopping.
     ck = torch.load(out_path, map_location="cpu", weights_only=False)
+    ck["final_widths"] = final_widths
+    ck["final_params"] = final_p
+    ck["final_param_saving_pct"] = final_saved
+    torch.save(ck, out_path)
     print(f"\n{'='*70}")
     print(f"  TSR-X Training Complete")
     print(f"  Baseline Reference Params : {baseline_params:,}")
