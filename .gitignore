@@ -25,4 +25,6 @@ data/cifar-100-python/
 data/*.tar.gz
 data/*.csv
 data/*.npz
+data/*.txt
+data/*.txt.gz
 .DS_Store

@@ -29,80 +29,8 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from bench.models import build_model, describe
+from bench.resize import resize_model_to_widths
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
-from tsrx.graph.bundle import build_all_bundles
-from tsrx.graph.groups import discover_groups
-from tsrx.graph.trace import trace_model
-
-
-def resize_model_to_widths(model: nn.Module, widths: dict, example_input) -> nn.Module:
-    """Rebuild `model` so every coupling group has the recorded width.
-
-    Uses the same coupling engine as training, so the resize is applied
-    consistently across every producer / affine / consumer slot of each
-    group (Definition 5.3) rather than per-module.
-    """
-    traced = trace_model(model.eval(), (example_input,))
-    res = discover_groups(traced)
-    bundles = build_all_bundles(res, model)
-    modules = dict(model.named_modules())
-
-    for tap_str, target in widths.items():
-        tap = int(tap_str)
-        bd = bundles.get(tap)
-        if bd is None or bd.size == target:
-            continue
-
-        seen = set()
-        for slot in bd.producer_slots:
-            if slot.module_name in seen:
-                continue
-            seen.add(slot.module_name)
-            mod = modules[slot.module_name]
-            w = mod.weight
-            mod.weight = nn.Parameter(torch.empty(target, *w.shape[1:], device=w.device, dtype=w.dtype))
-            nn.init.kaiming_uniform_(mod.weight.reshape(target, -1), a=5 ** 0.5)
-            if getattr(mod, "bias", None) is not None:
-                mod.bias = nn.Parameter(torch.zeros(target, device=w.device, dtype=w.dtype))
-            for attr in ("out_channels", "out_features"):
-                if hasattr(mod, attr):
-                    setattr(mod, attr, target)
-
-        seen = set()
-        for slot in bd.affine_slots:
-            if slot.module_name in seen:
-                continue
-            seen.add(slot.module_name)
-            mod = modules[slot.module_name]
-            dev = mod.weight.device if getattr(mod, "weight", None) is not None else "cpu"
-            dt = mod.weight.dtype if getattr(mod, "weight", None) is not None else torch.float32
-            if getattr(mod, "weight", None) is not None:
-                mod.weight = nn.Parameter(torch.ones(target, device=dev, dtype=dt))
-            if getattr(mod, "bias", None) is not None:
-                mod.bias = nn.Parameter(torch.zeros(target, device=dev, dtype=dt))
-            if getattr(mod, "running_mean", None) is not None:
-                mod.running_mean = torch.zeros(target, device=dev, dtype=dt)
-            if getattr(mod, "running_var", None) is not None:
-                mod.running_var = torch.ones(target, device=dev, dtype=dt)
-            for attr in ("num_features", "num_channels"):
-                if hasattr(mod, attr):
-                    setattr(mod, attr, target)
-
-        seen = set()
-        for slot in bd.consumer_slots:
-            if slot.module_name in seen:
-                continue
-            seen.add(slot.module_name)
-            mod = modules[slot.module_name]
-            w = mod.weight
-            new_in = target * slot.multiplicity
-            mod.weight = nn.Parameter(torch.empty(w.shape[0], new_in, *w.shape[2:], device=w.device, dtype=w.dtype))
-            nn.init.kaiming_uniform_(mod.weight.reshape(w.shape[0], -1), a=5 ** 0.5)
-            for attr in ("in_channels", "in_features"):
-                if hasattr(mod, attr):
-                    setattr(mod, attr, new_in)
-
-    return model
 
 
 @torch.no_grad()
@@ -165,7 +93,9 @@ def main():
     print(f"  Matched (discovered)      : {matched_params:,}")
     print(f"  TSR-X reported params     : {ck.get('params', 'n/a'):,}" if isinstance(ck.get('params'), int) else "")
     print(f"  TSR-X best val acc        : {ck.get('best_val_acc', 'n/a')}")
-    print(f"  => TSR-X must BEAT this run for the plasticity thesis to hold.")
+    print(f"  => discovered-shape accuracy vs this run separates the shape")
+    print(f"     from the plasticity contribution (Theorem 8.1); TSR-X is")
+    print(f"     not required to beat it for the discovery result to hold.")
     print(f"{'='*70}\n")
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
