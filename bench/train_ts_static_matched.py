@@ -60,6 +60,9 @@ def main():
     seq_len = ck.get("seq_len", ck_args.get("seq_len", 96))
     pred_len = ck.get("pred_len", ck_args.get("pred_len", 96))
     hidden = ck.get("hidden", ck_args.get("hidden", 64))
+    # C2 must rebuild with the SAME RevIN setting the discovery run used,
+    # or it is not a matched control.
+    use_revin = ck_args.get("use_revin", True)
     # Prefer the FINAL architecture (search converged) over the best-val
     # snapshot: on LTSF the best-val epoch lands at 1-9 while the budget
     # anneal is still ramping, so `discovered_widths` can be a barely-pruned
@@ -86,7 +89,7 @@ def main():
         batch_size=args.batch_size, root=args.data_root, num_workers=args.num_workers,
     )
 
-    model = build_ts_model(arch, n_vars, pred_len, hidden=hidden)
+    model = build_ts_model(arch, n_vars, pred_len, hidden=hidden, use_revin=use_revin)
     ref_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     example = torch.zeros(2, seq_len, n_vars)
     model = resize_model_to_widths(model, widths, example)

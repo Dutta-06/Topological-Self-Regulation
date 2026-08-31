@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--seq-len", type=int, default=96)
     ap.add_argument("--pred-len", type=int, default=96)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--no-revin", dest="use_revin", action="store_false", default=True,
+                    help="disable RevIN (tcn_ci only)")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=32)
@@ -114,7 +116,8 @@ def main():
     )
 
     # 1. Build Reference Model
-    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden).to(args.device)
+    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden,
+                            use_revin=args.use_revin).to(args.device)
 
     baseline_params = count_params(model)
     if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:

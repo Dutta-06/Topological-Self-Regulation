@@ -43,6 +43,10 @@ def main():
     ap.add_argument("--seq-len", type=int, default=96)
     ap.add_argument("--pred-len", type=int, default=96)
     ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--no-revin", dest="use_revin", action="store_false", default=True,
+                    help="disable RevIN (tcn_ci only). The loader already z-scores globally, so "
+                         "RevIN adds a second per-window normalization that may cost more than it "
+                         "buys on stationary series.")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -64,7 +68,8 @@ def main():
     )
 
     dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
-    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden).to(args.device)
+    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden,
+                            use_revin=args.use_revin).to(args.device)
     baseline_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print(f"\n{'='*70}")
