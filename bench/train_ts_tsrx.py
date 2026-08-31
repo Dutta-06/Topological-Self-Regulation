@@ -60,7 +60,10 @@ def evaluate(model: nn.Module, loader, device: str):
 
 def main():
     ap = argparse.ArgumentParser(description="TSR-X Dynamic Architecture Training (timeseries)")
-    ap.add_argument("--arch", choices=["tcn"], default="tcn")
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci"], default="tcn_ci",
+                    help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
+                         "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
+                         "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")
     ap.add_argument("--dataset", choices=["ETTh1", "ETTh2", "weather", "electricity", "traffic"], required=True)
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--seq-len", type=int, default=96)
@@ -343,6 +346,12 @@ def main():
     final_p = bank.deployed_params()
     final_saved = (1.0 - final_p / baseline_params) * 100.0
     final_widths = {str(t): h.base_size for t, h in bank.handles.items()}
+    # Evaluate the model AS IT ENDS, at the converged architecture. The
+    # best-val checkpoint above is a different (larger) model, so comparing
+    # it to C2/C3 is not a controlled comparison at all -- those train the
+    # final architecture. Report plasticity from these numbers, not those.
+    final_val_mse, final_val_mae = evaluate(model, val_loader, args.device)
+    final_test_mse, final_test_mae = evaluate(model, test_loader, args.device)
 
     # The FINAL architecture, recorded separately from the best-val
     # checkpoint above. These differ, and the difference is not cosmetic:
@@ -361,13 +370,18 @@ def main():
     ck["final_widths"] = final_widths
     ck["final_params"] = final_p
     ck["final_param_saving_pct"] = final_saved
+    ck["final_val_mse"] = final_val_mse
+    ck["final_val_mae"] = final_val_mae
+    ck["final_test_mse"] = final_test_mse
+    ck["final_test_mae"] = final_test_mae
     torch.save(ck, out_path)
     print(f"\n{'='*70}")
     print(f"  TSR-X Training Complete")
     print(f"  Baseline Reference Params : {baseline_params:,}")
     print(f"  Final Discovered Params   : {final_p:,} ({final_saved:+.1f}% parameter reduction)")
-    print(f"  Best Validation MSE       : {best_val_mse:.4f}")
+    print(f"  Best Validation MSE       : {best_val_mse:.4f}  (at a PARTIAL architecture)")
     print(f"  Test MSE / MAE @ best val : {ck['test_mse']:.4f} / {ck['test_mae']:.4f}")
+    print(f"  FINAL arch val / test MSE : {final_val_mse:.4f} / {final_test_mse:.4f}  <- compare to C2/C3")
     print(f"  Total Structural Events   : {structural_events_count}")
     print(f"  Checkpoint Saved To       : {out_path}")
     print(f"  Decision Trace Saved To   : {decisions_path}")

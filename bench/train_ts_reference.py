@@ -34,7 +34,10 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["tcn"], default="tcn")
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci"], default="tcn_ci",
+                    help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
+                         "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
+                         "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")
     ap.add_argument("--dataset", choices=["ETTh1", "ETTh2", "weather", "electricity", "traffic"], required=True)
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--seq-len", type=int, default=96)
