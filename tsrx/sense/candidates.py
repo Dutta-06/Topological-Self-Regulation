@@ -108,12 +108,36 @@ class CandidateBank(nn.Module):
     materialize/refill.
     """
 
-    def __init__(self, model: nn.Module, bundles: Dict[int, IndexBundle], k: int = 8):
+    def __init__(self, model: nn.Module, bundles: Dict[int, IndexBundle], k: int = 8,
+                 only_taps: Optional[List[int]] = None,
+                 skip_unsupported: bool = False):
+        """
+        Args:
+            only_taps: attach candidates ONLY to these groups. Required for
+                architectures where some groups are structurally unsafe to
+                resize even though they look ordinary to the coupling
+                engine — multi-head attention's q/k/v projections are the
+                motivating case: `view(B, L, h, d_head)` silently requires
+                the width to stay divisible by the head count, and the
+                engine cannot see that (it models module->module edges, not
+                the QK^T / AV matmuls). Use `tsrx.graph.safety.safe_taps`
+                to derive this list empirically rather than by hand.
+            skip_unsupported: record LayerNorm/GroupNorm groups in
+                `self.skipped` and carry on, instead of raising. A
+                transformer has exactly one such group -- the d_model
+                residual stream -- and freezing it is the intended design,
+                so aborting the whole bank for it is wrong. Off by default
+                so existing callers keep the loud failure.
+        """
         super().__init__()
         object.__setattr__(self, "model", model)
         self.k = k
         self.handles: Dict[int, CandidateHandle] = {}
+        self.skipped: Dict[int, str] = {}
         for tap, bd in bundles.items():
+            if only_taps is not None and tap not in only_taps:
+                self.skipped[tap] = "not in only_taps"
+                continue
             if bd.size == 0 or not bd.producer_slots:
                 continue
             if not bd.consumer_slots:
@@ -122,6 +146,9 @@ class CandidateBank(nn.Module):
                 # its width is the task's number of classes/targets, not a
                 # free capacity dimension (matches the terminal-layer rule
                 # of the old TSR engine and the framework's convention).
+                continue
+            if skip_unsupported and self._has_ln_gn(bd):
+                self.skipped[tap] = "LayerNorm/GroupNorm on this axis (condition N)"
                 continue
             self._attach(bd)
 

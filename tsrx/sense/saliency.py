@@ -54,15 +54,42 @@ class ActivationStats:
             mod = modules.get(prod)
             if mod is None:
                 continue
-            self._handles.append(mod.register_forward_hook(self._make_hook(tap)))
+            self._handles.append(mod.register_forward_hook(self._make_hook(tap, mod)))
 
-    def _make_hook(self, tap: int):
+    @staticmethod
+    def _channel_axis(mod: nn.Module, out: torch.Tensor) -> int:
+        """Which axis of this module's OUTPUT carries the group's channels.
+
+        Conv/BatchNorm emit (B, C, *spatial) -> axis 1.
+        Linear emits (..., out_features) -> the LAST axis, which for a
+        sequence model is (B, L, D) with D at axis 2, NOT axis 1. Assuming
+        axis 1 there silently averages over the feature dimension and
+        returns per-timestep statistics: E[a_j^2] would be computed for the
+        wrong index set entirely, and Eq. (14)'s second-order term would
+        rank incumbents by noise.
+        """
+        if isinstance(mod, nn.Linear):
+            return out.dim() - 1
+        return 1
+
+    def _make_hook(self, tap: int, owner: nn.Module):
         def hook(mod, inp, out):
+            # `copy.deepcopy(model)` copies a module's _forward_hooks, but a
+            # function object is not deep-copied -- so the copy's hook still
+            # writes into THIS ActivationStats. A forward pass on any copied
+            # model (e.g. a detached/stripped one, which has base_size
+            # channels instead of base_size + k) would then silently
+            # overwrite E[a_j^2] with statistics measured on a different
+            # architecture, and Eq. (14)'s second-order term would rank
+            # incumbents using the wrong model. Only accept the module this
+            # instance actually registered on.
+            if mod is not owner:
+                return
             if not torch.is_tensor(out) or out.dim() < 2:
                 return
             with torch.no_grad():
-                # mean square per channel (axis 1), over batch + all trailing axes
-                dims = [0] + list(range(2, out.dim()))
+                axis = self._channel_axis(mod, out)
+                dims = [d for d in range(out.dim()) if d != axis]
                 ms = out.detach().pow(2).mean(dim=dims)
             prev = self.sums.get(tap)
             self.sums[tap] = ms if prev is None or prev.shape != ms.shape else prev + ms
