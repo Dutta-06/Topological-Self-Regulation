@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from bench.ts_models import build_ts_model, describe
+from bench.ts_models import build_ts_model, describe, ts_model_kwargs
 from data.ltsf import get_ltsf_loaders, n_channels
 
 
@@ -34,7 +34,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["tcn", "tcn_ci"], default="tcn_ci",
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst"], default="tcn_ci",
                     help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
                          "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
                          "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")
@@ -47,6 +47,12 @@ def main():
                     help="disable RevIN (tcn_ci only). The loader already z-scores globally, so "
                          "RevIN adds a second per-window normalization that may cost more than it "
                          "buys on stationary series.")
+    ap.add_argument("--d-model", type=int, default=128, help="patchtst: residual stream width (FROZEN — see bench/patchtst.py)")
+    ap.add_argument("--d-ff", type=int, default=256, help="patchtst: FFN hidden width (the reallocated group)")
+    ap.add_argument("--n-heads", type=int, default=8)
+    ap.add_argument("--n-blocks", type=int, default=3)
+    ap.add_argument("--patch-len", type=int, default=16)
+    ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -68,8 +74,7 @@ def main():
     )
 
     dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
-    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden,
-                            use_revin=args.use_revin).to(args.device)
+    model = build_ts_model(args.arch, n_vars, args.pred_len, **ts_model_kwargs(args)).to(args.device)
     baseline_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print(f"\n{'='*70}")
@@ -77,7 +82,8 @@ def main():
     print(f"  Compute Device               : {dev_name} ({args.device})")
     print(f"  Variates / seq_len / pred_len: {n_vars} / {args.seq_len} / {args.pred_len}")
     print(f"  Total Parameters             : {baseline_params:,} (Fixed Static)")
-    print(f"  Block shapes                 : {describe(model, args.seq_len, n_vars)['block_shapes']}")
+    if args.arch != "patchtst":
+        print(f"  Block shapes                 : {describe(model, args.seq_len, n_vars)['block_shapes']}")
     print(f"  Epochs                       : {args.epochs}")
     print(f"{'='*70}\n")
 

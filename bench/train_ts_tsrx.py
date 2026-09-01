@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from bench.ts_models import build_ts_model, describe
+from bench.ts_models import build_ts_model, describe, ts_model_kwargs
 from data.ltsf import get_ltsf_loaders, n_channels
 from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange
 from tsrx.alloc.schedule import budget_at
@@ -60,7 +60,7 @@ def evaluate(model: nn.Module, loader, device: str):
 
 def main():
     ap = argparse.ArgumentParser(description="TSR-X Dynamic Architecture Training (timeseries)")
-    ap.add_argument("--arch", choices=["tcn", "tcn_ci"], default="tcn_ci",
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst"], default="tcn_ci",
                     help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
                          "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
                          "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")
@@ -71,6 +71,12 @@ def main():
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--no-revin", dest="use_revin", action="store_false", default=True,
                     help="disable RevIN (tcn_ci only)")
+    ap.add_argument("--d-model", type=int, default=128, help="patchtst: residual stream width (FROZEN — see bench/patchtst.py)")
+    ap.add_argument("--d-ff", type=int, default=256, help="patchtst: FFN hidden width (the reallocated group)")
+    ap.add_argument("--n-heads", type=int, default=8)
+    ap.add_argument("--n-blocks", type=int, default=3)
+    ap.add_argument("--patch-len", type=int, default=16)
+    ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=32)
@@ -94,6 +100,9 @@ def main():
                     help="Feasibility-regime cap: at most this many groups pruned (one index each) per update")
     ap.add_argument("--verbose-decisions", action="store_true",
                     help="Print a compact line for every structural-update decision, including no-ops")
+    ap.add_argument("--tap-selection", choices=["auto", "all"], default="auto",
+                    help="auto = empirical safety probe (prune 1 index + forward) to exclude "
+                         "groups the coupling engine cannot resize safely, e.g. attention head splits")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-workers", type=int, default=0)
@@ -116,8 +125,7 @@ def main():
     )
 
     # 1. Build Reference Model
-    model = build_ts_model(args.arch, n_vars, args.pred_len, hidden=args.hidden,
-                            use_revin=args.use_revin).to(args.device)
+    model = build_ts_model(args.arch, n_vars, args.pred_len, **ts_model_kwargs(args)).to(args.device)
 
     baseline_params = count_params(model)
     if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:
@@ -145,7 +153,52 @@ def main():
     res = discover_groups(traced)
     bundles = build_all_bundles(res, model)
 
-    bank = CandidateBank(model, bundles, k=args.k)
+    # Which groups may be resized at all. The coupling engine models
+    # module->module edges, so it cannot see that multi-head attention's
+    # `view(B, L, h, d_head)` requires the width to stay divisible by the
+    # head count -- resizing those groups yields a model that crashes on
+    # the next forward pass. The probe performs the edit on a throwaway
+    # copy and runs a forward, which is the only sound check. It also skips
+    # the d_model residual stream (LayerNorm spans it: condition (N)).
+    allowed = None
+    if args.tap_selection == "auto":
+        from tsrx.graph.safety import probe_reallocatable
+        _bf = lambda: build_ts_model(args.arch, n_vars, args.pred_len, **ts_model_kwargs(args))
+        info = probe_reallocatable(_bf, xb0[:2].cpu())
+        allowed = [t for t, i in info.items() if i["safe"]]
+        for t, i in sorted(info.items()):
+            if not i["safe"]:
+                print(f"    tap {t:>3} EXCLUDED: {i['reason']}")
+        print(f"  Reallocatable taps           : {allowed}")
+        if not allowed:
+            raise SystemExit("no safely reallocatable groups -- nothing for TSR-X to do")
+
+    # Is the requested budget even reachable? Only the `allowed` groups can
+    # shrink, and only down to --min-size, so the achievable reduction is
+    # capped by the parameter share of those groups. On PatchTST the FFN is
+    # ~29% of the model, so --budget-ratio 0.5 is arithmetically impossible
+    # and the run would quietly stop short -- the same silent under-delivery
+    # that voided an entire earlier campaign. Fail loudly instead.
+    if budget_params is not None and allowed:
+        from bench.resize import resize_model_to_widths
+        _floor = build_ts_model(args.arch, n_vars, args.pred_len, **ts_model_kwargs(args))
+        _fw = {str(t): args.min_size for t in allowed}
+        _floor = resize_model_to_widths(_floor, _fw, xb0[:2].cpu())
+        floor_params = sum(p.numel() for p in _floor.parameters() if p.requires_grad)
+        max_red = (1 - floor_params / baseline_params) * 100
+        want_red = (1 - budget_params / baseline_params) * 100
+        print(f"  Max achievable reduction     : {max_red:.1f}% "
+              f"(all reallocatable groups at min-size {args.min_size})")
+        if budget_params < floor_params:
+            raise SystemExit(
+                f"\nINFEASIBLE BUDGET: --budget-ratio {args.budget_ratio} asks for a "
+                f"{want_red:.1f}% reduction, but only {max_red:.1f}% is reachable — the "
+                f"reallocatable groups {allowed} are too small a share of this model.\n"
+                f"Either raise --budget-ratio above {floor_params/baseline_params:.2f}, "
+                f"or widen --d-ff so the FFN carries more of the parameters."
+            )
+
+    bank = CandidateBank(model, bundles, k=args.k, only_taps=allowed, skip_unsupported=True)
     bank = bank.to(args.device)
 
     # 3. Optimizer & Scheduler

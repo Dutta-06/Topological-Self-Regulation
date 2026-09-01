@@ -143,12 +143,39 @@ class TCNForecasterCI(nn.Module):
 
 
 def build_ts_model(arch: str, n_vars: int, pred_len: int, hidden: int = 64,
-                    use_revin: bool = True) -> nn.Module:
+                    use_revin: bool = True, seq_len: int = 96, d_model: int = 128,
+                    d_ff: int = 256, n_heads: int = 8, n_blocks: int = 3,
+                    patch_len: int = 16, stride: int = 8) -> nn.Module:
     if arch == "tcn":
         return TCNForecaster(n_vars, pred_len, hidden=hidden)
     if arch == "tcn_ci":
         return TCNForecasterCI(n_vars, pred_len, hidden=hidden, use_revin=use_revin)
+    if arch == "patchtst":
+        from bench.patchtst import build_patchtst
+        return build_patchtst(n_vars, seq_len, pred_len, d_model=d_model, d_ff=d_ff,
+                               n_heads=n_heads, n_blocks=n_blocks, patch_len=patch_len,
+                               stride=stride, use_revin=use_revin)
     raise ValueError(f"unknown timeseries arch {arch!r}")
+
+
+def ts_model_kwargs(args) -> dict:
+    """Pull the architecture hyperparameters out of an argparse namespace.
+
+    Kept in one place so the reference / TSR-X / C2 / C3 arms cannot drift
+    apart -- a C2 control built at a different d_model than the discovery
+    run is not a control at all.
+    """
+    return dict(
+        hidden=getattr(args, "hidden", 64),
+        use_revin=getattr(args, "use_revin", True),
+        seq_len=getattr(args, "seq_len", 96),
+        d_model=getattr(args, "d_model", 128),
+        d_ff=getattr(args, "d_ff", 256),
+        n_heads=getattr(args, "n_heads", 8),
+        n_blocks=getattr(args, "n_blocks", 3),
+        patch_len=getattr(args, "patch_len", 16),
+        stride=getattr(args, "stride", 8),
+    )
 
 
 def describe(model: nn.Module, seq_len: int, n_vars: int) -> dict:

@@ -27,21 +27,35 @@ from tsrx.graph.groups import discover_groups
 from tsrx.graph.trace import trace_model
 
 
-def attachable_taps(model: nn.Module, example_input) -> Dict[int, int]:
+def attachable_taps(model: nn.Module, example_input, build_fn=None) -> Dict[int, int]:
     """{tap: baseline_size} for every coupling group TSR-X could resize.
 
     Mirrors CandidateBank's eligibility rule: a group needs producers AND
     consumers. A group with no consumer is a model OUTPUT (the classifier
     head / forecast head) whose width is set by the task, not free capacity
     — resizing it would change the problem, not the architecture.
+
+    `build_fn` additionally applies the empirical safety probe
+    (`tsrx.graph.safety`). Pass it for any architecture where a group can
+    look resizable to the coupling engine yet break on resize — multi-head
+    attention is the case: `view(B, L, h, d_head)` needs the width to stay
+    divisible by the head count and the engine cannot see that. Without
+    this, C3 would randomize attention widths and produce a model that
+    crashes on its first forward pass, and C3 must span the SAME groups
+    TSR-X was allowed to touch or it is not a matched control.
     """
     traced = trace_model(model.eval(), (example_input,))
     bundles = build_all_bundles(discover_groups(traced), model)
-    return {
+    eligible = {
         tap: bd.size
         for tap, bd in bundles.items()
         if bd.size > 0 and bd.producer_slots and bd.consumer_slots
     }
+    if build_fn is not None:
+        from tsrx.graph.safety import safe_taps
+        allowed = set(safe_taps(build_fn, example_input))
+        eligible = {t: s for t, s in eligible.items() if t in allowed}
+    return eligible
 
 
 def random_widths_at_budget(
@@ -65,7 +79,7 @@ def random_widths_at_budget(
     Returns {str(tap): width}, the format `resize_model_to_widths` expects.
     """
     rng = np.random.default_rng(seed)
-    base = attachable_taps(build_fn(), example_input)
+    base = attachable_taps(build_fn(), example_input, build_fn=build_fn)
     taps = sorted(base)
     factors = rng.uniform(1.0 - spread, 1.0 + spread, size=len(taps))
 

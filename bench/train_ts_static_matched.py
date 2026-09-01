@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from bench.resize import resize_model_to_widths
-from bench.ts_models import build_ts_model
+from bench.ts_models import build_ts_model, ts_model_kwargs
 from data.ltsf import get_ltsf_loaders, n_channels
 
 
@@ -89,7 +89,13 @@ def main():
         batch_size=args.batch_size, root=args.data_root, num_workers=args.num_workers,
     )
 
-    model = build_ts_model(arch, n_vars, pred_len, hidden=hidden, use_revin=use_revin)
+    # rebuild with the EXACT architecture hyperparameters of the discovery
+    # run; a C2 at a different d_model/d_ff is not a matched control
+    class _A: pass
+    _a = _A()
+    for kk, vv in ck_args.items(): setattr(_a, kk, vv)
+    _a.hidden, _a.use_revin, _a.seq_len = hidden, use_revin, seq_len
+    model = build_ts_model(arch, n_vars, pred_len, **ts_model_kwargs(_a))
     ref_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     example = torch.zeros(2, seq_len, n_vars)
     model = resize_model_to_widths(model, widths, example)

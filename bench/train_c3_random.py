@@ -85,7 +85,7 @@ def main():
     c3_seed = args.c3_seed if args.c3_seed is not None else args.seed
 
     if args.domain == "ts":
-        from bench.ts_models import build_ts_model
+        from bench.ts_models import build_ts_model, ts_model_kwargs
         from data.ltsf import get_ltsf_loaders, n_channels
 
         ds = ck_args["dataset"]
@@ -101,7 +101,11 @@ def main():
         train_loader, val_loader, test_loader = get_ltsf_loaders(
             ds, seq_len=seq_len, pred_len=pred_len, batch_size=bs,
             root=args.data_root, num_workers=args.num_workers)
-        build_fn = lambda: build_ts_model(arch, n_vars, pred_len, hidden=hidden)
+        class _A: pass
+        _a = _A()
+        for kk, vv in ck_args.items(): setattr(_a, kk, vv)
+        _a.hidden, _a.seq_len = hidden, seq_len
+        build_fn = lambda: build_ts_model(arch, n_vars, pred_len, **ts_model_kwargs(_a))
         example = torch.zeros(2, seq_len, n_vars)
         loss_fn = F.mse_loss
         evaluate = _eval_ts
