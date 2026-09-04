@@ -94,9 +94,12 @@ def main():
         pred_len = ck.get("pred_len", ck_args.get("pred_len", 96))
         hidden = ck.get("hidden", ck_args.get("hidden", 64))
         n_vars = n_channels(ds)
-        bs = args.batch_size or 32
-        lr = args.lr if args.lr is not None else 1e-3
-        wd = args.weight_decay if args.weight_decay is not None else 1e-4
+        # Inherit from the discovery run, not a hardcoded default — PatchTST
+        # needs lr=1e-4, the TCN needs 1e-3. A C3 at the wrong lr is not a
+        # matched control even when its parameter count matches exactly.
+        bs = args.batch_size if args.batch_size is not None else ck_args.get("batch_size", 32)
+        lr = args.lr if args.lr is not None else ck_args.get("lr", 1e-3)
+        wd = args.weight_decay if args.weight_decay is not None else ck_args.get("weight_decay", 1e-4)
 
         train_loader, val_loader, test_loader = get_ltsf_loaders(
             ds, seq_len=seq_len, pred_len=pred_len, batch_size=bs,

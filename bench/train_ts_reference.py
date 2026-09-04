@@ -34,7 +34,7 @@ def evaluate(model, loader, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst"], default="tcn_ci",
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst", "itransformer", "tsmixer"], default="tcn_ci",
                     help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
                          "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
                          "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")
@@ -82,7 +82,7 @@ def main():
     print(f"  Compute Device               : {dev_name} ({args.device})")
     print(f"  Variates / seq_len / pred_len: {n_vars} / {args.seq_len} / {args.pred_len}")
     print(f"  Total Parameters             : {baseline_params:,} (Fixed Static)")
-    if args.arch != "patchtst":
+    if args.arch in ("tcn", "tcn_ci"):
         print(f"  Block shapes                 : {describe(model, args.seq_len, n_vars)['block_shapes']}")
     print(f"  Epochs                       : {args.epochs}")
     print(f"{'='*70}\n")

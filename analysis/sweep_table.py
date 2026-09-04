@@ -58,20 +58,28 @@ def _mean(vals):
     return statistics.mean(vals) if vals else None
 
 
-def _find_budgets(sweep_dir, ds, h):
-    pat = os.path.join(sweep_dir, f"tsrx_{ds}_h{h}_br*.pt")
+def _tag(arch, ds, h):
+    """Filename tag for one (arch, dataset, horizon). `arch=""` matches the
+    original untagged naming (tsrx_<ds>_h<H>_br<BR>.pt) used by the first
+    TCN sweep, so that old data stays readable without a rename."""
+    return f"{arch}_{ds}_h{h}" if arch else f"{ds}_h{h}"
+
+
+def _find_budgets(sweep_dir, arch, ds, h):
+    pat = os.path.join(sweep_dir, f"tsrx_{_tag(arch, ds, h)}_br*.pt")
     budgets = set()
     for p in glob.glob(pat):
-        m = re.match(rf"tsrx_{re.escape(ds)}_h{h}_br([0-9.]+)(?:_s\d+)?\.pt$", os.path.basename(p))
+        m = re.match(rf"tsrx_{re.escape(_tag(arch, ds, h))}_br([0-9.]+)(?:_s\d+)?\.pt$",
+                     os.path.basename(p))
         if m:
             budgets.add(m.group(1))
     return sorted(budgets, key=float, reverse=True)
 
 
-def _variants(sweep_dir, arm, ds, h, br):
+def _variants(sweep_dir, arm, arch, ds, h, br):
     """Every checkpoint for this arm/budget across seeds (_s<N>) and extra
     C3 draws (_c<N>). Base file (no suffix) is seed 42 / the default draw."""
-    base = f"{arm}_{ds}_h{h}_br{br}"
+    base = f"{arm}_{_tag(arch, ds, h)}_br{br}"
     paths = [os.path.join(sweep_dir, base + ".pt")]
     paths += sorted(glob.glob(os.path.join(sweep_dir, base + "_s*.pt")))
     paths += sorted(glob.glob(os.path.join(sweep_dir, base + "_c*.pt")))
@@ -85,12 +93,15 @@ def main():
     ap.add_argument("--horizon", type=int, default=96)
     ap.add_argument("--reference", default=None,
                     help="reference checkpoint to compare against, e.g. "
-                         "results/ts_reference/tcn_weather_h96.pt")
+                         "results/ts_reference/patchtst_weather_h96.pt")
+    ap.add_argument("--arch", default="",
+                    help="arch tag in the sweep filenames (tsrx_<arch>_<ds>_h<H>_br<BR>.pt). "
+                         "Empty (default) reads the original untagged TCN sweep.")
     args = ap.parse_args()
 
-    budgets = _find_budgets(args.sweep_dir, args.dataset, args.horizon)
+    budgets = _find_budgets(args.sweep_dir, args.arch, args.dataset, args.horizon)
     if not budgets:
-        raise SystemExit(f"no sweep checkpoints for {args.dataset} h{args.horizon} under {args.sweep_dir}")
+        raise SystemExit(f"no sweep checkpoints for arch={args.arch!r} {args.dataset} h{args.horizon} under {args.sweep_dir}")
 
     ref = _load(args.reference) if args.reference else None
     ref_test = ref.get("test_mse") if ref else None
@@ -101,7 +112,7 @@ def main():
     print("=" * 100)
     ok_all = True
     for br in budgets:
-        tx_paths = _variants(args.sweep_dir, "tsrx", args.dataset, args.horizon, br)
+        tx_paths = _variants(args.sweep_dir, "tsrx", args.arch, args.dataset, args.horizon, br)
         issues, n_checked = [], 0
         final_ps = set()
         for txp in tx_paths:
@@ -109,7 +120,7 @@ def main():
             if tx is None:
                 issues.append(f"unreadable: {os.path.basename(txp)}"); continue
             n_checked += 1
-            suffix = os.path.basename(txp)[len(f"tsrx_{args.dataset}_h{args.horizon}_br{br}"):-3]
+            suffix = os.path.basename(txp)[len(f"tsrx_{_tag(args.arch, args.dataset, args.horizon)}_br{br}"):-3]
             final_p = tx.get("final_params")
             if final_p is None:
                 issues.append(f"{suffix or '(seed42)'}: no final_params"); continue
@@ -118,16 +129,16 @@ def main():
             if dorm not in (None, 0.0):
                 issues.append(f"{suffix or '(seed42)'}: dormancy leaked (max_port_magnitude={dorm})")
 
-            c2 = _load(os.path.join(args.sweep_dir, f"c2_{args.dataset}_h{args.horizon}_br{br}{suffix}.pt"))
+            c2 = _load(os.path.join(args.sweep_dir, f"c2_{_tag(args.arch, args.dataset, args.horizon)}_br{br}{suffix}.pt"))
             if c2 is None:
                 issues.append(f"{suffix or '(seed42)'}: C2 missing")
             elif c2.get("params") != final_p:
                 issues.append(f"{suffix or '(seed42)'}: C2 params {c2.get('params'):,} != "
                               f"tsrx final {final_p:,} (C2 used the WRONG architecture)")
 
-        for c3p in _variants(args.sweep_dir, "c3", args.dataset, args.horizon, br):
+        for c3p in _variants(args.sweep_dir, "c3", args.arch, args.dataset, args.horizon, br):
             c3 = _load(c3p)
-            suffix = os.path.basename(c3p)[len(f"c3_{args.dataset}_h{args.horizon}_br{br}"):-3]
+            suffix = os.path.basename(c3p)[len(f"c3_{_tag(args.arch, args.dataset, args.horizon)}_br{br}"):-3]
             rel = c3.get("param_match_rel_error") if c3 else None
             if rel is None or rel > 0.01:
                 issues.append(f"C3{suffix or '(seed42)'}: off target by "
@@ -146,7 +157,7 @@ def main():
     print()
 
     print("=" * 100)
-    print(f"COMPRESSION FRONTIER  —  {args.dataset} h{args.horizon}   (mean±std where n>1)")
+    print(f"COMPRESSION FRONTIER  —  {args.arch or 'tcn(untagged)'} / {args.dataset} h{args.horizon}   (mean±std where n>1)")
     if ref is not None:
         print(f"reference: {ref_params:,} params   test {ref_test:.4f}")
     print("=" * 100)
@@ -155,7 +166,7 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for br in budgets:
-        tx_paths = _variants(args.sweep_dir, "tsrx", args.dataset, args.horizon, br)
+        tx_paths = _variants(args.sweep_dir, "tsrx", args.arch, args.dataset, args.horizon, br)
         if not tx_paths:
             continue
         tx0 = _load(tx_paths[0])
@@ -164,15 +175,15 @@ def main():
 
         c2_tests, c2_vals = [], []
         for txp in tx_paths:
-            suffix = os.path.basename(txp)[len(f"tsrx_{args.dataset}_h{args.horizon}_br{br}"):-3]
-            c2 = _load(os.path.join(args.sweep_dir, f"c2_{args.dataset}_h{args.horizon}_br{br}{suffix}.pt"))
+            suffix = os.path.basename(txp)[len(f"tsrx_{_tag(args.arch, args.dataset, args.horizon)}_br{br}"):-3]
+            c2 = _load(os.path.join(args.sweep_dir, f"c2_{_tag(args.arch, args.dataset, args.horizon)}_br{br}{suffix}.pt"))
             if c2:
                 c2_tests.append(c2.get("test_mse"))
                 c2_vals.append(c2.get("val_mse"))
         n_seed = len([v for v in c2_tests if v is not None])
 
         c3_vals = [_load(p).get("val_mse") for p in
-                   _variants(args.sweep_dir, "c3", args.dataset, args.horizon, br)]
+                   _variants(args.sweep_dir, "c3", args.arch, args.dataset, args.horizon, br)]
         c3_vals = [v for v in c3_vals if v is not None]
         n_c3 = len(c3_vals)
 

@@ -155,6 +155,14 @@ def build_ts_model(arch: str, n_vars: int, pred_len: int, hidden: int = 64,
         return build_patchtst(n_vars, seq_len, pred_len, d_model=d_model, d_ff=d_ff,
                                n_heads=n_heads, n_blocks=n_blocks, patch_len=patch_len,
                                stride=stride, use_revin=use_revin)
+    if arch == "itransformer":
+        from bench.itransformer import build_itransformer
+        return build_itransformer(n_vars, seq_len, pred_len, d_model=d_model, d_ff=d_ff,
+                                   n_heads=n_heads, n_blocks=n_blocks, use_revin=use_revin)
+    if arch == "tsmixer":
+        from bench.tsmixer import build_tsmixer
+        return build_tsmixer(n_vars, seq_len, pred_len, d_ff=d_ff, n_blocks=n_blocks,
+                              use_revin=use_revin)
     raise ValueError(f"unknown timeseries arch {arch!r}")
 
 

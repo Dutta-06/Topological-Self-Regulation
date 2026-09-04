@@ -60,7 +60,7 @@ def evaluate(model: nn.Module, loader, device: str):
 
 def main():
     ap = argparse.ArgumentParser(description="TSR-X Dynamic Architecture Training (timeseries)")
-    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst"], default="tcn_ci",
+    ap.add_argument("--arch", choices=["tcn", "tcn_ci", "patchtst", "itransformer", "tsmixer"], default="tcn_ci",
                     help="tcn_ci (default) is channel-independent: the head is Linear(hidden, "
                          "pred_len) instead of Linear(hidden, pred_len*n_vars), so the conv body "
                          "TSR-X can reallocate is 65-93%% of params instead of 1-41%%")

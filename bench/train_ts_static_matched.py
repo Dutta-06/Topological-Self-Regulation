@@ -41,9 +41,13 @@ def main():
     ap.add_argument("--tsrx-checkpoint", required=True)
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="defaults to the discovery run's batch size")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="defaults to the discovery run's lr — DO NOT hardcode this. "
+                         "PatchTST needs 1e-4, the TCN needs 1e-3; a C2 trained at the "
+                         "wrong lr is not a matched control even if the widths match.")
+    ap.add_argument("--weight-decay", type=float, default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -80,13 +84,20 @@ def main():
             "cannot be built."
         )
 
+    # Inherit optimization hyperparameters from the discovery run unless the
+    # caller explicitly overrides them. A C2/C3 trained at the wrong lr is
+    # not a matched control even when the widths match exactly.
+    batch_size = args.batch_size if args.batch_size is not None else ck_args.get("batch_size", 32)
+    lr = args.lr if args.lr is not None else ck_args.get("lr", 1e-3)
+    weight_decay = args.weight_decay if args.weight_decay is not None else ck_args.get("weight_decay", 1e-4)
+
     torch.manual_seed(args.seed)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
     n_vars = n_channels(dataset)
     train_loader, val_loader, test_loader = get_ltsf_loaders(
         dataset, seq_len=seq_len, pred_len=pred_len,
-        batch_size=args.batch_size, root=args.data_root, num_workers=args.num_workers,
+        batch_size=batch_size, root=args.data_root, num_workers=args.num_workers,
     )
 
     # rebuild with the EXACT architecture hyperparameters of the discovery
@@ -108,13 +119,14 @@ def main():
     print(f"  Reference params          : {ref_params:,}")
     print(f"  Matched (discovered)      : {matched_params:,}  ({(1-matched_params/ref_params)*100:.1f}% reduction)")
     print(f"  Width source              : {width_source}")
+    print(f"  lr / weight_decay / batch : {lr} / {weight_decay} / {batch_size}")
     print(f"  TSR-X best val MSE        : {ck.get('best_val_mse', 'n/a')}")
     print(f"  => discovered-shape MSE vs this run separates the shape from")
     print(f"     the plasticity contribution (Theorem 8.1); TSR-X is not")
     print(f"     required to beat it for the discovery result to hold.")
     print(f"{'='*70}\n")
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_loader))
 
     best_val_mse = float("inf")
