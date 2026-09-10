@@ -24,12 +24,15 @@ from bench.models import build_model, describe
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> float:
+def evaluate(model, loader, device, batch_tf=None, use_amp=False) -> float:
     model.eval()
     correct, total = 0, 0
     for x, y in tqdm(loader, desc="Eval", leave=False):
-        x, y = x.to(device), y.to(device)
-        pred = model(x).argmax(1)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        if batch_tf is not None:
+            x = batch_tf(x)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x).argmax(1)
         correct += (pred == y).sum().item()
         total += y.size(0)
     return correct / total
@@ -37,8 +40,8 @@ def evaluate(model, loader, device) -> float:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn"], required=True)
-    ap.add_argument("--dataset", choices=["cifar10", "cifar100"], required=True)
+    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn", "mobilenet_v2", "efficientnet_b0"], required=True)
+    ap.add_argument("--dataset", choices=["cifar10", "cifar100", "tiny_imagenet", "tiny-imagenet", "imagenet100", "imagenet-100"], required=True)
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch-size", type=int, default=128)
@@ -46,25 +49,61 @@ def main():
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=5e-4)
     ap.add_argument("--augmentation", default="standard")
-    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=True,
+    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=None,
                     help="3x3 stride-1 stem, no maxpool (REQUIRED for correct CIFAR accuracy)")
     ap.add_argument("--imagenet-stem", dest="cifar_stem", action="store_false",
                     help="keep torchvision 7x7 stride-2 stem (crushes 32x32 to 8x8; ~87 pct ceiling)")
+    ap.add_argument("--amp", dest="amp", action="store_true", default=True, help="Enable automatic mixed precision")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="Disable automatic mixed precision")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", required=True, help="checkpoint path (.pt)")
     ap.add_argument("--checkpoint-every", type=int, default=0, help="0 = only save at the end/best")
     args = ap.parse_args()
+
+    if args.cifar_stem is None:
+        args.cifar_stem = False if args.dataset in ("imagenet100", "imagenet-100") else True
 
     torch.manual_seed(args.seed)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     from data.cifar import get_cifar10_loaders, get_cifar100_loaders
-    num_classes = 10 if args.dataset == "cifar10" else 100
-    loader_fn = get_cifar10_loaders if args.dataset == "cifar10" else get_cifar100_loaders
-    train_loader, val_loader = loader_fn(root=args.data_root, batch_size=args.batch_size,
-                                          augmentation=args.augmentation)
+    from data.tiny_imagenet import get_tiny_imagenet_loaders, GPUBatchTransform
+    from data.imagenet100 import get_imagenet100_loaders
+    if args.dataset in ("imagenet100", "imagenet-100"):
+        num_classes = 100
+        loader_fn = get_imagenet100_loaders
+        train_batch_tf = None
+        eval_batch_tf = None
+        input_hw = 224
+    elif args.dataset == "cifar10":
+        num_classes = 10
+        loader_fn = get_cifar10_loaders
+        train_batch_tf = None
+        eval_batch_tf = None
+        input_hw = 32
+    elif args.dataset == "cifar100":
+        num_classes = 100
+        loader_fn = get_cifar100_loaders
+        train_batch_tf = None
+        eval_batch_tf = None
+        input_hw = 32
+    else:
+        num_classes = 200
+        loader_fn = get_tiny_imagenet_loaders
+        train_batch_tf = GPUBatchTransform(is_train=True, augmentation=args.augmentation).to(args.device)
+        eval_batch_tf = GPUBatchTransform(is_train=False).to(args.device)
+        input_hw = 64
+
+    if args.dataset in ("imagenet100", "imagenet-100"):
+        train_loader, val_loader = loader_fn(root=args.data_root, batch_size=args.batch_size,
+                                              num_workers=args.num_workers)
+    else:
+        train_loader, val_loader = loader_fn(root=args.data_root, batch_size=args.batch_size,
+                                              num_workers=args.num_workers,
+                                              augmentation=args.augmentation)
 
     dev_name = torch.cuda.get_device_name(0) if args.device.startswith("cuda") and torch.cuda.is_available() else args.device
     model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
@@ -75,9 +114,12 @@ def main():
     print(f"  Compute Device               : {dev_name} ({args.device})")
     print(f"  Total Parameters             : {baseline_params:,} (Fixed Static)")
     print(f"  CIFAR stem (3x3 s1, no pool) : {args.cifar_stem}")
-    print(f"  Stage spatial sizes          : {describe(model, args.arch)['spatial']}")
+    print(f"  Stage spatial sizes          : {describe(model, args.arch, input_hw=input_hw)['spatial']}")
     print(f"  Epochs                       : {args.epochs}")
     print(f"{'='*70}\n")
+
+    use_amp = args.amp and args.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
                            weight_decay=args.weight_decay, nesterov=True)
@@ -91,11 +133,23 @@ def main():
         total_loss, n = 0.0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
         for x, y in pbar:
-            x, y = x.to(args.device), y.to(args.device)
+            x, y = x.to(args.device, non_blocking=True), y.to(args.device, non_blocking=True)
+            if train_batch_tf is not None:
+                x = train_batch_tf(x)
             opt.zero_grad(set_to_none=True)
-            loss = nn.functional.cross_entropy(model(x), y)
-            loss.backward()
-            opt.step()
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(x)
+                loss = nn.functional.cross_entropy(out, y)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
+
             sched.step()
             total_loss += loss.item() * x.size(0)
             n += x.size(0)
@@ -104,7 +158,7 @@ def main():
                 "lr": f"{opt.param_groups[0]['lr']:.2e}",
             })
 
-        val_acc = evaluate(model, val_loader, args.device)
+        val_acc = evaluate(model, val_loader, args.device, batch_tf=eval_batch_tf, use_amp=use_amp)
         is_best = val_acc > best_acc
         best_acc = max(best_acc, val_acc)
         print(f"epoch {epoch+1:3d}/{args.epochs}  train_loss={total_loss/n:.4f}  "

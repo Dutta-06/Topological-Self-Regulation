@@ -22,7 +22,13 @@ gate_smoke*/
 # Ignore downloaded dataset files, keep the Python loaders.
 data/cifar-10-batches-py/
 data/cifar-100-python/
+data/tiny-imagenet-200/
+data/tiny-imagenet-200.zip
+data/imagenet-100/
 data/*.tar.gz
+data/*.zip
 data/*.csv
 data/*.npz
+scratch/
 .DS_Store
+

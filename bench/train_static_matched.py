@@ -30,7 +30,9 @@ from tqdm import tqdm
 
 from bench.models import build_model, describe
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
+from data.tiny_imagenet import get_tiny_imagenet_loaders, GPUBatchTransform
 from tsrx.graph.bundle import build_all_bundles
+from tsrx.graph.generators import is_depthwise
 from tsrx.graph.groups import discover_groups
 from tsrx.graph.trace import trace_model
 
@@ -59,6 +61,7 @@ def resize_model_to_widths(model: nn.Module, widths: dict, example_input) -> nn.
                 continue
             seen.add(slot.module_name)
             mod = modules[slot.module_name]
+            is_dw = isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and is_depthwise(mod)
             w = mod.weight
             mod.weight = nn.Parameter(torch.empty(target, *w.shape[1:], device=w.device, dtype=w.dtype))
             nn.init.kaiming_uniform_(mod.weight.reshape(target, -1), a=5 ** 0.5)
@@ -67,6 +70,9 @@ def resize_model_to_widths(model: nn.Module, widths: dict, example_input) -> nn.
             for attr in ("out_channels", "out_features"):
                 if hasattr(mod, attr):
                     setattr(mod, attr, target)
+            if is_dw:
+                mod.groups = target
+                mod.in_channels = target
 
         seen = set()
         for slot in bd.affine_slots:
@@ -106,12 +112,15 @@ def resize_model_to_widths(model: nn.Module, widths: dict, example_input) -> nn.
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> float:
+def evaluate(model, loader, device, batch_tf=None, use_amp=False) -> float:
     model.eval()
     correct, total = 0, 0
     for x, y in tqdm(loader, desc="Eval", leave=False):
-        x, y = x.to(device), y.to(device)
-        correct += (model(x).argmax(1) == y).sum().item()
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        if batch_tf is not None:
+            x = batch_tf(x)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            correct += (model(x).argmax(1) == y).sum().item()
         total += y.size(0)
     model.train()
     return correct / max(total, 1)
@@ -126,6 +135,8 @@ def main():
     ap.add_argument("--lr", type=float, default=0.1)
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=5e-4)
+    ap.add_argument("--amp", dest="amp", action="store_true", default=True, help="Enable automatic mixed precision")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="Disable automatic mixed precision")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -147,14 +158,38 @@ def main():
     torch.manual_seed(args.seed)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 
-    num_classes = 10 if dataset == "cifar10" else 100
-    loader_fn = get_cifar10_loaders if dataset == "cifar10" else get_cifar100_loaders
+    from data.imagenet100 import get_imagenet100_loaders
+    if dataset in ("imagenet100", "imagenet-100"):
+        num_classes = 100
+        loader_fn = get_imagenet100_loaders
+        in_hw = 224
+        train_batch_tf = None
+        eval_batch_tf = None
+    elif dataset == "cifar10":
+        num_classes = 10
+        loader_fn = get_cifar10_loaders
+        in_hw = 32
+        train_batch_tf = None
+        eval_batch_tf = None
+    elif dataset == "cifar100":
+        num_classes = 100
+        loader_fn = get_cifar100_loaders
+        in_hw = 32
+        train_batch_tf = None
+        eval_batch_tf = None
+    else:
+        num_classes = 200
+        loader_fn = get_tiny_imagenet_loaders
+        in_hw = 64
+        train_batch_tf = GPUBatchTransform(is_train=True).to(args.device)
+        eval_batch_tf = GPUBatchTransform(is_train=False).to(args.device)
+
     train_loader, val_loader = loader_fn(root=args.data_root, batch_size=args.batch_size,
                                           num_workers=args.num_workers)
 
     model = build_model(arch, num_classes, cifar_stem=cifar_stem)
     ref_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model = resize_model_to_widths(model, widths, torch.zeros(2, 3, 32, 32))
+    model = resize_model_to_widths(model, widths, torch.zeros(2, 3, in_hw, in_hw))
     model = model.to(args.device)
     matched_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -168,6 +203,9 @@ def main():
     print(f"  => TSR-X must BEAT this run for the plasticity thesis to hold.")
     print(f"{'='*70}\n")
 
+    use_amp = args.amp and args.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
                            weight_decay=args.weight_decay, nesterov=True)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_loader))
@@ -177,14 +215,25 @@ def main():
         model.train()
         t0, tot, n = time.time(), 0.0, 0
         for x, y in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
-            x, y = x.to(args.device), y.to(args.device)
+            x, y = x.to(args.device, non_blocking=True), y.to(args.device, non_blocking=True)
+            if train_batch_tf is not None:
+                x = train_batch_tf(x)
             opt.zero_grad(set_to_none=True)
-            loss = nn.functional.cross_entropy(model(x), y)
-            loss.backward()
-            opt.step()
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss = nn.functional.cross_entropy(model(x), y)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
+
             sched.step()
             tot += loss.item() * x.size(0); n += x.size(0)
-        acc = evaluate(model, val_loader, args.device)
+        acc = evaluate(model, val_loader, args.device, batch_tf=eval_batch_tf, use_amp=use_amp)
         is_best = acc > best
         best = max(best, acc)
         print(f"epoch {epoch+1:3d}/{args.epochs}  loss={tot/n:.4f}  val_acc={acc:.4f}  best={best:.4f}  ({time.time()-t0:.1f}s)")

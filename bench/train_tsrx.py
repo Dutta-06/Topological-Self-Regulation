@@ -30,6 +30,8 @@ from tqdm import tqdm
 
 from bench.models import build_model, describe
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
+from data.tiny_imagenet import get_tiny_imagenet_loaders, GPUBatchTransform
+from data.imagenet100 import get_imagenet100_loaders
 from tsrx.alloc.cost import kappa_params
 from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange
 from tsrx.alloc.schedule import budget_at
@@ -47,12 +49,15 @@ def count_params(model: nn.Module) -> int:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, device: str) -> float:
+def evaluate(model: nn.Module, loader, device: str, batch_tf: nn.Module = None, use_amp: bool = False) -> float:
     model.eval()
     correct, total = 0, 0
     for x, y in tqdm(loader, desc="Eval", leave=False):
-        x, y = x.to(device), y.to(device)
-        pred = model(x).argmax(dim=1)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        if batch_tf is not None:
+            x = batch_tf(x)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            pred = model(x).argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
     model.train()
@@ -61,8 +66,8 @@ def evaluate(model: nn.Module, loader, device: str) -> float:
 
 def main():
     ap = argparse.ArgumentParser(description="TSR-X Dynamic Architecture Training")
-    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn"], default="resnet18")
-    ap.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar100")
+    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn", "mobilenet_v2", "efficientnet_b0"], default="resnet18")
+    ap.add_argument("--dataset", choices=["cifar10", "cifar100", "tiny_imagenet", "tiny-imagenet", "imagenet100", "imagenet-100"], default="tiny_imagenet")
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--max-steps", type=int, default=None)
@@ -77,8 +82,10 @@ def main():
     ap.add_argument("--prune-tol", type=float, default=1e-3,
                     help="RELATIVE pure-prune tolerance (fraction of group median saliency)")
     ap.add_argument("--min-size", type=int, default=8, help="Min channels per group")
-    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=True)
+    ap.add_argument("--cifar-stem", dest="cifar_stem", action="store_true", default=None)
     ap.add_argument("--imagenet-stem", dest="cifar_stem", action="store_false")
+    ap.add_argument("--amp", dest="amp", action="store_true", default=True, help="Enable automatic mixed precision")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="Disable automatic mixed precision")
     ap.add_argument("--H-max", type=float, default=1.0, help="curvature bound for Eq.14 removal score")
     ap.add_argument("--calibrate-hmax", action="store_true",
                     help="Replace --H-max with a data-driven estimate (curvature.calibrate_h_max), "
@@ -93,7 +100,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num-workers", type=int, default=0)
-    ap.add_argument("--out", default="results/tsrx/resnet18_cifar100.pt")
+    ap.add_argument("--out", default="results/tsrx/resnet18_tiny_imagenet.pt")
     ap.add_argument("--smoke-test", action="store_true", help="Quick 500-step test")
     args = ap.parse_args()
 
@@ -101,15 +108,36 @@ def main():
         args.max_steps = 500
         args.update_interval = 50
 
+    if args.cifar_stem is None:
+        args.cifar_stem = False if args.dataset in ("imagenet100", "imagenet-100") else True
+
     torch.manual_seed(args.seed)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
-    loader_fn = get_cifar10_loaders if args.dataset == "cifar10" else get_cifar100_loaders
+    if args.dataset in ("imagenet100", "imagenet-100"):
+        num_classes = 100
+        loader_fn = get_imagenet100_loaders
+    elif args.dataset == "cifar10":
+        num_classes = 10
+        loader_fn = get_cifar10_loaders
+    elif args.dataset == "cifar100":
+        num_classes = 100
+        loader_fn = get_cifar100_loaders
+    else:  # tiny_imagenet / tiny-imagenet
+        num_classes = 200
+        loader_fn = get_tiny_imagenet_loaders
+
     train_loader, val_loader = loader_fn(
         root=args.data_root, batch_size=args.batch_size, num_workers=args.num_workers
     )
+
+    if args.dataset in ("tiny_imagenet", "tiny-imagenet"):
+        train_batch_tf = GPUBatchTransform(is_train=True).to(args.device)
+        eval_batch_tf = GPUBatchTransform(is_train=False).to(args.device)
+    else:
+        train_batch_tf = None
+        eval_batch_tf = None
 
     # 1. Build Reference Model
     model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
@@ -135,7 +163,10 @@ def main():
     # 2. Graph Tracing & Coupling Group Discovery
     it = iter(train_loader)
     xb0, _ = next(it)
-    traced = trace_model(model, (xb0[:2].to(args.device),))
+    xb0 = xb0[:2].to(args.device)
+    if train_batch_tf is not None:
+        xb0 = train_batch_tf(xb0)
+    traced = trace_model(model, (xb0,))
     res = discover_groups(traced)
     bundles = build_all_bundles(res, model)
 
@@ -147,6 +178,9 @@ def main():
                            weight_decay=args.weight_decay, nesterov=True)
     total_steps = args.max_steps or (args.epochs * len(train_loader))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
+
+    use_amp = args.amp and args.device.startswith("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     win = WindowedSignal(window=args.update_interval)
     act_stats = ActivationStats(model, bank)   # E[a_j^2] for Eq.(14)'s 2nd-order term
@@ -173,12 +207,20 @@ def main():
             if args.max_steps and global_step >= args.max_steps:
                 break
 
-            xb, yb = xb.to(args.device), yb.to(args.device)
+            xb, yb = xb.to(args.device, non_blocking=True), yb.to(args.device, non_blocking=True)
+            if train_batch_tf is not None:
+                xb = train_batch_tf(xb)
             opt.zero_grad(set_to_none=True)
 
-            out = model(xb)
-            loss = F.cross_entropy(out, yb)
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(xb)
+                loss = F.cross_entropy(out, yb)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+            else:
+                loss.backward()
 
             # Sense candidate gradients u_c and compute removal saliency
             with torch.no_grad():
@@ -189,7 +231,11 @@ def main():
                     saliency_sum[tap] = sal if saliency_sum[tap] is None else saliency_sum[tap] + sal
 
             n_saliency_seen += 1
-            opt.step()
+            if use_amp:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             # CRITICAL (Definition 3.2 / Lemma 2.2): candidate ports carry a
             # real gradient (u_c IS that gradient), so opt.step() trains them
             # away from zero unless we re-zero. Without this the "candidates"
@@ -309,7 +355,7 @@ def main():
             global_step += 1
 
         # Per-epoch evaluation
-        val_acc = evaluate(model, val_loader, args.device)
+        val_acc = evaluate(model, val_loader, args.device, batch_tf=eval_batch_tf, use_amp=use_amp)
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
         is_best = val_acc > best_acc

@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from tsrx.graph.bundle import IndexBundle, ParamSlot
+from tsrx.graph.generators import is_depthwise
 from tsrx.sense.candidates import CandidateBank
 
 
@@ -124,11 +125,16 @@ def prune_group_index(
             reindex_optimizer_state(optimizer, mod.bias, new_b_param, axis=0, action="prune", idx=idx)
             mod.bias = new_b_param
 
+        is_dw = isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and is_depthwise(mod)
+
         # Update module attribute
         if hasattr(mod, "out_channels"):
             mod.out_channels -= 1
         elif hasattr(mod, "out_features"):
             mod.out_features -= 1
+        if is_dw:
+            mod.groups -= 1
+            mod.in_channels -= 1
 
     # 2. Prune Affine Slots (BatchNorm / InstanceNorm)
     affines_seen = set()
@@ -242,7 +248,11 @@ def materialize_candidate(
             reindex_optimizer_state(optimizer, mod.bias, new_b, axis=0, action="grow", idx=base_size, count=1)
             mod.bias = new_b
 
+        is_dw = isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and is_depthwise(mod)
         _bump_out_attr(mod, 1)
+        if is_dw:
+            mod.groups += 1
+            mod.in_channels += 1
 
     # 2. Expand Affine Slots (BatchNorm)
     affines_seen = set()

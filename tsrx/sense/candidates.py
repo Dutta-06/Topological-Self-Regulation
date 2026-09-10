@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from tsrx.graph.bundle import IndexBundle, ParamSlot
+from tsrx.graph.generators import is_depthwise
 
 _LN_GN_TYPES = (nn.LayerNorm, nn.GroupNorm)
 
@@ -45,6 +46,7 @@ def _kaiming_rows(n: int, fan_in_shape, device, dtype) -> torch.Tensor:
 
 
 def _extend_producer_weight(mod: nn.Module, k: int) -> None:
+    is_dw = isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and is_depthwise(mod)
     w = mod.weight
     new_rows = torch.empty(k, *w.shape[1:], device=w.device, dtype=w.dtype)
     if new_rows.numel():
@@ -54,6 +56,9 @@ def _extend_producer_weight(mod: nn.Module, k: int) -> None:
         b = mod.bias
         mod.bias = nn.Parameter(torch.cat([b.data, torch.zeros(k, device=b.device, dtype=b.dtype)]))
     _bump_out_attr(mod, k)
+    if is_dw:
+        mod.groups += k
+        mod.in_channels += k
 
 
 def _extend_consumer_weight_zero(mod: nn.Module, k: int, multiplicity: int = 1) -> None:

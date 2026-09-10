@@ -133,7 +133,7 @@ def summarize(report: List[dict]) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description="Prediction 9.1 gate: equimarginal spread on a trained reference.")
-    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn"], required=True)
+    ap.add_argument("--arch", choices=["resnet18", "vgg16_bn", "mobilenet_v2", "efficientnet_b0"], required=True)
     ap.add_argument("--checkpoint", required=True, help="path to a trained state_dict (.pt)")
     ap.add_argument("--dataset", choices=["cifar10", "cifar100"], required=True)
     ap.add_argument("--data-root", default="./data")

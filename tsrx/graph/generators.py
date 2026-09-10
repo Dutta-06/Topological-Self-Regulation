@@ -81,5 +81,5 @@ def classify_function(name: str) -> Role:
     return Role.UNKNOWN
 
 
-def is_depthwise(mod: nn.Conv2d) -> bool:
-    return mod.groups == mod.in_channels == mod.out_channels
+def is_depthwise(mod: nn.Module) -> bool:
+    return getattr(mod, "groups", 1) > 1 and getattr(mod, "groups", 1) == getattr(mod, "in_channels", 0)
