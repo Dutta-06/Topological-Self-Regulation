@@ -57,7 +57,11 @@ def _budgets(sweep, arch, ds, h):
         m = re.match(rf"^tsrx_{re.escape(t)}_br([0-9.]+)(?:_s\d+)?\.pt$", os.path.basename(p))
         if m:
             out.add(m.group(1))
-    return sorted(out, key=float)
+    by_value = {}
+    for b in out:  # "0.5" and "0.50" are the same budget from two campaigns
+        if float(b) not in by_value or len(b) > len(by_value[float(b)]):
+            by_value[float(b)] = b
+    return sorted(by_value.values(), key=float)
 
 
 def _variants(sweep, arm, arch, ds, h, br, draws=False):
@@ -184,14 +188,19 @@ def _best_arm(cell):
     return min(means, key=means.get) if means else None
 
 
-def main_rows(sweep, ref_dir, h, tol, metric):
+def main_rows(sweep, ref_dir, h, tol, metric, datasets=None):
     rows = []
     for arch, aname in ARCHS:
         for ds, dname in DATASETS:
+            if datasets and ds not in datasets:
+                continue
             br = _knee(sweep, ref_dir, arch, ds, h, tol)
             if br is None:
                 continue
             cell = _cell(sweep, ref_dir, arch, ds, h, br, metric)
+            # Accuracy never crossed tolerance at any budget tried: the knee is
+            # bounded by the budget grid / architectural ceiling, not by accuracy.
+            cell["censored"] = br == _budgets(sweep, arch, ds, h)[0]
             rows.append((aname, dname, br, cell))
     return rows
 
@@ -203,7 +212,7 @@ def render_main_md(rows, metric):
         best = _best_arm(c)
         d = (f"{(c['c2'][0] - c['ref'][0]) / c['ref'][0] * 100:+.2f}%"
              if c["c2"] and c["ref"] else "--")
-        flag = " †" if c["issues"] else ""
+        flag = (" †" if c["issues"] else "") + (" §" if c.get("censored") else "")
         tsrx = _fmt(c["tsrx"], bold=best == "tsrx") + (" ‡" if c["tsrx_fallback"] else "")
         n = "/".join(str(c[k][2]) if c[k] else "0" for k in ("ref", "tsrx", "c2", "c3"))
         out.append(
@@ -224,11 +233,11 @@ def render_main_tex(rows, metric, tol, h):
         r"\small",
         r"\setlength{\tabcolsep}{4pt}",
         r"\resizebox{\textwidth}{!}{%",
-        r"\begin{tabular}{@{}llrrccccr@{}}",
+        r"\begin{tabular}{@{}llrrccccrc@{}}",
         r"\toprule",
-        rf"& & \multicolumn{{2}}{{c}}{{Parameters}} & \multicolumn{{4}}{{c}}{{Test {M} ($\downarrow$)}} & \\",
+        rf"& & \multicolumn{{2}}{{c}}{{Parameters}} & \multicolumn{{4}}{{c}}{{Test {M} ($\downarrow$)}} & & \\",
         r"\cmidrule(lr){3-4}\cmidrule(lr){5-8}",
-        r"Model & Dataset & Ref $\to$ Ours & Red. & Reference & TSR-X & \textbf{C2 (ours)} & C3 (random) & $\Delta_{\mathrm{C2}}$ \\",
+        r"Model & Dataset & Ref $\to$ Ours & Red. & Reference & TSR-X & \textbf{C2 (ours)} & C3 (random) & $\Delta_{\mathrm{C2}}$ & $n$ \\",
         r"\midrule",
     ]
     prev = None
@@ -238,7 +247,7 @@ def render_main_tex(rows, metric, tol, h):
         best = _best_arm(c)
         d = (f"${(c['c2'][0] - c['ref'][0]) / c['ref'][0] * 100:+.2f}\\%$"
              if c["c2"] and c["ref"] else "--")
-        name = (aname + r"$^\dagger$") if c["issues"] else aname
+        name = aname + (r"$^\dagger$" if c["issues"] else "") + (r"$^\S$" if c.get("censored") else "")
         tsrx = _fmt(c["tsrx"], latex=True, bold=best == "tsrx") + (r"$^\ddagger$" if c["tsrx_fallback"] else "")
         red = f"{c['reduction']:.1f}\\%" if c["reduction"] is not None else "--"
         params = (f"{_human(c['ref_params'])} $\\to$ {_human(c['params'])}"
@@ -247,7 +256,8 @@ def render_main_tex(rows, metric, tol, h):
             f"{name if aname != prev else ''} & {dname} & {params} & {red} & "
             f"{_fmt(c['ref'], latex=True, bold=best == 'ref')} & {tsrx} & "
             f"{_fmt(c['c2'], latex=True, bold=best == 'c2')} & "
-            f"{_fmt(c['c3'], latex=True, bold=best == 'c3')} & {d} \\\\")
+            f"{_fmt(c['c3'], latex=True, bold=best == 'c3')} & {d} & "
+            f"{'/'.join(str(c[k][2]) if c[k] else '0' for k in ('ref', 'tsrx', 'c2', 'c3'))} \\\\")
         prev = aname
     lines += [
         r"\bottomrule",
@@ -262,17 +272,21 @@ def render_main_tex(rows, metric, tol, h):
          rf"$\Delta_{{\mathrm{{C2}}}}$ is the relative change of C2 against the reference. "
          rf"$^\dagger$Row failed a validity check. "
          rf"$^\ddagger$Final-architecture metric unavailable; best-validation value shown. "
-         rf"TCN is not a competitive forecasting baseline and is included as a simple non-SOTA reference.}}"),
+         rf"$^\S$Knee is the tightest budget evaluated: accuracy stayed within tolerance throughout, "
+         rf"so compression is bounded by the budget grid or the architecture's reallocatable share, not by accuracy. "
+         rf"$n$ gives the number of runs for reference / TSR-X / C2 / C3 (C3 includes extra random draws).}}"),
         rf"\label{{tab:ts-main-{metric}}}",
         r"\end{table*}",
     ]
     return "\n".join(lines)
 
 
-def frontier(sweep, ref_dir, h, tol):
+def frontier(sweep, ref_dir, h, tol, datasets=None):
     blocks = []
     for arch, aname in ARCHS:
         for ds, dname in DATASETS:
+            if datasets and ds not in datasets:
+                continue
             brs = _budgets(sweep, arch, ds, h)
             if not brs:
                 continue
@@ -304,7 +318,7 @@ def render_frontier_md(blocks):
     return "\n".join(out)
 
 
-def render_frontier_tex(blocks, tol, h):
+def render_frontier_tex(blocks, tol, h, label="tab:ts-frontier", title=""):
     lines = [r"\begin{table}[t]", r"\centering", r"\small",
              r"\begin{tabular}{@{}rrrcccr@{}}", r"\toprule",
              r"Budget & Params & Red. & TSR-X & C2 (ours) & C3 (random) & C2$-$C3 \\"]
@@ -320,12 +334,113 @@ def render_frontier_tex(blocks, tol, h):
             lines.append(f"{b} & {_human(c['params'])} & {red} & {_fmt(c['tsrx'], latex=True)} & "
                          f"{_fmt(c['c2'], latex=True)} & {_fmt(c['c3'], latex=True)} & {g} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}",
-              (rf"\caption{{Full compression frontier at horizon {h} (test MSE, lower is better). "
+              (rf"\caption{{{title}Full compression frontier at horizon {h} (test MSE, lower is better). "
                rf"$^\star$marks the knee (tightest budget with C2 within {tol*100:.0f}\% of the reference). "
                rf"C2$-$C3 $<0$ means the TSR-X-discovered allocation beat random allocation at the same "
                rf"parameter count. $^\dagger$Validity check failed.}}"),
-              r"\label{tab:ts-frontier}", r"\end{table}"]
+              rf"\label{{{label}}}", r"\end{table}"]
     return "\n".join(lines)
+
+
+def _tex_escape(text):
+    return (str(text).replace("\\", r"\textbackslash{}").replace("_", r"\_")
+            .replace("%", r"\%").replace("&", r"\&").replace("#", r"\#"))
+
+
+def render_standalone(args, main_mse, main_mae, blocks):
+    """A complete, compilable document with every result for the chosen
+    datasets -- for sending to a collaborator without the codebase."""
+    import datetime
+    ds_names = [n for d, n in DATASETS if not args.datasets or d in args.datasets]
+    models = sorted({a for a, _, _, _ in main_mse} | {a for a, _, _, _ in blocks},
+                    key=[n for _, n in ARCHS].index)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # validity, from every cell in the frontier (the main rows are a subset)
+    failures = []
+    for aname, dname, _, rows in blocks:
+        for br, c, _, _ in rows:
+            for why in sorted(set(c["issues"])):
+                failures.append((aname, dname, br, why))
+
+    # mechanism summary at the knees, computed not asserted
+    knee_pairs = [(a, d, c) for a, d, _, c in main_mse if c["c2"] and c["c3"]]
+    c2_wins = sum(1 for _, _, c in knee_pairs if c["c2"][0] < c["c3"][0])
+    ref_single = any(c["ref"] and c["ref"][2] == 1 for _, _, _, c in main_mse)
+    censored = [f"{a} ({d})" for a, d, _, c in main_mse if c.get("censored")]
+
+    out = [
+        r"\documentclass[11pt]{article}",
+        r"\usepackage[margin=0.9in]{geometry}",
+        r"\usepackage{amsmath,amssymb,booktabs,graphicx,float}",
+        r"\usepackage[hidelinks]{hyperref}",
+        r"\title{\textbf{TSR-X: Time-Series Forecasting Results}}",
+        rf"\author{{Generated from checkpoints by \texttt{{analysis/paper\_tables.py}}}}",
+        rf"\date{{{stamp}}}",
+        r"\begin{document}",
+        r"\maketitle",
+        "",
+        r"\section{Setup}",
+        r"\begin{itemize}",
+        rf"  \item \textbf{{Datasets:}} {', '.join(ds_names)}; forecast horizon {args.horizon}.",
+        rf"  \item \textbf{{Models:}} {', '.join(models)}.",
+        r"  \item \textbf{Reference:} the dense architecture, trained normally.",
+        r"  \item \textbf{TSR-X:} the discovery run, which reallocates capacity during training under an "
+        r"annealed parameter budget. Reported at its final, search-converged architecture.",
+        r"  \item \textbf{C2 (the claim):} the architecture discovered by TSR-X, retrained from scratch.",
+        r"  \item \textbf{C3 (control):} a \emph{random} width allocation at the same parameter count "
+        r"(matched to within 1\%), retrained from scratch. C2 vs.\ C3 isolates whether the TSR-X "
+        r"signal chose the allocation better than chance.",
+        rf"  \item \textbf{{Knee:}} the tightest budget whose seed-42 C2 test MSE is within "
+        rf"{args.tol*100:.0f}\% of the seed-42 reference. The tolerance was fixed before results were read.",
+        r"  \item Values are mean$_{\pm\text{std}}$ over available runs; $n$ is shown per cell. "
+        r"Test metrics are computed on normalised data (train-split statistics).",
+        r"\end{itemize}",
+        "",
+        r"\section{Main results}",
+        render_main_tex(main_mse, "mse", args.tol, args.horizon).replace("[t]", "[H]", 1),
+        "",
+        render_main_tex(main_mae, "mae", args.tol, args.horizon).replace("[t]", "[H]", 1),
+        "",
+        r"\paragraph{Summary.}",
+        (rf"At the knee, C2 has lower test MSE than C3 in {c2_wins} of {len(knee_pairs)} cells." if knee_pairs
+         else r"No cell has both C2 and C3 at the knee."),
+        "",
+        r"\section{Validity checks}",
+        r"Every cell was checked for: C2 parameter count equal to TSR-X's final count; C3 within 1\% "
+        r"of that count; candidate ports exactly zero (dormancy). ",
+    ]
+    if failures:
+        out += [r"The following cells \textbf{failed} and must not be reported as-is:", r"\begin{itemize}"]
+        out += [rf"  \item {_tex_escape(a)} / {_tex_escape(d)}, budget {br}: {_tex_escape(w)}"
+                for a, d, br, w in failures]
+        out += [r"\end{itemize}"]
+    else:
+        out += [r"All cells passed."]
+
+    out += ["", r"\section{Full compression frontier}"]
+    for aname in models:
+        sub = [b for b in blocks if b[0] == aname]
+        if sub:
+            out += [render_frontier_tex(sub, args.tol, args.horizon,
+                                        label=f"tab:ts-frontier-{aname.lower()}",
+                                        title=rf"\textbf{{{aname}.}} ").replace("[t]", "[H]", 1), ""]
+    out += [r"\clearpage", "", r"\section{Notes}", r"\begin{itemize}"]
+    if ref_single:
+        out.append(r"  \item The reference is a single run in at least one cell, so its own seed "
+                   r"variance is not yet reflected in $\Delta_{\mathrm{C2}}$.")
+    if censored:
+        out.append(rf"  \item Knees at the tightest budget evaluated (accuracy never left the tolerance "
+                   rf"band, so compression is limited by the budget grid or by the architecture's "
+                   rf"reallocatable share): {_tex_escape(', '.join(censored))}.")
+    if args.datasets and "weather" not in args.datasets:
+        out.append(r"  \item Weather is excluded: the local copy of the dataset was found to have its rows "
+                   r"out of time order, which invalidates every weather run. Results are pending a re-run "
+                   r"on the canonical file.")
+    out.append(r"  \item Parameter reduction is exact; accuracy differences at $n=1$ are not yet "
+               r"statistically resolved.")
+    out += [r"\end{itemize}", "", r"\end{document}", ""]
+    return "\n".join(out)
 
 
 def main():
@@ -336,11 +451,16 @@ def main():
     ap.add_argument("--tol", type=float, default=0.03,
                     help="knee tolerance, relative to reference test MSE (must match the campaign)")
     ap.add_argument("--latex-dir", default=None, help="write ts_table_*.tex here")
+    ap.add_argument("--datasets", nargs="+", default=None,
+                    choices=[d for d, _ in DATASETS],
+                    help="restrict to these datasets, e.g. --datasets electricity traffic")
+    ap.add_argument("--standalone", default=None,
+                    help="write a complete compilable .tex document with all results to this path")
     args = ap.parse_args()
 
-    main_mse = main_rows(args.sweep_dir, args.ref_dir, args.horizon, args.tol, "mse")
-    main_mae = main_rows(args.sweep_dir, args.ref_dir, args.horizon, args.tol, "mae")
-    blocks = frontier(args.sweep_dir, args.ref_dir, args.horizon, args.tol)
+    main_mse = main_rows(args.sweep_dir, args.ref_dir, args.horizon, args.tol, "mse", args.datasets)
+    main_mae = main_rows(args.sweep_dir, args.ref_dir, args.horizon, args.tol, "mae", args.datasets)
+    blocks = frontier(args.sweep_dir, args.ref_dir, args.horizon, args.tol, args.datasets)
     if not main_mse and not blocks:
         raise SystemExit(f"no sweep checkpoints under {args.sweep_dir}")
 
@@ -352,7 +472,7 @@ def main():
     print(render_frontier_md(blocks))
     print("\nn = seeds for reference / TSR-X / C2 / C3 (C3 also counts extra random draws). "
           "† failed validity check. ‡ TSR-X best-val value shown (no final-architecture metric). "
-          "★ knee.")
+          "§ knee at tightest budget tried (bounded by grid/architecture, not accuracy). ★ knee.")
 
     issues = [(a, d, c["issues"]) for a, d, _, c in main_mse if c["issues"]]
     if issues:
@@ -369,6 +489,13 @@ def main():
                 f.write(body + "\n")
         print(f"\nLaTeX written to {args.latex_dir}/ts_table_{{main_mse,main_mae,frontier}}.tex "
               f"(\\input them; needs booktabs)")
+
+    if args.standalone:
+        os.makedirs(os.path.dirname(args.standalone) or ".", exist_ok=True)
+        with open(args.standalone, "w") as f:
+            f.write(render_standalone(args, main_mse, main_mae, blocks))
+        print(f"\nStandalone document written to {args.standalone}\n"
+              f"  compile: pdflatex {os.path.basename(args.standalone)}   (run twice)")
 
 
 if __name__ == "__main__":
