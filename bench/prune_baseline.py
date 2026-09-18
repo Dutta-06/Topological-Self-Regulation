@@ -1,10 +1,18 @@
 """Structured-pruning baseline on the same plastic set as TSR-X (vision).
 
-Takes the archived dense reference, removes whole channels from exactly the
-coupling groups TSR-X was allowed to edit (a producer and a consumer, no
-task-fixed axis) until the deployed count reaches the matching C2 model's, then
-either fine-tunes the pruned network (inherited weights) or retrains the pruned
-width vector from scratch under the C2 recipe (Liu et al., 2019).
+Takes a dense reference, removes whole channels from exactly the coupling groups
+TSR-X was allowed to edit (a producer and a consumer, no task-fixed axis) until
+the deployed count reaches the matching C2 model's, then either fine-tunes the
+pruned network (inherited weights) or retrains the pruned width vector from
+scratch under the C2 recipe (Liu et al., 2019).
+
+Self-contained: the target count comes from bench/pruning_targets.json (the
+exact deployed count of the archived C2 for that cell) unless a C2 checkpoint
+is present, and the reference is whatever results/reference/ holds for the
+cell -- the archived one, or one trained on this machine by
+scripts/run_pruning_baselines.py with the shared recipe. Every run writes a
+JSON record next to its checkpoint with everything the comparison needs, so
+the .pt files never have to leave the machine.
 
 The pruning itself is tsrx/edit/pruning.py: removals go through
 `prune_group_index`, so residual trunks, depthwise pairs and SE branches are
@@ -22,9 +30,11 @@ Usage:
 
 import argparse
 import json
+import platform
+import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,6 +48,7 @@ from tsrx.edit.pruning import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+TARGETS = ROOT / "bench" / "pruning_targets.json"
 
 # arch name used by build_model -> key used in results/ filenames
 ARCH_KEY = {"resnet18": "resnet18", "vgg16_bn": "vgg16bn",
@@ -86,11 +97,16 @@ def evaluate(model, loader, device, batch_tf=None, use_amp=False) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Locating the arms
+# Locating the reference and the target
 # ---------------------------------------------------------------------------
 
+def reference_name(arch: str, dataset: str) -> str:
+    return f"{ARCH_KEY[arch]}_{dataset.replace('-', '_')}.pt"
+
+
 def find_reference(arch: str, dataset: str, cifar_stem: bool) -> Path:
-    """The dense reference for a cell, chosen by inspecting the checkpoint."""
+    """The dense reference for a cell, chosen by inspecting the checkpoint:
+    the stem must match the cell, and stamped-incomplete or aborted runs are refused."""
     key = ARCH_KEY[arch]
     ds = dataset.replace("-", "_")
     candidates = [ROOT / "results" / "reference" / f"{key}_{ds}_stem.pt",
@@ -102,12 +118,19 @@ def find_reference(arch: str, dataset: str, cifar_stem: bool) -> Path:
         ck = torch.load(path, map_location="cpu", weights_only=False)
         state = ck["model_state_dict"]
         ok = (state["conv1.weight"].shape[2] == 3) == cifar_stem if arch == "resnet18" else True
-        complete = ck.get("complete", True) and ck.get("epoch", 99) >= 10
+        complete = bool(ck.get("complete", True)) and int(ck.get("epoch", 99)) >= 10
         checked.append((path.name, ok, complete))
         if ok and complete:
             return path
     raise SystemExit(f"no usable dense reference for {arch}/{dataset} (cifar_stem={cifar_stem}); "
-                     f"inspected {checked}")
+                     f"inspected {checked}. Train one with bench/train_reference.py or let "
+                     f"scripts/run_pruning_baselines.py do it.")
+
+
+def load_targets() -> dict:
+    if not TARGETS.exists():
+        return {}
+    return json.loads(TARGETS.read_text(encoding="utf-8")).get("cells", {})
 
 
 def find_match(arch: str, dataset: str) -> Optional[Path]:
@@ -115,18 +138,43 @@ def find_match(arch: str, dataset: str) -> Optional[Path]:
     return path if path.exists() else None
 
 
+def find_target(arch: str, dataset: str) -> Tuple[int, str]:
+    """(target deployed count, where it came from): the archived C2 checkpoint
+    if present on this machine, else the committed table of exact C2 counts."""
+    match = find_match(arch, dataset)
+    if match is not None:
+        ck = torch.load(match, map_location="cpu", weights_only=False)
+        return int(ck["params"]), match.name
+    cell = load_targets().get(f"{arch}/{dataset}")
+    if cell is None:
+        raise SystemExit(f"no target for {arch}/{dataset}: no C2 checkpoint and no entry in "
+                         f"{TARGETS.relative_to(ROOT)}; pass --target-params")
+    return int(cell["target_params"]), f"pruning_targets.json ({cell['target_params']:,})"
+
+
+def environment() -> dict:
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                                capture_output=True, text=True).stdout.strip()
+    except Exception:
+        commit = ""
+    return {"git_commit": commit, "torch": torch.__version__, "python": platform.python_version(),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "hostname": platform.node()}
+
+
 # ---------------------------------------------------------------------------
 # Training (the C2 recipe)
 # ---------------------------------------------------------------------------
 
 def train(model, train_loader, val_loader, args, device, train_tf, eval_tf, epochs, lr,
-          record: dict, out: Path) -> float:
+          record: dict, out: Path) -> dict:
     use_amp = args.amp and device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=args.momentum,
                           weight_decay=args.weight_decay, nesterov=True)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs * len(train_loader))
-    best = 0.0
+    best, history, t_start = 0.0, [], time.time()
     for epoch in range(epochs):
         model.train()
         t0, tot, n = time.time(), 0.0, 0
@@ -150,6 +198,7 @@ def train(model, train_loader, val_loader, args, device, train_tf, eval_tf, epoc
         acc = evaluate(model, val_loader, device, batch_tf=eval_tf, use_amp=use_amp)
         is_best = acc > best
         best = max(best, acc)
+        history.append({"epoch": epoch, "loss": tot / n, "val_acc": acc, "seconds": time.time() - t0})
         print(f"epoch {epoch + 1:3d}/{epochs}  loss={tot / n:.4f}  val_acc={acc:.4f}  "
               f"best={best:.4f}  ({time.time() - t0:.1f}s)")
         if is_best:
@@ -159,7 +208,8 @@ def train(model, train_loader, val_loader, args, device, train_tf, eval_tf, epoc
     ck["complete"] = True
     ck["total_epochs"] = epochs
     torch.save(ck, out)
-    return best
+    return {"best_val_acc": best, "best_epoch": int(ck["epoch"]), "history": history,
+            "train_seconds": time.time() - t_start}
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +225,8 @@ def main() -> None:
     ap.add_argument("--mode", choices=MODES, default="finetune",
                     help="finetune: keep the reference weights; scratch: retrain the pruned width vector")
     ap.add_argument("--reference", default=None, help="dense reference checkpoint (default: auto)")
-    ap.add_argument("--match", default=None, help="C2 checkpoint whose deployed count is the target (default: auto)")
-    ap.add_argument("--target-params", type=int, default=None, help="explicit target instead of --match")
+    ap.add_argument("--target-params", type=int, default=None,
+                    help="explicit target (default: the C2 checkpoint, else bench/pruning_targets.json)")
     ap.add_argument("--min-width", type=int, default=8, help="width floor, as in TSR-X")
     ap.add_argument("--taylor-batches", type=int, default=50)
     ap.add_argument("--round-fraction", type=float, default=0.05)
@@ -213,24 +263,24 @@ def main() -> None:
     model = build_model(args.arch, num_classes, cifar_stem=cifar_stem)
     model.load_state_dict(ref_ck["model_state_dict"])
     ref_params = deployed_params(model)
-
     if args.target_params is not None:
-        target, match_name = args.target_params, None
+        target, target_source = args.target_params, "--target-params"
     else:
-        match_path = Path(args.match) if args.match else find_match(args.arch, args.dataset)
-        if match_path is None:
-            raise SystemExit("no C2 checkpoint to match; pass --match or --target-params")
-        match_ck = torch.load(match_path, map_location="cpu", weights_only=False)
-        target, match_name = int(match_ck["params"]), match_path.name
+        target, target_source = find_target(args.arch, args.dataset)
+    table = load_targets().get(f"{args.arch}/{args.dataset}", {})
+    if table and int(table["reference_params"]) != ref_params:
+        raise SystemExit(f"this reference has {ref_params:,} params but the archived one had "
+                         f"{table['reference_params']:,}: not the same architecture / stem")
 
     use_amp = args.amp and args.device.startswith("cuda")
     model = model.to(args.device)
     ref_top1 = evaluate(model, val_loader, args.device, batch_tf=eval_tf, use_amp=use_amp)
+    archived_note = f"  (archived reference: {table['reference_top1']:.2f}%)" if table else ""
     print(f"\n{'=' * 70}\n  PRUNING BASELINE  {args.criterion} / {args.mode}\n"
           f"  Arch / dataset     : {args.arch} / {args.dataset}\n"
-          f"  Reference          : {ref_path.name}  {ref_top1 * 100:.2f}% at {ref_params:,} params\n"
-          f"  Target             : {target:,} params ({100 * (target / ref_params - 1):+.2f}%)"
-          f"{'  = ' + match_name if match_name else ''}\n{'=' * 70}\n")
+          f"  Reference          : {ref_path.name}  {ref_top1 * 100:.2f}% at {ref_params:,} params{archived_note}\n"
+          f"  Target             : {target:,} params ({100 * (target / ref_params - 1):+.2f}%)  from {target_source}"
+          f"\n{'=' * 70}\n")
 
     # --- prune on the same plastic set ---------------------------------------
     bundles = editable_bundles(model.cpu(), example)
@@ -249,11 +299,12 @@ def main() -> None:
     t0 = time.time()
     events = prune_to_target(model, bundles, target, importance_fn, min_width=args.min_width,
                              round_fraction=args.round_fraction, log=print)
+    prune_seconds = time.time() - t0
     pruned_params = deployed_params(model)
     widths = {str(t): b.size for t, b in bundles.items()}
     with torch.no_grad():
         model.cpu().eval()(example)                   # every shape still legal
-    print(f"pruning took {time.time() - t0:.1f}s; {len(events)} channels removed from "
+    print(f"pruning took {prune_seconds:.1f}s; {len(events)} channels removed from "
           f"{sum(1 for t in bundles if widths[str(t)] != reference_widths[t])} of {len(bundles)} groups")
     if pruned_params > target:
         raise SystemExit(f"pruned model has {pruned_params:,} > target {target:,}")
@@ -276,17 +327,27 @@ def main() -> None:
         "arch": args.arch, "dataset": args.dataset, "cifar_stem": cifar_stem,
         "criterion": args.criterion, "mode": args.mode,
         "reference": ref_path.name, "reference_params": ref_params, "reference_top1": ref_top1,
-        "match": match_name, "target_params": target, "params": pruned_params,
+        "reference_trained_here": bool(ref_ck.get("trained_for") == "pruning-baselines"),
+        "target_source": target_source, "target_params": target, "params": pruned_params,
         "pruned_top1_before_training": pruned_top1,
         "reference_widths": {str(t): w for t, w in reference_widths.items()},
-        "discovered_widths": widths, "removed": len(events),
-        "epochs": epochs, "lr": lr, "args": vars(args),
+        "discovered_widths": widths, "removed": len(events), "prune_seconds": prune_seconds,
+        "epochs": epochs, "lr": lr, "batch_size": batch_size, "args": vars(args),
+        "environment": environment(),
     }
-    best = train(model, train_loader, val_loader, args, args.device, train_tf, eval_tf,
-                 epochs, lr, record, out)
+    outcome = train(model, train_loader, val_loader, args, args.device, train_tf, eval_tf,
+                    epochs, lr, record, out)
     out.with_suffix(".events.json").write_text(json.dumps(events), encoding="utf-8")
-    print(f"\n{'=' * 70}\n  {record['control']}  best {best * 100:.2f}% at {pruned_params:,} params "
-          f"(reference {ref_top1 * 100:.2f}% at {ref_params:,})\n{'=' * 70}")
+
+    # The committable record: everything the comparison needs, no tensors.
+    summary = {k: v for k, v in record.items() if k != "args"}
+    summary.update({"best_top1": outcome["best_val_acc"], "best_epoch": outcome["best_epoch"],
+                    "train_seconds": outcome["train_seconds"], "history": outcome["history"],
+                    "archived": {k: table[k] for k in ("reference_top1", "c2_top1", "tsr_top1")} if table else None,
+                    "checkpoint": out.name, "complete": True})
+    out.with_suffix(".json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"\n{'=' * 70}\n  {record['control']}  best {outcome['best_val_acc'] * 100:.2f}% at {pruned_params:,} params "
+          f"(reference here {ref_top1 * 100:.2f}% at {ref_params:,})\n  record: {out.with_suffix('.json')}\n{'=' * 70}")
 
 
 if __name__ == "__main__":

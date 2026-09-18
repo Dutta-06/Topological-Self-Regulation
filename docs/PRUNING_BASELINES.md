@@ -60,27 +60,52 @@ Two modes, both under the shared training recipe:
 
 ## Running
 
+The branch is self-contained: it needs the datasets and nothing else. No
+archived checkpoint has to be copied to the run machine.
+
+- **Target count.** `bench/pruning_targets.json` records, per cell, the exact
+  deployed count of the archived C2 model (and the archived Ref/C2/TSR top-1
+  for the comparison table). The driver uses a C2 checkpoint if one is present
+  and the table otherwise.
+- **Reference.** If `results/reference/` has no usable dense reference for a
+  cell, `scripts/run_pruning_baselines.py` trains one with the shared recipe
+  (`bench/train_reference.py`, 100 epochs, seed 42) and stamps it complete.
+  Its parameter count is checked against the archived reference's, and its
+  own top-1 is recorded with every pruned result, since a reference trained
+  on another machine differs from the archived one by seed and hardware.
+- **Records.** Each run writes `results/pruned/<cell>_<criterion>_<mode>.json`
+  (accuracy before and after training, counts, widths, timing, environment)
+  next to the ignored `.pt`. Commit the JSON files; they are all the
+  comparison needs.
+
 Vision (`bench/prune_baseline.py`):
 
 ```bash
-# one cell
-python -m bench.prune_baseline --arch resnet18 --dataset cifar100 --criterion l1 \
-    --mode finetune --num-workers 4 --out results/pruned/resnet18_cifar100_l1_finetune.pt
+git checkout pruning-baselines
+python -m pytest tests/test_prune_baseline.py -q          # 4 tests, CPU
 
-# every vision cell that has a C2 arm; resumable
-python scripts/run_pruning_baselines.py --criteria l1 bnscale --modes finetune
-python scripts/run_pruning_baselines.py --criteria l1 --modes scratch --cells resnet18/cifar100
+# every cell with a target; trains missing references first; resumable
+python scripts/run_pruning_baselines.py --num-workers 8
+# the from-scratch (allocation-only) row where wanted
+python scripts/run_pruning_baselines.py --num-workers 8 --criteria l1 --modes scratch \
+    --cells resnet18/cifar100 vgg16_bn/cifar100 mobilenet_v2/cifar100 efficientnet_b0/cifar100
+# list the jobs without running
+python scripts/run_pruning_baselines.py --dry-run
 
-# tabulate against Ref / C2 / TSR
-python scripts/eval_pruning_baselines.py
+# table (Markdown + CSV; --latex also prints rows in the paper's format)
+python scripts/eval_pruning_baselines.py --latex
+git add results/pruned/*.json results/pruning_baselines.csv
 ```
 
-The reference is chosen by inspecting the checkpoint (ResNet's stem must match
-the cell; aborted checkpoints are refused), and the target is read from the
-matching `results/static_matched/*_two_regime.pt`. Each output carries the
-reference's and the pruned-before-training top-1, the removed-channel log
-(`*.events.json`), and `discovered_widths` in the same form as a TSR-X
-checkpoint, so `bench/train_static_matched.py` can rebuild it.
+One cell by hand:
+
+```bash
+python -m bench.prune_baseline --arch resnet18 --dataset cifar100 --criterion l1 \
+    --mode finetune --num-workers 8 --out results/pruned/resnet18_cifar100_l1_finetune.pt
+```
+
+Training the 13 references adds about one full-recipe run per cell (roughly
+18 h on a Titan RTX in total, dominated by ImageNet-100 and Tiny-ImageNet).
 
 Forecasting (`bench/prune_baseline_ts.py`, written against the `tsrx-time`
 harness: `bench.ts_models`, `bench.resize`, `data.ltsf`, `bench.c3_random`):
@@ -120,6 +145,7 @@ Per criterion, prune + fine-tune, from the measured 100-epoch static runs:
 | | CIFAR-10 | CIFAR-100 | Tiny-IN | ImageNet-100 |
 |---|---|---|---|---|
 | RTX 4060 laptop | ~1 h / cell | ~1 h / cell | 1–3 h / cell | 3–20 h / cell |
+| Titan RTX | ~25 min | ~25 min | 0.3–1.3 h | 1.2–8 h |
 | Blackwell 6000 | ~12 min | ~12 min | ~10–25 min | 0.5–2.5 h |
 
 About 48 h per criterion on the laptop for the 13 complete cells, ~6.5 h on

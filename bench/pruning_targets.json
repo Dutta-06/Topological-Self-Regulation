@@ -1,0 +1,136 @@
+{
+  "note": "Per-cell targets for the pruning baselines. target_params is the exact deployed count of the archived C2 (static-matched) checkpoint; reference_params that of the archived dense reference; the top-1 values are the paper's re-measured accuracies (full held-out split, one seed) and are used only to build the comparison table on a machine without the archived checkpoints.",
+  "measured_on": "2026-09-17, results/vision_reeval_all_arms.csv",
+  "cells": {
+    "resnet18/cifar10": {
+      "arch": "resnet18",
+      "dataset": "cifar10",
+      "reference_params": 11173962,
+      "target_params": 9497686,
+      "reference_top1": 95.01,
+      "c2_top1": 95.08,
+      "tsr_top1": 94.7,
+      "n_val": 10000
+    },
+    "resnet18/cifar100": {
+      "arch": "resnet18",
+      "dataset": "cifar100",
+      "reference_params": 11220132,
+      "target_params": 9536305,
+      "reference_top1": 77.9,
+      "c2_top1": 77.63,
+      "tsr_top1": 77.62,
+      "n_val": 10000
+    },
+    "resnet18/tiny_imagenet": {
+      "arch": "resnet18",
+      "dataset": "tiny_imagenet",
+      "reference_params": 11271432,
+      "target_params": 9580578,
+      "reference_top1": 65.85,
+      "c2_top1": 65.33,
+      "tsr_top1": 66.14,
+      "n_val": 10000
+    },
+    "resnet18/imagenet100": {
+      "arch": "resnet18",
+      "dataset": "imagenet100",
+      "reference_params": 11227812,
+      "target_params": 9543190,
+      "reference_top1": 82.98,
+      "c2_top1": 82.72,
+      "tsr_top1": 82.46,
+      "n_val": 5000
+    },
+    "vgg16_bn/cifar10": {
+      "arch": "vgg16_bn",
+      "dataset": "cifar10",
+      "reference_params": 14728266,
+      "target_params": 12513661,
+      "reference_top1": 93.78,
+      "c2_top1": 93.66,
+      "tsr_top1": 93.46,
+      "n_val": 10000
+    },
+    "vgg16_bn/cifar100": {
+      "arch": "vgg16_bn",
+      "dataset": "cifar100",
+      "reference_params": 14774436,
+      "target_params": 12553018,
+      "reference_top1": 73.36,
+      "c2_top1": 73.32,
+      "tsr_top1": 73.39,
+      "n_val": 10000
+    },
+    "vgg16_bn/tiny_imagenet": {
+      "arch": "vgg16_bn",
+      "dataset": "tiny_imagenet",
+      "reference_params": 14825736,
+      "target_params": 12601243,
+      "reference_top1": 62.32,
+      "c2_top1": 62.39,
+      "tsr_top1": 62.07,
+      "n_val": 10000
+    },
+    "mobilenet_v2/cifar10": {
+      "arch": "mobilenet_v2",
+      "dataset": "cifar10",
+      "reference_params": 2236682,
+      "target_params": 1872999,
+      "reference_top1": 90.99,
+      "c2_top1": 90.78,
+      "tsr_top1": 90.72,
+      "n_val": 10000
+    },
+    "mobilenet_v2/cifar100": {
+      "arch": "mobilenet_v2",
+      "dataset": "cifar100",
+      "reference_params": 2351972,
+      "target_params": 1992323,
+      "reference_top1": 68.09,
+      "c2_top1": 66.8,
+      "tsr_top1": 68.19,
+      "n_val": 10000
+    },
+    "mobilenet_v2/tiny_imagenet": {
+      "arch": "mobilenet_v2",
+      "dataset": "tiny_imagenet",
+      "reference_params": 2480072,
+      "target_params": 2101085,
+      "reference_top1": 44.74,
+      "c2_top1": 43.07,
+      "tsr_top1": 44.76,
+      "n_val": 10000
+    },
+    "efficientnet_b0/cifar10": {
+      "arch": "efficientnet_b0",
+      "dataset": "cifar10",
+      "reference_params": 4020358,
+      "target_params": 3417087,
+      "reference_top1": 90.78,
+      "c2_top1": 90.61,
+      "tsr_top1": 90.21,
+      "n_val": 10000
+    },
+    "efficientnet_b0/cifar100": {
+      "arch": "efficientnet_b0",
+      "dataset": "cifar100",
+      "reference_params": 4135648,
+      "target_params": 3515277,
+      "reference_top1": 68.51,
+      "c2_top1": 67.99,
+      "tsr_top1": 67.6,
+      "n_val": 10000
+    },
+    "efficientnet_b0/tiny_imagenet": {
+      "arch": "efficientnet_b0",
+      "dataset": "tiny_imagenet",
+      "reference_params": 4263748,
+      "target_params": 3604306,
+      "reference_top1": 51.49,
+      "c2_top1": 50.71,
+      "tsr_top1": 51.13,
+      "n_val": 10000
+    }
+  }
+}
