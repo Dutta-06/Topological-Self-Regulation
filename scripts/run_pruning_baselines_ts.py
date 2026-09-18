@@ -36,6 +36,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--matches", default="results/ts_static_matched", help="directory of C2 checkpoints")
     ap.add_argument("--only", nargs="*", default=None, help="substrings a C2 stem must contain")
+    ap.add_argument("--exclude", nargs="*", default=None, help="substrings that drop a C2 stem, e.g. _s43 _s44")
     ap.add_argument("--criteria", nargs="*", choices=CRITERIA, default=["l1", "taylor"])
     ap.add_argument("--modes", nargs="*", choices=MODES, default=["finetune"])
     ap.add_argument("--dry-run", action="store_true")
@@ -45,6 +46,8 @@ def main() -> None:
     matches = sorted((ROOT / args.matches).glob("*.pt"))
     if args.only:
         matches = [m for m in matches if any(s in m.stem for s in args.only)]
+    if args.exclude:
+        matches = [m for m in matches if not any(s in m.stem for s in args.exclude)]
     jobs = [(m, c, mode) for m in matches for c in args.criteria for mode in args.modes]
     out_dir = ROOT / "results" / "ts_pruned"
     todo = [(m, c, mode) for m, c, mode in jobs

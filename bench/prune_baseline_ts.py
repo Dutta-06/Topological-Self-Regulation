@@ -21,6 +21,7 @@ Usage (paths follow scripts/overnight_ts.sh):
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,11 +62,15 @@ def reference_for(match_path: Path, match_ck: dict) -> Path:
     from names the cell, and the campaign stores its reference under the same
     tag in results/ts_reference/."""
     src = match_ck.get("args", {}).get("tsrx_checkpoint")
-    tag = Path(src).stem if src else match_path.stem
-    for cand in (ROOT / "results" / "ts_reference" / f"{tag}.pt",
-                 match_path.parent.parent / "ts_reference" / f"{tag}.pt"):
-        if cand.exists():
-            return cand
+    stem = Path(src).stem if src else match_path.stem
+    # sweep names are <kind>_<tag>_br<budget>[_s<seed>|_c<draw>]; the reference is just <tag>
+    tag = re.sub(r"_br[0-9.]+(_s\d+|_c\d+)?$", "", re.sub(r"^(tsrx|c2|c3)_", "", stem))
+    # the campaign leaves the TCN untagged, but its references are stored as tcn_<cell>
+    for t in (tag, f"tcn_{tag}"):
+        for cand in (ROOT / "results" / "ts_reference" / f"{t}.pt",
+                     match_path.parent.parent / "ts_reference" / f"{t}.pt"):
+            if cand.exists():
+                return cand
     raise SystemExit(f"no dense reference found for {match_path.name} (looked for ts_reference/{tag}.pt)")
 
 
