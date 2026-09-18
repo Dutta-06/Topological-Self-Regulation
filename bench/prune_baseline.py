@@ -1,4 +1,4 @@
-"""Structured-pruning baseline on the same plastic set as TSR-X.
+"""Structured-pruning baseline on the same plastic set as TSR-X (vision).
 
 Takes the archived dense reference, removes whole channels from exactly the
 coupling groups TSR-X was allowed to edit (a producer and a consumer, no
@@ -6,18 +6,14 @@ task-fixed axis) until the deployed count reaches the matching C2 model's, then
 either fine-tunes the pruned network (inherited weights) or retrains the pruned
 width vector from scratch under the C2 recipe (Liu et al., 2019).
 
-Removals go through `tsrx.edit.edits.prune_group_index`, so every producer,
-affine and consumer slot of a group -- residual trunks, depthwise pairs, SE
-branches -- is edited by index exactly as TSR-X edits it, and the count is the
-real tensor extent. Nothing here gives the baseline an action TSR-X lacked, and
-nothing denies it one TSR-X had, except growth: pruning only removes.
+The pruning itself is tsrx/edit/pruning.py: removals go through
+`prune_group_index`, so residual trunks, depthwise pairs and SE branches are
+edited by index exactly as TSR-X edits them, and the count is the real tensor
+extent. Nothing here gives the baseline an action TSR-X lacked, and nothing
+denies it one TSR-X had, except growth: pruning only removes.
 
-Criteria (importance of a channel, ranked globally after per-group mean
-normalisation so groups of different kernel size are comparable):
-    l1       L1 norm of the channel's producer weights (Li et al., 2017)
-    bnscale  |gamma| of the group's BatchNorm scale (Liu et al., 2017)
-    taylor   |activation x gradient| via the paper's own first-order saliency,
-             accumulated over minibatches (Molchanov et al., 2017)
+Criteria: l1 (Li et al., 2017), bnscale (Liu et al., 2017), taylor (Molchanov
+et al., 2017, via the paper's own first-order saliency).
 
 Usage:
     python -m bench.prune_baseline --arch resnet18 --dataset cifar100 \
@@ -28,7 +24,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -36,11 +32,10 @@ from tqdm import tqdm
 
 from bench.models import build_model
 from bench.train_static_matched import resize_model_to_widths
-from tsrx.edit.edits import prune_group_index
-from tsrx.graph.bundle import IndexBundle, build_all_bundles
-from tsrx.graph.groups import discover_groups
-from tsrx.graph.trace import trace_model
-from tsrx.sense.saliency import first_order_saliency
+from tsrx.edit.pruning import (
+    deployed_params, editable_bundles, importance_bnscale, importance_l1,
+    make_importance_taylor, prune_to_target,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -90,10 +85,6 @@ def evaluate(model, loader, device, batch_tf=None, use_amp=False) -> float:
     return correct / max(total, 1)
 
 
-def deployed_params(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
 # ---------------------------------------------------------------------------
 # Locating the arms
 # ---------------------------------------------------------------------------
@@ -110,10 +101,7 @@ def find_reference(arch: str, dataset: str, cifar_stem: bool) -> Path:
             continue
         ck = torch.load(path, map_location="cpu", weights_only=False)
         state = ck["model_state_dict"]
-        if arch == "resnet18":
-            ok = (state["conv1.weight"].shape[2] == 3) == cifar_stem
-        else:
-            ok = True
+        ok = (state["conv1.weight"].shape[2] == 3) == cifar_stem if arch == "resnet18" else True
         complete = ck.get("complete", True) and ck.get("epoch", 99) >= 10
         checked.append((path.name, ok, complete))
         if ok and complete:
@@ -125,134 +113,6 @@ def find_reference(arch: str, dataset: str, cifar_stem: bool) -> Path:
 def find_match(arch: str, dataset: str) -> Optional[Path]:
     path = ROOT / "results" / "static_matched" / f"{ARCH_KEY[arch]}_{dataset.replace('-', '_')}_two_regime.pt"
     return path if path.exists() else None
-
-
-# ---------------------------------------------------------------------------
-# Importance criteria
-# ---------------------------------------------------------------------------
-
-def editable_bundles(model: nn.Module, example: torch.Tensor) -> Dict[int, IndexBundle]:
-    """Exactly the groups CandidateBank attaches to: producer + consumer, quantum 1."""
-    traced = trace_model(model.eval(), (example,))
-    result = discover_groups(traced)
-    bundles = build_all_bundles(result, model)
-    return {t: b for t, b in bundles.items()
-            if b.size and b.producer_slots and b.consumer_slots and b.quantum == 1}
-
-
-def importance_l1(model, bundles) -> Dict[int, torch.Tensor]:
-    modules = dict(model.named_modules())
-    out = {}
-    for tap, bd in bundles.items():
-        total = torch.zeros(bd.size)
-        seen = set()
-        for slot in bd.producer_slots:
-            if slot.module_name in seen:
-                continue
-            seen.add(slot.module_name)
-            w = modules[slot.module_name].weight.detach().float().cpu()
-            total += w.abs().reshape(w.shape[0], -1).sum(1)
-        out[tap] = total
-    return out
-
-
-def importance_bnscale(model, bundles) -> Dict[int, torch.Tensor]:
-    modules = dict(model.named_modules())
-    fallback = importance_l1(model, bundles)
-    out = {}
-    for tap, bd in bundles.items():
-        gammas, seen = [], set()
-        for slot in bd.affine_slots:
-            if slot.module_name in seen:
-                continue
-            seen.add(slot.module_name)
-            mod = modules[slot.module_name]
-            if getattr(mod, "weight", None) is not None:
-                gammas.append(mod.weight.detach().float().cpu().abs())
-        out[tap] = torch.stack(gammas).mean(0) if gammas else fallback[tap]
-    return out
-
-
-def make_importance_taylor(loader, device, batch_tf, n_batches: int) -> Callable:
-    """|<u_j, v_j>| accumulated over `n_batches` minibatches: the released
-    controller's own removal statistic, read from the same .grad tensors."""
-    def importance(model, bundles):
-        model.eval()                        # frozen BN statistics, gradients still flow
-        acc = {tap: torch.zeros(bd.size) for tap, bd in bundles.items()}
-        it = iter(loader)
-        for _ in range(n_batches):
-            try:
-                x, y = next(it)
-            except StopIteration:
-                break
-            x, y = x.to(device), y.to(device)
-            if batch_tf is not None:
-                x = batch_tf(x)
-            model.zero_grad(set_to_none=True)
-            nn.functional.cross_entropy(model(x), y).backward()
-            for tap, bd in bundles.items():
-                acc[tap] += first_order_saliency(model, bd, bd.size).detach().cpu()
-        model.zero_grad(set_to_none=True)
-        return acc
-    return importance
-
-
-IMPORTANCE = {"l1": importance_l1, "bnscale": importance_bnscale}
-
-
-# ---------------------------------------------------------------------------
-# Greedy global pruning to a parameter target
-# ---------------------------------------------------------------------------
-
-def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: int,
-                    importance_fn: Callable, min_width: int = 8,
-                    round_fraction: float = 0.05, log: Optional[Callable] = None) -> List[dict]:
-    """Remove the globally least important channels until deployed_params <= target.
-
-    Importance is normalised by its group mean before ranking, and recomputed
-    after each round (a round removes at most `round_fraction` of the channels
-    still to be removed, at least one), so index shifts and interactions are
-    respected without a full recompute per channel.
-    """
-    events = []
-    start = deployed_params(model)
-    while deployed_params(model) > target:
-        scores = importance_fn(model, bundles)
-        ranked = []
-        for tap, bd in bundles.items():
-            if bd.size <= min_width:
-                continue
-            s = scores[tap]
-            norm = s / s.mean().clamp_min(1e-12)
-            for idx in range(bd.size):
-                ranked.append((float(norm[idx]), tap, idx))
-        if not ranked:
-            raise SystemExit("every editable group is at its width floor before the target was reached")
-        ranked.sort()
-
-        gap_channels = sum(bd.size - min_width for bd in bundles.values())
-        budget = max(1, int(round_fraction * gap_channels))
-        removed_this_round: Dict[int, List[int]] = {}
-        for _score, tap, idx in ranked:
-            if budget == 0 or deployed_params(model) <= target:
-                break
-            taken = removed_this_round.setdefault(tap, [])
-            if bundles[tap].size - len(taken) <= min_width:
-                continue
-            # Indices removed earlier in this round shift later ones down.
-            shifted = idx - sum(1 for j in taken if j < idx)
-            before = deployed_params(model)
-            prune_group_index(model, bundles[tap], shifted)
-            taken.append(idx)
-            budget -= 1
-            events.append({"tap": tap, "index": idx, "importance": _score,
-                           "params_before": before, "params_after": deployed_params(model)})
-        if log:
-            log(f"  round: {deployed_params(model):,} params ({len(events)} removed)")
-    if log:
-        log(f"pruned {start:,} -> {deployed_params(model):,} (target {target:,}, "
-            f"{len(events)} channels removed)")
-    return events
 
 
 # ---------------------------------------------------------------------------
@@ -373,14 +233,19 @@ def main() -> None:
           f"{'  = ' + match_name if match_name else ''}\n{'=' * 70}\n")
 
     # --- prune on the same plastic set ---------------------------------------
-    model_cpu = model.cpu()
-    bundles = editable_bundles(model_cpu, example)
+    bundles = editable_bundles(model.cpu(), example)
     reference_widths = {t: b.size for t, b in bundles.items()}
+    model.to(args.device)
     if args.criterion == "taylor":
-        model.to(args.device)
-        importance_fn = make_importance_taylor(train_loader, args.device, train_tf, args.taylor_batches)
+        def loss_of(m, batch):
+            x, y = batch
+            x, y = x.to(args.device), y.to(args.device)
+            if train_tf is not None:
+                x = train_tf(x)
+            return nn.functional.cross_entropy(m(x), y)
+        importance_fn = make_importance_taylor(lambda: iter(train_loader), loss_of, args.taylor_batches)
     else:
-        importance_fn = IMPORTANCE[args.criterion]
+        importance_fn = {"l1": importance_l1, "bnscale": importance_bnscale}[args.criterion]
     t0 = time.time()
     events = prune_to_target(model, bundles, target, importance_fn, min_width=args.min_width,
                              round_fraction=args.round_fraction, log=print)
@@ -419,7 +284,7 @@ def main() -> None:
     }
     best = train(model, train_loader, val_loader, args, args.device, train_tf, eval_tf,
                  epochs, lr, record, out)
-    (out.with_suffix(".events.json")).write_text(json.dumps(events), encoding="utf-8")
+    out.with_suffix(".events.json").write_text(json.dumps(events), encoding="utf-8")
     print(f"\n{'=' * 70}\n  {record['control']}  best {best * 100:.2f}% at {pruned_params:,} params "
           f"(reference {ref_top1 * 100:.2f}% at {ref_params:,})\n{'=' * 70}")
 

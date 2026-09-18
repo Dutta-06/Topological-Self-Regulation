@@ -60,8 +60,9 @@ def test_taylor_importance_reads_saliency():
     bundles = editable_bundles(model, example)
     x = torch.randn(8, 3, 32, 32)
     y = torch.randint(0, 100, (8,))
-    loader = [(x, y)] * 2
-    fn = make_importance_taylor(loader, "cpu", None, n_batches=2)
+    fn = make_importance_taylor(lambda: iter([(x, y)] * 2),
+                                lambda m, b: torch.nn.functional.cross_entropy(m(b[0]), b[1]),
+                                n_batches=2)
     scores = fn(model, bundles)
     assert all(scores[t].shape == (b.size,) for t, b in bundles.items())
     assert any(scores[t].sum() > 0 for t in bundles)

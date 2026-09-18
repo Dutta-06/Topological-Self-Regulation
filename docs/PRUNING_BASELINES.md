@@ -28,9 +28,9 @@ lives, so it matters more there.
 
 ## Why it is built on the TSR-X engine, not torch-pruning
 
-A fair baseline needs the same action space. `bench/prune_baseline.py` removes
-channels with `tsrx.edit.edits.prune_group_index`, the same by-index edit the
-controller uses, over exactly the coupling groups `CandidateBank` attaches to
+A fair baseline needs the same action space. The core, `tsrx/edit/pruning.py`,
+removes channels with `tsrx.edit.edits.prune_group_index`, the same by-index
+edit the controller uses, over exactly the coupling groups `CandidateBank` attaches to
 (producer + consumer, quantum 1, no task-fixed axis). Residual trunks,
 depthwise pairs and SE branches are therefore edited as coupled groups, the
 parameter count is the real tensor extent, and the width floor (8) is TSR-X's.
@@ -60,6 +60,8 @@ Two modes, both under the shared training recipe:
 
 ## Running
 
+Vision (`bench/prune_baseline.py`):
+
 ```bash
 # one cell
 python -m bench.prune_baseline --arch resnet18 --dataset cifar100 --criterion l1 \
@@ -80,6 +82,37 @@ reference's and the pruned-before-training top-1, the removed-channel log
 (`*.events.json`), and `discovered_widths` in the same form as a TSR-X
 checkpoint, so `bench/train_static_matched.py` can rebuild it.
 
+Forecasting (`bench/prune_baseline_ts.py`, written against the `tsrx-time`
+harness: `bench.ts_models`, `bench.resize`, `data.ltsf`, `bench.c3_random`):
+
+```bash
+# one cell: the C2 checkpoint names the cell and fixes the target count
+python -m bench.prune_baseline_ts --match results/ts_static_matched/tcn_ci_weather_h96.pt \
+    --criterion l1 --mode finetune --out results/ts_pruned/tcn_ci_weather_h96_l1_finetune.pt
+
+# every archived C2 (every backbone x dataset x horizon x budget); resumable
+python scripts/run_pruning_baselines_ts.py --criteria l1 taylor --modes finetune
+python scripts/run_pruning_baselines_ts.py --only weather_h96 --modes scratch
+
+# tabulate against Ref / C2 / TSR-X / C3
+python scripts/eval_pruning_baselines_ts.py
+```
+
+The forecasting driver takes its plastic set from `bench.c3_random.attachable_taps`
+with the safety probe, i.e. the same allowlist C3 and the discovery run used,
+so LayerNorm-spanned residual widths and attention projections are never
+pruned. It inherits the discovery run's lr, weight decay and batch size (a
+PatchTST fine-tuned at the TCN's lr is not a matched control), fine-tunes 20
+epochs by default, and in `scratch` mode trains 50 epochs exactly as C2 does.
+`bnscale` applies to the TCN only; other backbones fall back to `l1`, so use
+`l1` + `taylor` there. The knee comparison is then C2's test MSE against the
+pruned model's at the same count, and the frontier comparison is the same over
+every budget the campaign archived.
+
+The forecasting driver and its test only import when the `tsrx-time` modules
+are present: run them on that branch or on a merge of the two. The vision
+driver, the core and their tests run here.
+
 ## Cost
 
 Per criterion, prune + fine-tune, from the measured 100-epoch static runs:
@@ -90,17 +123,23 @@ Per criterion, prune + fine-tune, from the measured 100-epoch static runs:
 | Blackwell 6000 | ~12 min | ~12 min | ~10–25 min | 0.5–2.5 h |
 
 About 48 h per criterion on the laptop for the 13 complete cells, ~6.5 h on
-Blackwell; `scratch` mode costs 2.5x. The three ImageNet-100 cells without a C2
+Blackwell; `scratch` mode costs 2.5x. Forecasting is small by comparison
+(roughly 19 h per criterion on the laptop for the 12 knee cells with 50-epoch
+fine-tunes, dominated by PatchTST on Electricity/Traffic; ~3 h on Blackwell;
+the 20-epoch default is 0.4 of that). The three ImageNet-100 cells without a C2
 arm (VGG-16-BN, MobileNetV2, EfficientNet-B0) must have their Ref/TSR/C2 arms
 trained first; the runner skips them until then.
 
-## Forecasting
+## Forecasting: what differs from vision
 
-The forecasting models live on the `tsrx-time` branch. `prune_to_target`,
-`editable_bundles` and the three importance functions are model-agnostic and
-take any traced module; the forecasting driver needs that branch's model
-definitions and loaders, the knee's C2 count as the target, and `l1` + `taylor`
-as criteria (`bnscale` does not apply to LayerNorm/MLP backbones).
+- The count is matched per C2 checkpoint, not per cell: the campaign archives
+  one C2 per budget, so the pruned frontier is built by matching each one.
+- Two criteria (`l1`, `taylor`); no BatchNorm scale on the transformer/MLP
+  backbones.
+- The reference is the cell's `results/ts_reference/<tag>.pt`, located from the
+  TSR-X checkpoint the C2 records.
+- Metric is test MSE at the best-validation epoch, saved alongside MAE, as in
+  the other arms, so `analysis/collect_results.py` conventions carry over.
 
 ## Paper
 
