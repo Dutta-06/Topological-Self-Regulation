@@ -32,6 +32,14 @@ ARCH_LABEL = {"resnet18": "ResNet-18", "vgg16_bn": "VGG-16-BN", "mobilenet_v2": 
 DATA_LABEL = {"cifar10": "C-10", "cifar100": "C-100", "tiny_imagenet": "Tiny-IN", "imagenet100": "IN-100"}
 ORDER = ["resnet18", "vgg16_bn", "mobilenet_v2", "efficientnet_b0"]
 DORDER = ["cifar10", "cifar100", "tiny_imagenet", "imagenet100"]
+CRIT_ORDER = ["l1", "bnscale", "taylor", "depgraph"]
+MODE_ORDER = ["finetune", "scratch"]
+
+
+def col_key(col: str):
+    crit, mode = col.split("/")
+    return (CRIT_ORDER.index(crit) if crit in CRIT_ORDER else len(CRIT_ORDER),
+            MODE_ORDER.index(mode) if mode in MODE_ORDER else len(MODE_ORDER))
 
 
 def main() -> None:
@@ -58,7 +66,7 @@ def main() -> None:
     if not cells:
         raise SystemExit("no complete pruning records under results/pruned/*.json")
 
-    cols = sorted({c for r in cells.values() for c in r if "/" in c})
+    cols = sorted({c for r in cells.values() for c in r if "/" in c}, key=col_key)
     rows = []
     for arch in ORDER:
         for dataset in DORDER:

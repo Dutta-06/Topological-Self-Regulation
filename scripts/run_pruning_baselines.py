@@ -17,6 +17,7 @@ Every step is resumable: existing complete outputs are skipped.
 Usage:
     python scripts/run_pruning_baselines.py --num-workers 8              # everything
     python scripts/run_pruning_baselines.py --criteria l1 --modes scratch --cells resnet18/cifar100
+    python scripts/run_pruning_baselines.py --criteria depgraph --modes finetune scratch
     python scripts/run_pruning_baselines.py --dry-run
 """
 
@@ -81,7 +82,7 @@ def ensure_reference(arch: str, dataset: str, num_workers: int, dry_run: bool) -
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cells", nargs="*", default=None, help="arch/dataset pairs; default: every cell with a target")
-    ap.add_argument("--criteria", nargs="*", choices=CRITERIA, default=["l1", "bnscale"])
+    ap.add_argument("--criteria", nargs="*", choices=CRITERIA, default=["l1", "bnscale", "depgraph"])
     ap.add_argument("--modes", nargs="*", choices=MODES, default=["finetune"])
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--no-train-reference", action="store_true",

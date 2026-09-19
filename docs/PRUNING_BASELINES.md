@@ -43,11 +43,37 @@ Criteria, ranked globally after per-group mean normalisation:
 | `l1` | L1 norm of the channel's producer weights | Li et al., 2017 |
 | `bnscale` | mean \|gamma\| over the group's BatchNorm scales | Liu et al., 2017 (network slimming) |
 | `taylor` | \|activation x gradient\| via `tsrx.sense.saliency.first_order_saliency`, i.e. the controller's own removal statistic | Molchanov et al., 2017 |
+| `depgraph` | DepGraph's group L2 norm (`GroupMagnitudeImportance`), pruned by the torch-pruning library itself | Fang et al., 2023 |
 
 Pruning is greedy and iterative: importance is recomputed after every round
 (at most 5% of the remaining channels), and removal stops when the deployed
 count is at or below the target. The last channel can undershoot by at most
 its own cost; the runner refuses a result more than 1% under the target.
+
+### The DepGraph arm
+
+`depgraph` is the one criterion not executed by TSR-X's edit. The reference
+is handed to torch-pruning (`tsrx/edit/depgraph.py`): its `DependencyGraph`
+finds the coupled layers, its `GroupMagnitudeImportance` (the DepGraph paper's
+group-norm criterion, L2 aggregated over every layer of a group) ranks them
+globally after per-group mean normalisation, and its `MetaPruner` removes
+them, importance recomputed every step. The comparison protocol is imposed
+from outside the library:
+
+- every Conv/Linear whose output is not a producer of a TSR-X coupling group
+  is an ignored layer, so the plastic set is exactly TSR-X's;
+- the width floor (8) is enforced on every step;
+- pruning stops at the matched C2 count, with the last group trimmed to its
+  least important channels so the undershoot is under one channel's cost
+  (below 0.05% on all four backbones).
+
+Before pruning, `depgraph_group_report` checks that DepGraph's groups and
+TSR-X's coupling groups agree (same producer modules, grouped the same way);
+they do on all four backbones (12, 13, 25 and 40 groups), and the driver
+refuses a cell where they would not. Sparse learning, the regulariser DepGraph
+can train with before pruning, is not used: it changes the reference's
+training recipe, and every arm here prunes the same reference. The record
+stores the library version and settings under `criterion_details`.
 
 Two modes, both under the shared training recipe:
 
@@ -82,10 +108,13 @@ Vision (`bench/prune_baseline.py`):
 
 ```bash
 git checkout pruning-baselines
-python -m pytest tests/test_prune_baseline.py -q          # 4 tests, CPU
+pip install 'torch-pruning>=1.5'                         # the depgraph criterion
+python -m pytest tests/test_prune_baseline.py tests/test_depgraph_baseline.py -q   # CPU
 
-# every cell with a target; trains missing references first; resumable
+# every cell with a target (l1, bnscale, depgraph; finetune); trains missing references first; resumable
 python scripts/run_pruning_baselines.py --num-workers 8
+# DepGraph in both modes on every cell (the scratch row is the allocation-only comparison)
+python scripts/run_pruning_baselines.py --num-workers 8 --criteria depgraph --modes finetune scratch
 # the from-scratch (allocation-only) row where wanted
 python scripts/run_pruning_baselines.py --num-workers 8 --criteria l1 --modes scratch \
     --cells resnet18/cifar100 vgg16_bn/cifar100 mobilenet_v2/cifar100 efficientnet_b0/cifar100
@@ -149,7 +178,10 @@ Per criterion, prune + fine-tune, from the measured 100-epoch static runs:
 | Blackwell 6000 | ~12 min | ~12 min | ~10–25 min | 0.5–2.5 h |
 
 About 48 h per criterion on the laptop for the 13 complete cells, ~6.5 h on
-Blackwell; `scratch` mode costs 2.5x. Forecasting is small by comparison
+Blackwell, ~19 h on an L4 (Titan-class); `scratch` mode costs 2.5x. The
+DepGraph arm costs the same as any other criterion (pruning itself is seconds
+to minutes per cell): about 8 h finetune + 19 h scratch on an L4 for the 13
+cells. Forecasting is small by comparison
 (roughly 19 h per criterion on the laptop for the 12 knee cells with 50-epoch
 fine-tunes, dominated by PatchTST on Electricity/Traffic; ~3 h on Blackwell;
 the 20-epoch default is 0.4 of that). The three ImageNet-100 cells without a C2

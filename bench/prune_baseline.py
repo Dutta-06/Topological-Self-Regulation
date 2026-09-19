@@ -21,7 +21,9 @@ extent. Nothing here gives the baseline an action TSR-X lacked, and nothing
 denies it one TSR-X had, except growth: pruning only removes.
 
 Criteria: l1 (Li et al., 2017), bnscale (Liu et al., 2017), taylor (Molchanov
-et al., 2017, via the paper's own first-order saliency).
+et al., 2017, via the paper's own first-order saliency), and depgraph (Fang et
+al., 2023): the DepGraph library itself, run through torch-pruning on the same
+plastic set, width floor and target (tsrx/edit/depgraph.py; no sparse learning).
 
 Usage:
     python -m bench.prune_baseline --arch resnet18 --dataset cifar100 \
@@ -53,7 +55,7 @@ TARGETS = ROOT / "bench" / "pruning_targets.json"
 # arch name used by build_model -> key used in results/ filenames
 ARCH_KEY = {"resnet18": "resnet18", "vgg16_bn": "vgg16bn",
             "mobilenet_v2": "mobilenetv2", "efficientnet_b0": "efficientnet_b0"}
-CRITERIA = ("l1", "bnscale", "taylor")
+CRITERIA = ("l1", "bnscale", "taylor", "depgraph")
 MODES = ("finetune", "scratch")
 
 
@@ -230,6 +232,10 @@ def main() -> None:
     ap.add_argument("--min-width", type=int, default=8, help="width floor, as in TSR-X")
     ap.add_argument("--taylor-batches", type=int, default=50)
     ap.add_argument("--round-fraction", type=float, default=0.05)
+    ap.add_argument("--depgraph-step", type=float, default=0.005,
+                    help="depgraph: fraction of the initial channel count removed per torch-pruning step")
+    ap.add_argument("--depgraph-local", action="store_true",
+                    help="depgraph: prune every group by the same ratio instead of ranking globally")
     ap.add_argument("--epochs", type=int, default=None, help="default 40 (finetune) / 100 (scratch)")
     ap.add_argument("--lr", type=float, default=None, help="default 0.01 (finetune) / 0.1 (scratch)")
     ap.add_argument("--momentum", type=float, default=0.9)
@@ -295,16 +301,33 @@ def main() -> None:
             return nn.functional.cross_entropy(m(x), y)
         importance_fn = make_importance_taylor(lambda: iter(train_loader), loss_of, args.taylor_batches)
     else:
-        importance_fn = {"l1": importance_l1, "bnscale": importance_bnscale}[args.criterion]
+        importance_fn = {"l1": importance_l1, "bnscale": importance_bnscale, "depgraph": None}[args.criterion]
+    criterion_details = None
     t0 = time.time()
-    events = prune_to_target(model, bundles, target, importance_fn, min_width=args.min_width,
-                             round_fraction=args.round_fraction, log=print)
+    if args.criterion == "depgraph":
+        # The DepGraph library does the removal; the plastic set, floor and target are ours.
+        import torch_pruning
+        from tsrx.edit.depgraph import prune_depgraph_to_target
+        model.cpu()
+        events, bundles = prune_depgraph_to_target(
+            model, example, bundles, target, min_width=args.min_width,
+            step_fraction=args.depgraph_step, global_pruning=not args.depgraph_local, log=print)
+        criterion_details = {
+            "library": "torch-pruning", "version": torch_pruning.__version__,
+            "importance": "GroupMagnitudeImportance(p=2, group_reduction=mean, normalizer=mean)",
+            "global_pruning": not args.depgraph_local, "step_fraction": args.depgraph_step,
+            "sparse_learning": False,
+        }
+    else:
+        events = prune_to_target(model, bundles, target, importance_fn, min_width=args.min_width,
+                                 round_fraction=args.round_fraction, log=print)
     prune_seconds = time.time() - t0
     pruned_params = deployed_params(model)
     widths = {str(t): b.size for t, b in bundles.items()}
     with torch.no_grad():
         model.cpu().eval()(example)                   # every shape still legal
-    print(f"pruning took {prune_seconds:.1f}s; {len(events)} channels removed from "
+    removed_channels = sum(e.get("removed", 1) for e in events)   # depgraph events are per group edit
+    print(f"pruning took {prune_seconds:.1f}s; {removed_channels} channels removed from "
           f"{sum(1 for t in bundles if widths[str(t)] != reference_widths[t])} of {len(bundles)} groups")
     if pruned_params > target:
         raise SystemExit(f"pruned model has {pruned_params:,} > target {target:,}")
@@ -325,13 +348,14 @@ def main() -> None:
     record = {
         "control": f"pruned_{args.criterion}_{args.mode}",
         "arch": args.arch, "dataset": args.dataset, "cifar_stem": cifar_stem,
-        "criterion": args.criterion, "mode": args.mode,
+        "criterion": args.criterion, "mode": args.mode, "criterion_details": criterion_details,
         "reference": ref_path.name, "reference_params": ref_params, "reference_top1": ref_top1,
         "reference_trained_here": bool(ref_ck.get("trained_for") == "pruning-baselines"),
         "target_source": target_source, "target_params": target, "params": pruned_params,
         "pruned_top1_before_training": pruned_top1,
         "reference_widths": {str(t): w for t, w in reference_widths.items()},
-        "discovered_widths": widths, "removed": len(events), "prune_seconds": prune_seconds,
+        "discovered_widths": widths, "removed": removed_channels, "group_edits": len(events),
+        "prune_seconds": prune_seconds,
         "epochs": epochs, "lr": lr, "batch_size": batch_size, "args": vars(args),
         "environment": environment(),
     }
