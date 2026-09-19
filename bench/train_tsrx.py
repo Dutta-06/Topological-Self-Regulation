@@ -32,7 +32,7 @@ from bench.models import build_model, describe
 from data.cifar import get_cifar10_loaders, get_cifar100_loaders
 from data.tiny_imagenet import get_tiny_imagenet_loaders, GPUBatchTransform
 from data.imagenet100 import get_imagenet100_loaders
-from tsrx.alloc.cost import kappa_params
+from tsrx.alloc.cost import deployed_flops, kappa_params, make_cost_fn, model_flops
 from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange
 from tsrx.alloc.schedule import budget_at
 from tsrx.graph.bundle import build_all_bundles
@@ -77,7 +77,10 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=5e-4)
     ap.add_argument("--k", type=int, default=4, help="Candidate bank size per group")
     ap.add_argument("--update-interval", type=int, default=100, help="Steps between structural updates")
-    ap.add_argument("--budget-ratio", type=float, default=0.85, help="Max param budget as ratio of baseline (e.g. 0.85)")
+    ap.add_argument("--budget-ratio", type=float, default=0.85, help="Max budget as ratio of baseline (e.g. 0.85)")
+    ap.add_argument("--cost", choices=["params", "flops"], default="params",
+                    help="Resource the budget and the proposal densities are measured in: deployed "
+                         "parameters (released default) or forward FLOPs (kappa_flops, 2*MACs)")
     ap.add_argument("--delta", type=float, default=1e-7, help="Exchange acceptance margin")
     ap.add_argument("--prune-tol", type=float, default=1e-3,
                     help="RELATIVE pure-prune tolerance (fraction of group median saliency)")
@@ -143,6 +146,7 @@ def main():
     model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
 
     baseline_params = count_params(model)
+    baseline_flops = None
     if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:
         budget_params = None
         cap_str = "None (Unconstrained Capacity Discovery)"
@@ -172,6 +176,21 @@ def main():
 
     bank = CandidateBank(model, bundles, k=args.k)
     bank = bank.to(args.device)
+
+    # The unit the budget is enforced in. Parameters are read exactly from the
+    # bank; FLOPs are counted exactly on a candidate-free copy at each update.
+    cost_fn = make_cost_fn(args.cost, traced)
+    if args.cost == "flops":
+        baseline_flops = model_flops(bank.detached_copy(), xb0)
+        baseline_cost = baseline_flops
+        budget_cost = None if budget_params is None else int(baseline_flops * args.budget_ratio)
+        print(f"  Cost mode                    : FLOPs -- baseline {baseline_flops:,} "
+              f"(2*MACs), budget cap {budget_cost if budget_cost is None else f'{budget_cost:,}'}")
+    else:
+        baseline_cost, budget_cost = baseline_params, budget_params
+
+    def deployed_cost() -> int:
+        return deployed_flops(bank, xb0) if args.cost == "flops" else bank.deployed_params()
 
     # 3. Optimizer & Scheduler
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
@@ -262,8 +281,9 @@ def main():
             # optimality — see tsrx/alloc/exchange.py module docstring)
             if global_step > 0 and global_step % args.update_interval == 0:
                 t0_struct = time.time()
-                deployed_before = bank.deployed_params()
-                B_t = budget_at(global_step, total_steps, baseline_params, budget_params,
+                deployed_before = deployed_cost()
+                deployed_params_before = bank.deployed_params()
+                B_t = budget_at(global_step, total_steps, baseline_cost, budget_cost,
                                  end_frac=args.budget_end_frac)
 
                 if args.calibrate_hmax:
@@ -284,6 +304,7 @@ def main():
                     act_stats=act_stats,
                     H_max=h_max_value,
                     max_prunes_per_update=args.max_prunes_per_update,
+                    cost_fn=cost_fn,
                 )
 
                 applied = [d for d in decisions if d.action != "none"]
@@ -303,7 +324,8 @@ def main():
                         torch.cuda.empty_cache()
 
                 overhead_ms = (time.time() - t0_struct) * 1000
-                new_p = bank.deployed_params()
+                new_p = deployed_cost()
+                new_params = bank.deployed_params()
 
                 for dec in decisions:
                     if args.verbose_decisions or dec.action != "none":
@@ -316,15 +338,18 @@ def main():
                             name += f" prune={bank.handles.get(dec.prune_tap, None) and bank.handles[dec.prune_tap].bundle.producer_slots[0].module_name}(idx {dec.prune_idx})"
                         tqdm.write(
                             f"  [{global_step:>6}] [{dec.regime:>11}:{tag:<8}]{name}  "
-                            f"reason={dec.reason}  B_t={B_t}  params={new_p:,} ({overhead_ms:.0f}ms)"
+                            f"reason={dec.reason}  B_t={B_t}  {args.cost}={new_p:,} ({overhead_ms:.0f}ms)"
                         )
                     decisions_file.write(json.dumps({
                         "step": global_step,
                         "regime": dec.regime,
                         "action": dec.action,
                         "reason": dec.reason,
+                        "cost_mode": args.cost,
                         "deployed_before": deployed_before,
                         "deployed_after": new_p,
+                        "deployed_params_before": deployed_params_before,
+                        "deployed_params_after": new_params,
                         "budget_at_t": B_t,
                         "H_max": h_max_value,
                         "grow_tap": dec.grow_tap,
@@ -378,6 +403,9 @@ def main():
                 "params": curr_p,
                 "baseline_params": baseline_params,
                 "param_saving_pct": pct_saved,
+                "cost_mode": args.cost,
+                "baseline_flops": baseline_flops,
+                "flops": deployed_flops(bank, xb0) if args.cost == "flops" else None,
                 "structural_events": events_log,
                 "discovered_widths": {str(t): h.base_size for t, h in bank.handles.items()},
                 "max_port_magnitude": bank.max_port_magnitude(),

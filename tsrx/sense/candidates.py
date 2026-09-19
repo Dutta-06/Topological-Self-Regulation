@@ -294,6 +294,19 @@ class CandidateBank(nn.Module):
                 total += n
         return total
 
+    def detached_copy(self) -> nn.Module:
+        """A deep copy of the model with every candidate stripped, leaving this
+        bank and its model untouched -- for measuring the deployed model
+        (e.g. its FLOPs) during a run."""
+        import copy
+        model_copy = copy.deepcopy(self.model)
+        bank_copy = copy.copy(self)
+        object.__setattr__(bank_copy, "model", model_copy)
+        bank_copy.handles = {t: copy.copy(h) for t, h in self.handles.items()}
+        for h in bank_copy.handles.values():
+            h.bundle = copy.deepcopy(h.bundle)
+        return bank_copy.detach()
+
     def detach(self) -> nn.Module:
         """Strip all candidate rows and columns from the model, leaving the pure deployed model."""
         modules = _modules_by_name(self.model)
@@ -308,10 +321,17 @@ class CandidateBank(nn.Module):
                     continue
                 producers_seen.add(s.module_name)
                 mod = modules[s.module_name]
+                # A depthwise producer's groups and in_channels were bumped by k at
+                # attach time (_extend_producer_weight); strip them the same way, or
+                # the stripped module keeps groups=base+k and cannot run a forward pass.
+                is_dw = isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and is_depthwise(mod)
                 mod.weight = nn.Parameter(mod.weight.data[:base_size])
                 if getattr(mod, "bias", None) is not None:
                     mod.bias = nn.Parameter(mod.bias.data[:base_size])
                 _bump_out_attr(mod, -k)
+                if is_dw:
+                    mod.groups -= k
+                    mod.in_channels -= k
 
             # 2. Affines
             affines_seen = set()

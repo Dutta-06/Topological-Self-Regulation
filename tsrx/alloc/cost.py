@@ -96,6 +96,64 @@ def kappa_flops(bundle: IndexBundle, model: nn.Module, traced: TracedModel) -> f
     return total
 
 
+def model_flops(model: nn.Module, example: torch.Tensor) -> int:
+    """Forward FLOPs of `model` on one input of `example`'s shape, 2*MACs over
+    convolutions and linear layers -- the convention used throughout the repo's
+    reporting (scripts/regenerate_vision_summaries.py). Batch dimension is
+    divided out."""
+    total = 0
+    handles = []
+
+    def conv_hook(mod, inp, out):
+        nonlocal total
+        k = 1
+        for d in mod.kernel_size:
+            k *= d
+        spatial = 1
+        for d in out.shape[2:]:
+            spatial *= d
+        total += 2 * k * (mod.in_channels // mod.groups) * out.shape[1] * spatial
+
+    def linear_hook(mod, inp, out):
+        nonlocal total
+        positions = 1
+        for d in out.shape[1:-1]:
+            positions *= d
+        total += 2 * mod.in_features * mod.out_features * positions
+
+    for m in model.modules():
+        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            handles.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, nn.Linear):
+            handles.append(m.register_forward_hook(linear_hook))
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        model(example[:1])
+    model.train(was_training)
+    for h in handles:
+        h.remove()
+    return int(total)
+
+
+def deployed_flops(bank, example: torch.Tensor) -> int:
+    """Forward FLOPs of the DEPLOYED model: candidates stripped from a copy,
+    counted exactly, the model itself untouched. The FLOP analogue of
+    `CandidateBank.deployed_params()`."""
+    return model_flops(bank.detached_copy(), example)
+
+
+def make_cost_fn(mode: str, traced: TracedModel):
+    """The per-index marginal cost the controller ranks by: `kappa_params`
+    (the released default) or `kappa_flops` bound to the traced shapes, which
+    do not change with width."""
+    if mode == "params":
+        return kappa_params
+    if mode == "flops":
+        return lambda bundle, model: kappa_flops(bundle, model, traced)
+    raise ValueError(f"unknown cost mode {mode!r}; expected 'params' or 'flops'")
+
+
 def cost_report(bundles: Dict[int, IndexBundle], model: nn.Module, traced: TracedModel) -> Dict[int, dict]:
     return {
         tap: {

@@ -59,6 +59,7 @@ def _gather_removal_options(
     min_size_per_group: int,
     act_stats=None,
     H_max: float = 1.0,
+    cost_fn=kappa_params,
 ) -> List[dict]:
     """One removal option per prunable group (argmin real-unit saliency)."""
     model = bank.model
@@ -69,7 +70,7 @@ def _gather_removal_options(
         sal_tensor = saliency_sum.get(tap)
         if sal_tensor is None:
             continue
-        kp = kappa_params(h.bundle, model)
+        kp = cost_fn(h.bundle, model)
         if kp <= 0:
             continue
         avg_sal = sal_tensor / max(n_seen, 1)
@@ -116,8 +117,9 @@ def _feasibility_prunes(
     max_prunes_per_update: int,
     act_stats=None,
     H_max: float = 1.0,
+    cost_fn=kappa_params,
 ) -> List[ExchangeDecision]:
-    options = _gather_removal_options(bank, saliency_sum, n_seen, min_size_per_group, act_stats, H_max)
+    options = _gather_removal_options(bank, saliency_sum, n_seen, min_size_per_group, act_stats, H_max, cost_fn)
     # Cheapest damage-per-param-freed first (Remark 4.3's rho ordering still
     # applies here — feasibility only waives the DEADNESS test, not the
     # preference for low-damage removals).
@@ -162,6 +164,7 @@ def evaluate_exchange(
     act_stats=None,
     H_max: float = 1.0,
     deployed_params: Optional[int] = None,
+    cost_fn=kappa_params,
 ) -> ExchangeDecision:
     """Optimality-regime core: argmax growth density vs argmin removal
     density, Definition 4.5's accept rule. Assumes the caller has already
@@ -183,7 +186,7 @@ def evaluate_exchange(
     for tap, h in bank.handles.items():
         if h.base_size >= max_size_per_group:
             continue
-        kp = kappa_params(h.bundle, model)
+        kp = cost_fn(h.bundle, model)
         if kp <= 0:
             continue
         cand_u = windowed_signal.mean(tap)
@@ -203,7 +206,7 @@ def evaluate_exchange(
         })
 
     # 2. Gather removal densities rho_ell for all groups
-    removal_options = _gather_removal_options(bank, saliency_sum, n_seen, min_size_per_group, act_stats, H_max)
+    removal_options = _gather_removal_options(bank, saliency_sum, n_seen, min_size_per_group, act_stats, H_max, cost_fn)
 
     if not growth_options and not removal_options:
         return ExchangeDecision(action="none", regime="optimality", reason="no_options")
@@ -312,6 +315,7 @@ def evaluate_structural_update(
     act_stats=None,
     H_max: float = 1.0,
     max_prunes_per_update: int = 4,
+    cost_fn=kappa_params,
 ) -> List[ExchangeDecision]:
     """Entry point: dispatch feasibility vs optimality regime by comparing
     `deployed_params` (bank.deployed_params(), NOT candidate-inflated) to
@@ -322,7 +326,7 @@ def evaluate_structural_update(
     if budget_at_t is not None and deployed_params > budget_at_t:
         return _feasibility_prunes(
             bank, saliency_sum, n_seen, deployed_params, budget_at_t,
-            min_size_per_group, max_prunes_per_update, act_stats, H_max,
+            min_size_per_group, max_prunes_per_update, act_stats, H_max, cost_fn,
         )
 
     dec = evaluate_exchange(
@@ -338,6 +342,7 @@ def evaluate_structural_update(
         act_stats=act_stats,
         H_max=H_max,
         deployed_params=deployed_params,
+        cost_fn=cost_fn,
     )
     return [dec]
 
