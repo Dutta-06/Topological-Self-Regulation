@@ -144,10 +144,15 @@ def _cell(sweep, ref_dir, arch, ds, h, br, metric):
         c3 = _load(p)
         if c3 is None:
             continue
-        c3_vals.append(c3.get(f"test_{metric}"))
+        # A draw that missed the budget is a differently-sized model, not a
+        # matched control, so it is excluded from the mean rather than averaged
+        # in and flagged. The gate is parameter count -- independent of
+        # accuracy -- so this is a validity criterion, not outcome selection.
         rel = c3.get("param_match_rel_error")
         if rel is None or rel > 0.01:
-            issues.append(f"C3 off target{suffix}")
+            issues.append(f"C3 off target{suffix} (excluded from the mean)")
+            continue
+        c3_vals.append(c3.get(f"test_{metric}"))
 
     # TSR-X's final_params is the source of truth for the discovered size; a
     # C2 that disagrees with it is the validity failure, not the reference.
