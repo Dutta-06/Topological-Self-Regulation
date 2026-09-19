@@ -115,7 +115,9 @@ def _cell(sweep, ref_dir, arch, ds, h, br, metric):
     """Every arm's statistic for one (arch, dataset, budget)."""
     refs = _references(ref_dir, arch, ds, h)
     ref_params = refs[0].get("params") if refs else None
-    issues, tx_vals, tx_params, fallback = [], [], [], False
+    # `issues` invalidate the row; `notes` are handled conditions that must be
+    # disclosed but leave the reported numbers valid (an excluded C3 draw).
+    issues, notes, tx_vals, tx_params, fallback = [], [], [], [], False
     c2_vals, c2_params = [], []
 
     for suffix, p in _variants(sweep, "tsrx", arch, ds, h, br):
@@ -150,7 +152,7 @@ def _cell(sweep, ref_dir, arch, ds, h, br, metric):
         # accuracy -- so this is a validity criterion, not outcome selection.
         rel = c3.get("param_match_rel_error")
         if rel is None or rel > 0.01:
-            issues.append(f"C3 off target{suffix} (excluded from the mean)")
+            notes.append(f"C3 draw{suffix} off target, excluded")
             continue
         c3_vals.append(c3.get(f"test_{metric}"))
 
@@ -167,6 +169,7 @@ def _cell(sweep, ref_dir, arch, ds, h, br, metric):
         "params": params,
         "reduction": (1 - params / ref_params) * 100 if (params and ref_params) else None,
         "issues": issues,
+        "notes": notes,
         "tsrx_fallback": fallback,
     }
 
@@ -362,11 +365,13 @@ def render_standalone(args, main_mse, main_mae, blocks):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # validity, from every cell in the frontier (the main rows are a subset)
-    failures = []
+    failures, disclosures = [], []
     for aname, dname, _, rows in blocks:
         for br, c, _, _ in rows:
             for why in sorted(set(c["issues"])):
                 failures.append((aname, dname, br, why))
+            for why in sorted(set(c.get("notes") or [])):
+                disclosures.append((aname, dname, br, why))
 
     # mechanism summary at the knees, computed not asserted
     knee_pairs = [(a, d, c) for a, d, _, c in main_mse if c["c2"] and c["c3"]]
@@ -422,6 +427,16 @@ def render_standalone(args, main_mse, main_mae, blocks):
         out += [r"\end{itemize}"]
     else:
         out += [r"All cells passed."]
+
+    if disclosures:
+        out += ["", r"A random draw whose parameter count misses the target by more than 1\% is a "
+                r"differently-sized model rather than a matched control, so it is excluded from the "
+                r"C3 mean. The exclusion criterion is parameter count alone --- it is independent of "
+                r"the draw's accuracy --- so this is a validity gate, not selection on the outcome. "
+                r"The affected cells, with the excluded draws, are:", r"\begin{itemize}"]
+        out += [rf"  \item {_tex_escape(a)} / {_tex_escape(d)}, budget {br}: {_tex_escape(w)}"
+                for a, d, br, w in disclosures]
+        out += [r"\end{itemize}"]
 
     out += ["", r"\section{Full compression frontier}"]
     for aname in models:
@@ -484,6 +499,12 @@ def main():
         print("\n!! VALIDITY FAILURES — these rows must not be reported as-is:")
         for a, d, iss in issues:
             print(f"   {a}/{d}: {', '.join(sorted(set(iss)))}")
+
+    notes = [(a, d, c.get("notes")) for a, d, _, c in main_mse if c.get("notes")]
+    if notes:
+        print("\n   Disclosures (handled; the rows above stay valid) — report these:")
+        for a, d, nts in notes:
+            print(f"   {a}/{d}: {', '.join(sorted(set(nts)))}")
 
     if args.latex_dir:
         os.makedirs(args.latex_dir, exist_ok=True)
