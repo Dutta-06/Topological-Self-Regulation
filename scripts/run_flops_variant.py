@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import subprocess
+import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,6 +43,12 @@ def done(path: Path) -> bool:
 def run(cmd, logfile: Path) -> bool:
     with logfile.open("w", encoding="utf-8") as fh:
         return subprocess.run(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT).returncode == 0
+
+
+# torch.fx symbolic tracing keeps global state, so two cells measuring at once corrupt
+# each other's trace ("module is not installed as a submodule"). Measuring is seconds;
+# serialising it costs nothing and the trainings still run concurrently.
+_MEASURE_LOCK = threading.Lock()
 
 
 def measure(arch: str, dataset: str, tsrx_ckpt: Path, c2_ckpt: Path) -> dict:
@@ -93,7 +100,8 @@ def pipeline(arch: str, dataset: str, num_workers: int, dry_run: bool) -> str:
             return f"FAILED C2 for {arch}/{dataset} (see {c2_out.with_suffix('.log').name})"
     if dry_run:
         return f"{arch}/{dataset}: dry run"
-    rec = measure(arch, dataset, tsrx_out, c2_out)
+    with _MEASURE_LOCK:
+        rec = measure(arch, dataset, tsrx_out, c2_out)
     rec["seconds"] = time.time() - t0
     tsrx_out.with_suffix(".json").write_text(json.dumps(rec, indent=2), encoding="utf-8")
     return (f"{arch}/{dataset}: FLOPs {rec['reference_flops']:,} -> {rec['discovered_flops']:,} "
