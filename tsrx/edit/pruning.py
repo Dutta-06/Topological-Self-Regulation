@@ -20,6 +20,7 @@ and removes the least important until the deployed count is at or below the
 target, recomputing importance after every round.
 """
 
+import copy
 from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
@@ -105,50 +106,41 @@ def make_importance_taylor(batches: Callable[[], Iterable], loss_of: Callable[[n
     return importance
 
 
-def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: int,
-                    importance_fn: Callable, min_width: int = 8,
-                    round_fraction: float = 0.05, log: Optional[Callable] = None,
-                    tol: float = 0.01) -> List[dict]:
-    """Remove the globally least important channels until deployed_params <= target.
+def _greedy_pass(model: nn.Module, bundles: Dict[int, IndexBundle], target: int,
+                 importance_fn: Callable, floors: Dict[int, int], round_fraction: float,
+                 tol: float, events: List[dict], log: Optional[Callable]) -> bool:
+    """Remove the globally least important channels, never taking a group below
+    `floors[tap]`, until deployed_params <= target. Returns False if every group
+    reached its floor first. Appends one record per removed channel to `events`.
 
-    A round removes at most `round_fraction` of the channels still above the
-    floor (at least one) before importance is recomputed, so index shifts and
-    interactions are respected without a recompute per channel. Returns one
-    record per removed channel.
-
-    Endgame: a channel whose removal would land more than `tol` under the
-    target is skipped in favour of the next-ranked channel that fits. Without
-    this, a model with a very expensive group -- the channel-mixing TCN, whose
-    head costs pred_len * n_vars per channel -- overshoots by one whole channel
-    whenever the crossing removal lands in that group. Far from the target no
-    candidate is skipped, so the order of removal is unchanged there. If nothing
-    fits, the least-undershooting candidate is taken.
+    Near the target, a channel whose removal would land more than `tol` under it
+    is skipped for the next-ranked channel that fits; if none fits, the
+    least-undershooting candidate is taken. Far from the target nothing is
+    skipped, so the removal order is plain importance order there.
     """
-    events: List[dict] = []
-    start = deployed_params(model)
+    floor = target * (1.0 - tol)
     while deployed_params(model) > target:
         scores = importance_fn(model, bundles)
         ranked = []
         for tap, bd in bundles.items():
-            if bd.size <= min_width:
+            if bd.size <= floors[tap]:
                 continue
             s = scores[tap]
             norm = s / s.mean().clamp_min(1e-12)
             ranked.extend((float(norm[idx]), tap, idx) for idx in range(bd.size))
         if not ranked:
-            raise RuntimeError("every editable group is at its width floor before the target was reached")
+            return False
         ranked.sort()
 
-        headroom = sum(max(0, bd.size - min_width) for bd in bundles.values())
+        headroom = sum(max(0, bd.size - floors[t]) for t, bd in bundles.items())
         budget = max(1, int(round_fraction * headroom))
         removed_this_round: Dict[int, List[int]] = {}
-        floor = target * (1.0 - tol)
         fallback = None                                      # (undershoot, score, tap, idx)
         for score, tap, idx in ranked:
             if budget == 0 or deployed_params(model) <= target:
                 break
             taken = removed_this_round.setdefault(tap, [])
-            if bundles[tap].size <= min_width:
+            if bundles[tap].size <= floors[tap]:
                 continue
             before = deployed_params(model)
             cost = kappa_params(bundles[tap], model)
@@ -165,7 +157,7 @@ def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: i
                            "params_before": before, "params_after": deployed_params(model)})
         if deployed_params(model) > target and not any(removed_this_round.values()):
             if fallback is None:
-                raise RuntimeError("every editable group is at its width floor before the target was reached")
+                return False
             _, score, tap, idx = fallback                    # nothing fits: take the smallest undershoot
             before = deployed_params(model)
             prune_group_index(model, bundles[tap], idx)
@@ -173,6 +165,73 @@ def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: i
                            "params_before": before, "params_after": deployed_params(model)})
         if log:
             log(f"  round: {deployed_params(model):,} params ({len(events)} removed)")
+    return True
+
+
+def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: int,
+                    importance_fn: Callable, min_width: int = 8,
+                    round_fraction: float = 0.05, log: Optional[Callable] = None,
+                    tol: float = 0.01) -> List[dict]:
+    """Remove the globally least important channels until deployed_params lands
+    in [target * (1 - tol), target].
+
+    A round removes at most `round_fraction` of the channels still above the
+    floor (at least one) before importance is recomputed, so index shifts and
+    interactions are respected without a recompute per channel. Returns one
+    record per removed channel.
+
+    Coarse-group repair. Plain greedy can strand a model whose groups differ in
+    price by orders of magnitude -- the channel-mixing TCN, whose head-feeding
+    group costs pred_len * n_vars params per channel against ~100 for the rest:
+    it drives the cheap groups to their floor first, after which the only
+    reachable counts are one expensive channel apart and straddle the target.
+    If the greedy result misses the band, the reference is restored, every
+    coarse group (per-channel cost above the band's width) is pruned alone to
+    the width greedy gave it (or one or two wider), and greedy then runs over
+    the fine groups only, whose steps are smaller than the band, so it lands.
+    A run that lands on the first pass never enters the repair, so its result
+    is exactly the plain greedy one.
+    """
+    events: List[dict] = []
+    start = deployed_params(model)
+    band_low = target * (1.0 - tol)
+    snapshot = copy.deepcopy(model)
+    snapshot_sizes = {t: bd.size for t, bd in bundles.items()}
+
+    floors = {t: min_width for t in bundles}
+    if not _greedy_pass(model, bundles, target, importance_fn, floors, round_fraction, tol, events, log):
+        raise RuntimeError("every editable group is at its width floor before the target was reached")
+
+    if deployed_params(model) < band_low:
+        greedy_sizes = {t: bd.size for t, bd in bundles.items()}
+        coarse = [t for t in bundles if kappa_params(bundles[t], snapshot) > tol * target]
+        if log:
+            log(f"  greedy missed the band ({deployed_params(model):,} < {int(band_low):,}); "
+                f"repairing via coarse groups {coarse}")
+        for delta in (0, 1, 2) if coarse else ():
+            trial = copy.deepcopy(snapshot)
+            for t, bd in bundles.items():
+                bd.size = snapshot_sizes[t]
+            trial_events: List[dict] = []
+            # phase A: coarse groups alone, down to the chosen width
+            floors_a = {t: (min(snapshot_sizes[t], greedy_sizes[t] + delta) if t in coarse
+                            else snapshot_sizes[t]) for t in bundles}
+            _greedy_pass(trial, bundles, 0, importance_fn, floors_a, round_fraction, tol, trial_events, None)
+            # phase B: fine groups only, to the target
+            floors_b = {t: (bundles[t].size if t in coarse else min_width) for t in bundles}
+            _greedy_pass(trial, bundles, target, importance_fn, floors_b, round_fraction, tol, trial_events, None)
+            if band_low <= deployed_params(trial) <= target:
+                model.__dict__.clear()
+                model.__dict__.update(trial.__dict__)        # the caller keeps its model object
+                events = trial_events
+                if log:
+                    log(f"  repaired: coarse widths {({t: bundles[t].size for t in coarse})}, "
+                        f"{deployed_params(model):,} params")
+                break
+        else:
+            for t, bd in bundles.items():                    # repair failed: leave the greedy result
+                bd.size = greedy_sizes[t]
+
     if log:
         log(f"pruned {start:,} -> {deployed_params(model):,} (target {target:,}, "
             f"{len(events)} channels removed)")
