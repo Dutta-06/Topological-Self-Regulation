@@ -391,6 +391,15 @@ def main():
 
     final_p = bank.deployed_params()
     final_saved = (1.0 - final_p / baseline_params) * 100.0
+
+    # The checkpoint above is the best-val epoch, whose widths can predate the
+    # search converging. Record the converged architecture alongside it; C2
+    # rebuilds from `final_widths` (the same fix as the forecasting harness).
+    if out_path.exists():
+        ck = torch.load(out_path, map_location="cpu", weights_only=False)
+        ck["final_widths"] = {str(t): h.base_size for t, h in bank.handles.items()}
+        ck["final_params"] = final_p
+        torch.save(ck, out_path)
     print(f"\n{'='*70}")
     print(f"  TSR-X Training Complete")
     print(f"  Baseline Reference Params : {baseline_params:,}")

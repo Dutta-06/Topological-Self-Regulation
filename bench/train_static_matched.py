@@ -71,7 +71,9 @@ def main():
     arch = ck_args.get("arch", "resnet18")
     dataset = ck_args.get("dataset", "cifar10")
     cifar_stem = ck_args.get("cifar_stem", True)
-    widths = ck.get("discovered_widths")
+    # the converged architecture; best-val `discovered_widths` only for checkpoints
+    # written before train_tsrx.py recorded `final_widths`
+    widths = ck.get("final_widths") or ck.get("discovered_widths")
     if not widths:
         raise SystemExit(
             "checkpoint has no 'discovered_widths' — rerun train_tsrx.py after the "
