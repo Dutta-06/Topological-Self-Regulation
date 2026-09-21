@@ -25,6 +25,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 import torch
 import torch.nn as nn
 
+from tsrx.alloc.cost import kappa_params
 from tsrx.edit.edits import prune_group_index
 from tsrx.graph.bundle import IndexBundle, build_all_bundles
 from tsrx.graph.groups import discover_groups
@@ -106,13 +107,22 @@ def make_importance_taylor(batches: Callable[[], Iterable], loss_of: Callable[[n
 
 def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: int,
                     importance_fn: Callable, min_width: int = 8,
-                    round_fraction: float = 0.05, log: Optional[Callable] = None) -> List[dict]:
+                    round_fraction: float = 0.05, log: Optional[Callable] = None,
+                    tol: float = 0.01) -> List[dict]:
     """Remove the globally least important channels until deployed_params <= target.
 
     A round removes at most `round_fraction` of the channels still above the
     floor (at least one) before importance is recomputed, so index shifts and
     interactions are respected without a recompute per channel. Returns one
     record per removed channel.
+
+    Endgame: a channel whose removal would land more than `tol` under the
+    target is skipped in favour of the next-ranked channel that fits. Without
+    this, a model with a very expensive group -- the channel-mixing TCN, whose
+    head costs pred_len * n_vars per channel -- overshoots by one whole channel
+    whenever the crossing removal lands in that group. Far from the target no
+    candidate is skipped, so the order of removal is unchanged there. If nothing
+    fits, the least-undershooting candidate is taken.
     """
     events: List[dict] = []
     start = deployed_params(model)
@@ -132,17 +142,33 @@ def prune_to_target(model: nn.Module, bundles: Dict[int, IndexBundle], target: i
         headroom = sum(max(0, bd.size - min_width) for bd in bundles.values())
         budget = max(1, int(round_fraction * headroom))
         removed_this_round: Dict[int, List[int]] = {}
+        floor = target * (1.0 - tol)
+        fallback = None                                      # (undershoot, score, tap, idx)
         for score, tap, idx in ranked:
             if budget == 0 or deployed_params(model) <= target:
                 break
             taken = removed_this_round.setdefault(tap, [])
             if bundles[tap].size <= min_width:
                 continue
-            shifted = idx - sum(1 for j in taken if j < idx)   # earlier removals shift later indices
             before = deployed_params(model)
+            cost = kappa_params(bundles[tap], model)
+            if before - cost < floor:                        # would cross the target by more than tol
+                under = floor - (before - cost)
+                if fallback is None or under < fallback[0]:
+                    fallback = (under, score, tap, idx)
+                continue
+            shifted = idx - sum(1 for j in taken if j < idx)   # earlier removals shift later indices
             prune_group_index(model, bundles[tap], shifted)
             taken.append(idx)
             budget -= 1
+            events.append({"tap": tap, "index": idx, "importance": score,
+                           "params_before": before, "params_after": deployed_params(model)})
+        if deployed_params(model) > target and not any(removed_this_round.values()):
+            if fallback is None:
+                raise RuntimeError("every editable group is at its width floor before the target was reached")
+            _, score, tap, idx = fallback                    # nothing fits: take the smallest undershoot
+            before = deployed_params(model)
+            prune_group_index(model, bundles[tap], idx)
             events.append({"tap": tap, "index": idx, "importance": score,
                            "params_before": before, "params_after": deployed_params(model)})
         if log:
