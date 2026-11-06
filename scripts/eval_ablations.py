@@ -22,6 +22,7 @@ import argparse
 import collections
 import json
 import statistics as st
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +57,33 @@ def acc(r, metric):
     return None if v is None else 100.0 * float(v)
 
 
+def widths_log_ratio(ckpt_path: Path) -> dict:
+    """{group: log2(final width / reference width)} for a discovery checkpoint.
+    The reference widths are the first logged decision's pre-edit state: every
+    group starts at its dense width, recovered here from the run's own log."""
+    import math
+    import torch
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    final = {int(t): v for t, v in (ck.get("final_widths") or ck["discovered_widths"]).items()}
+    # Undo the logged edits to recover each group's starting width.
+    start = dict(final)
+    log = ckpt_path.with_name(f"{ckpt_path.stem}_decisions.jsonl")
+    for line in log.open(encoding="utf-8"):
+        d = json.loads(line)
+        if d["action"] in ("pure_prune", "exchange"):
+            start[d["prune_tap"]] += 1
+        if d["action"] in ("pure_grow", "exchange"):
+            start[d["grow_tap"]] -= 1
+    return {t: math.log2(final[t] / start[t]) for t in final}
+
+
+def cosine(a: dict, b: dict) -> float:
+    keys = sorted(set(a) & set(b))
+    num = sum(a[k] * b[k] for k in keys)
+    den = (sum(a[k] ** 2 for k in keys) ** 0.5) * (sum(b[k] ** 2 for k in keys) ** 0.5)
+    return num / den if den else float("nan")
+
+
 def growth_stats(log: Path):
     births, by_tap, port = 0, collections.Counter(), collections.Counter()
     actions = collections.Counter()
@@ -78,6 +106,8 @@ def main():
     ap.add_argument("--metric", choices=["best", "final"], default="best")
     ap.add_argument("--markdown", default=None, help="also write the tables to this file")
     args = ap.parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # tables use Δ/±; Windows pipes default to cp1252
     root = Path(args.root)
     recs = load(root)
     out = []
@@ -132,6 +162,31 @@ def main():
                 b, top, ng, port, actions = growth_stats(log)
                 emit(f"| {arm} | {s} | {b} | {top:.0%} | {ng} | {dict(port)} | {dict(actions)} |")
         emit("")
+
+        # Discovery stability across seeds (R3): how similar are the exported
+        # width vectors, as log2(width / reference width) per group?
+        rows = []
+        for arm in ARM_ORDER[1:]:
+            vecs = {}
+            for s in seeds:
+                ckp = root / cell / f"{arm}_s{s}.pt"
+                if (arm, "online", s) not in R or not ckp.exists():
+                    continue
+                vecs[s] = widths_log_ratio(ckp)
+            if len(vecs) >= 2:
+                ss = sorted(vecs)
+                cos = [cosine(vecs[a], vecs[b]) for i, a in enumerate(ss) for b in ss[i + 1:]]
+                top = [max(vecs[s], key=lambda t: vecs[s][t]) for s in ss]
+                rows.append(f"| {arm} | {len(ss)} | {st.mean(cos):.3f} (min {min(cos):.3f}) | "
+                            f"{'same' if len(set(top)) == 1 else 'differs'}: {top} |")
+        if rows:
+            emit("Discovery stability across seeds: cosine similarity of log2(width/ref) vectors "
+                 "(final widths), and the most-grown group per seed.\n")
+            emit("| arm | seeds | mean pairwise cosine | most-grown group |")
+            emit("|---|---|---|---|")
+            for r in rows:
+                emit(r)
+            emit("")
 
     if args.markdown:
         Path(args.markdown).write_text("\n".join(out) + "\n", encoding="utf-8")

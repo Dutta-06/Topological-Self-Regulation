@@ -255,6 +255,8 @@ def main():
     ap.add_argument("--markdown", default=None)
     ap.add_argument("--json", default=str(ROOT / "results" / "training_compute.json"))
     args = ap.parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # Δ/ℓ in the table; Windows pipes default to cp1252
 
     cells = []
     for p in sorted((ROOT / "results" / "tsrx").glob("*_two_regime.pt")):
