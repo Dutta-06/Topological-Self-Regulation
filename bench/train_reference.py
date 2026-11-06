@@ -20,6 +20,7 @@ import torch.nn as nn
 import torchvision
 
 
+from bench.checkpoints import save_atomic
 from bench.models import build_model, describe
 
 
@@ -127,6 +128,8 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
 
     best_acc = 0.0
+    history = []  # per-epoch val accuracy and wall-clock
+    t_train_start = time.time()
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -161,14 +164,21 @@ def main():
         val_acc = evaluate(model, val_loader, args.device, batch_tf=eval_batch_tf, use_amp=use_amp)
         is_best = val_acc > best_acc
         best_acc = max(best_acc, val_acc)
+        history.append({"epoch": epoch, "val_acc": val_acc, "seconds": time.time() - t0})
         print(f"epoch {epoch+1:3d}/{args.epochs}  train_loss={total_loss/n:.4f}  "
               f"val_acc={val_acc:.4f}  best={best_acc:.4f}  ({time.time()-t0:.1f}s)")
 
         if is_best:
-            torch.save({
+            # `complete` stays False until the run finishes: while training is
+            # in progress this file is a real, loadable, but NOT final model,
+            # and nothing downstream may treat it as the reference.
+            save_atomic({
                 "model_state_dict": model.state_dict(),
                 "epoch": epoch,
                 "val_acc": val_acc,
+                "best_val_acc": best_acc,
+                "complete": False,
+                "total_epochs": args.epochs,
                 "arch": args.arch,
                 "dataset": args.dataset,
                 "params": baseline_params,
@@ -184,6 +194,22 @@ def main():
                 "epoch": epoch,
                 "val_acc": val_acc,
             }, out_path.with_name(out_path.stem + f"_epoch{epoch+1}.pt"))
+
+    # Mark the surviving best checkpoint as final. Until this runs, every
+    # consumer that goes through bench.checkpoints will refuse the file, which
+    # is the point: an interrupted run must not be readable as a reference.
+    if out_path.exists():
+        final = torch.load(out_path, map_location="cpu", weights_only=False)
+        final["complete"] = True
+        final["best_val_acc"] = best_acc
+        final["total_epochs"] = args.epochs
+        # Last-epoch accuracy: the selection-free figure (CIFAR's "val" is its test split).
+        final["final_val_acc"] = history[-1]["val_acc"] if history else None
+        final["history"] = history
+        final["train_seconds"] = time.time() - t_train_start
+        save_atomic(final, out_path)
+    else:
+        print(f"  [WARN] no checkpoint at {out_path}; nothing to finalize")
 
     print(f"\n{'='*70}")
     print(f"  Reference Baseline Training Complete")
