@@ -1,0 +1,460 @@
+[
+  {
+    "cell": "efficientnet_b0_cifar100",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 856,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 64189184,
+      "discovered": 61901292,
+      "final": 61898740
+    },
+    "train_flops_units": {
+      "ref": 2503378176000,
+      "tsr": 2676396477180,
+      "tsr_without_candidates": 2473071603644,
+      "c2": 5090546865180
+    },
+    "hook_check": {
+      "ref": [
+        64189184,
+        64189184
+      ],
+      "discovered": [
+        61901292,
+        61901292
+      ],
+      "final+k": [
+        67065972,
+        67065972
+      ]
+    },
+    "batch_size": 128
+  },
+  {
+    "cell": "efficientnet_b0_cifar10",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 793,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 63958784,
+      "discovered": 89651524,
+      "final": 95126012,
+      "l1_pruned": 49769052
+    },
+    "train_flops_units": {
+      "ref": 2494392576000,
+      "tsr": 2883739814724,
+      "tsr_without_candidates": 2667188688772,
+      "c2": 6380149250724,
+      "l1_finetune": 3270789787200,
+      "l1_scratch": 4435385604000
+    },
+    "hook_check": {
+      "ref": [
+        63958784,
+        63958784
+      ],
+      "discovered": [
+        89651524,
+        89651524
+      ],
+      "final+k": [
+        102476908,
+        102476908
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 3898.97234082222
+  },
+  {
+    "cell": "efficientnet_b0_tiny_imagenet",
+    "k": 4,
+    "steps": 156200,
+    "decisions": 2361,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 252481536,
+      "discovered": 262998472,
+      "final": 262998472
+    },
+    "train_flops_units": {
+      "ref": 39437615923200,
+      "tsr": 49779677516760,
+      "tsr_without_candidates": 46004515606664,
+      "c2": 90860038843160
+    },
+    "hook_check": {
+      "ref": [
+        252481536,
+        252481536
+      ],
+      "discovered": [
+        262998472,
+        262998472
+      ],
+      "final+k": [
+        285694456,
+        285694456
+      ]
+    },
+    "batch_size": 64
+  },
+  {
+    "cell": "mobilenetv2_cifar100",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 1207,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 49153024,
+      "discovered": 43576976,
+      "final": 43576976
+    },
+    "train_flops_units": {
+      "ref": 1916967936000,
+      "tsr": 1977976807440,
+      "tsr_without_candidates": 1790449488848,
+      "c2": 3677478871440
+    },
+    "hook_check": {
+      "ref": [
+        49153024,
+        49153024
+      ],
+      "discovered": [
+        43576976,
+        43576976
+      ],
+      "final+k": [
+        48255216,
+        48255216
+      ]
+    },
+    "batch_size": 128
+  },
+  {
+    "cell": "mobilenetv2_cifar10",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 1255,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 48922624,
+      "discovered": 43500848,
+      "final": 43472248,
+      "l1_pruned": 33772248
+    },
+    "train_flops_units": {
+      "ref": 1907982336000,
+      "tsr": 1973925198632,
+      "tsr_without_candidates": 1786346363176,
+      "c2": 3670458270632,
+      "l1_finetune": 2434829404800,
+      "l1_scratch": 3225100008000
+    },
+    "hook_check": {
+      "ref": [
+        48922624,
+        48922624
+      ],
+      "discovered": [
+        43500848,
+        43500848
+      ],
+      "final+k": [
+        48152904,
+        48152904
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 3355.3263897895813
+  },
+  {
+    "cell": "mobilenetv2_tiny_imagenet",
+    "k": 4,
+    "steps": 156200,
+    "decisions": 2437,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 196100096,
+      "discovered": 113700816,
+      "final": 113700816
+    },
+    "train_flops_units": {
+      "ref": 30630834995200,
+      "tsr": 24028819267120,
+      "tsr_without_candidates": 21766524834480,
+      "c2": 41788886726320
+    },
+    "hook_check": {
+      "ref": [
+        196100096,
+        196100096
+      ],
+      "discovered": [
+        113700816,
+        113700816
+      ],
+      "final+k": [
+        125545104,
+        125545104
+      ]
+    },
+    "batch_size": 64
+  },
+  {
+    "cell": "resnet18_cifar100",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 446,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 1110937600,
+      "discovered": 1130547000,
+      "final": 1130547000
+    },
+    "train_flops_units": {
+      "ref": 43326566400000,
+      "tsr": 45416886095592,
+      "tsr_without_candidates": 42528006906600,
+      "c2": 89508219095592
+    },
+    "hook_check": {
+      "ref": [
+        1110937600,
+        1110937600
+      ],
+      "discovered": [
+        1130547000,
+        1130547000
+      ],
+      "final+k": [
+        1210438488,
+        1210438488
+      ]
+    },
+    "batch_size": 128
+  },
+  {
+    "cell": "resnet18_cifar10",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 407,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 1110845440,
+      "discovered": 1456440476,
+      "final": 1456440476,
+      "l1_pruned": 879987724
+    },
+    "train_flops_units": {
+      "ref": 43322972160000,
+      "tsr": 50608142164260,
+      "tsr_without_candidates": 47448297644964,
+      "c2": 107409320728260,
+      "l1_finetune": 57050780654400,
+      "l1_scratch": 77642493396000
+    },
+    "hook_check": {
+      "ref": [
+        1110845440,
+        1110845440
+      ],
+      "discovered": [
+        1456440476,
+        1456440476
+      ],
+      "final+k": [
+        1554940140,
+        1554940140
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 3781.1924438476562
+  },
+  {
+    "cell": "resnet18_imagenet100",
+    "k": 4,
+    "steps": 197900,
+    "decisions": 2076,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 3627225088,
+      "discovered": 4063873690,
+      "final": 4063873690
+    },
+    "train_flops_units": {
+      "ref": 717827844915200,
+      "tsr": 867130424724886,
+      "tsr_without_candidates": 799595152627398,
+      "c2": 1671371027975886
+    },
+    "hook_check": {
+      "ref": [
+        3627225088,
+        3627225088
+      ],
+      "discovered": [
+        4063873690,
+        4063873690
+      ],
+      "final+k": [
+        4466870090,
+        4466870090
+      ]
+    },
+    "batch_size": 64
+  },
+  {
+    "cell": "resnet18_tiny_imagenet",
+    "k": 4,
+    "steps": 78100,
+    "decisions": 906,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 4443545600,
+      "discovered": 3572163264,
+      "final": 3572163264,
+      "l1_pruned": 2543937856
+    },
+    "train_flops_units": {
+      "ref": 347040911360000,
+      "tsr": 310934398915520,
+      "tsr_without_candidates": 289473306438336,
+      "c2": 589920349833920,
+      "l1_finetune": 426513529981440,
+      "l1_scratch": 545722457913600
+    },
+    "hook_check": {
+      "ref": [
+        4443545600,
+        4443545600
+      ],
+      "discovered": [
+        3572163264,
+        3572163264
+      ],
+      "final+k": [
+        3859641600,
+        3859641600
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 11959.75475025177
+  },
+  {
+    "cell": "vgg16bn_cifar100",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 486,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 626495488,
+      "discovered": 800219424,
+      "final": 823620216
+    },
+    "train_flops_units": {
+      "ref": 24433324032000,
+      "tsr": 26807112332328,
+      "tsr_without_candidates": 25558654783272,
+      "c2": 58015669868328
+    },
+    "hook_check": {
+      "ref": [
+        626495488,
+        626495488
+      ],
+      "discovered": [
+        800219424,
+        800219424
+      ],
+      "final+k": [
+        866114840,
+        866114840
+      ]
+    },
+    "batch_size": 128
+  },
+  {
+    "cell": "vgg16bn_cifar10",
+    "k": 4,
+    "steps": 39000,
+    "decisions": 530,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 626403328,
+      "discovered": 795914412,
+      "final": 814160076,
+      "l1_pruned": 540280924
+    },
+    "train_flops_units": {
+      "ref": 24429729792000,
+      "tsr": 26649693035748,
+      "tsr_without_candidates": 25409629274052,
+      "c2": 57690355103748,
+      "l1_finetune": 32858112206400,
+      "l1_scratch": 45500685828000
+    },
+    "hook_check": {
+      "ref": [
+        626403328,
+        626403328
+      ],
+      "discovered": [
+        795914412,
+        795914412
+      ],
+      "final+k": [
+        856162940,
+        856162940
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 3084.416848897934
+  },
+  {
+    "cell": "vgg16bn_imagenet100",
+    "incomplete": true,
+    "note": "log ends at step 10800 of 395900; archived run is not the full discovery run"
+  },
+  {
+    "cell": "vgg16bn_tiny_imagenet",
+    "k": 4,
+    "steps": 78100,
+    "decisions": 860,
+    "replay_matches_checkpoint": true,
+    "flops_fwd": {
+      "ref": 2505777152,
+      "discovered": 3695943664,
+      "final": 3695943664,
+      "l1_pruned": 1439747872
+    },
+    "train_flops_units": {
+      "ref": 195701195571200,
+      "tsr": 239329906730448,
+      "tsr_without_candidates": 227888034820688,
+      "c2": 527983106888848,
+      "l1_finetune": 240678919092480,
+      "l1_scratch": 308145504374400
+    },
+    "hook_check": {
+      "ref": [
+        2505777152,
+        2505777152
+      ],
+      "discovered": [
+        3695943664,
+        3695943664
+      ],
+      "final+k": [
+        3890466224,
+        3890466224
+      ]
+    },
+    "batch_size": 128,
+    "l1_scratch_train_seconds": 6202.537776470184
+  }
+]
