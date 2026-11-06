@@ -54,7 +54,7 @@
 \begin{document}
 \maketitle
 \begin{abstract}
-A neural network learns how to use its channels during training, but where those channels sit is decided before the first gradient is taken, by convention rather than by the task. One part of a network can be starved of channels while another carries channels it barely uses. We ask whether training itself can revise this allocation. Topological Self-Regulation (TSR) treats channel width as a budgeted, revisable part of the model: silent candidate channels are attached throughout the network, the ordinary backward pass reveals which of them would be worth introducing and which incumbents contribute least, and capacity is transferred between them through edits that keep every dependent tensor consistent. A coupling calculus makes such edits valid across residual trunks, depthwise stacks, normalization state and optimizer moments, with exact accounting of the parameters they move. Across four image-classification families and four forecasting backbones, the discovered architectures match the dense reference at roughly fifteen percent fewer parameters in vision and at reductions reaching well over half the network in forecasting. Where the reduction is large, the task-directed allocation outperforms a random one of the same size, and pruning the same reference to the same count shows how much of that is reallocation rather than removal.
+A neural network learns how to use its channels during training, but where those channels sit is decided before the first gradient is taken, by convention rather than by the task. One part of a network can be starved of channels while another carries channels it barely uses. We ask whether training itself can revise this allocation. Topological Self-Regulation (TSR) treats channel width as a budgeted, revisable part of the model: silent candidate channels are attached throughout the network, the ordinary backward pass reveals which of them would be worth introducing and which incumbents contribute least, and capacity is transferred between them through edits that keep every dependent tensor consistent. A coupling calculus makes such edits valid across residual trunks, depthwise stacks, normalization state and optimizer moments, and the deployed parameter count is computed exactly from the edited tensors. Across four image-classification families and four forecasting backbones, the discovered architectures match the dense reference at roughly fifteen percent fewer parameters in vision and at reductions reaching well over half the network in forecasting. Where the reduction is large, the task-directed allocation outperforms a random one of the same size, and pruning the same reference to the same count shows how much of that is reallocation rather than removal.
 \end{abstract}
 
 \section{Introduction}
@@ -67,9 +67,9 @@ Width allocation occupies a middle ground between post hoc pruning, which asks w
 
 \section{Related Work}
 \label{sec:related}
-Cascade-Correlation learns candidate features from residual errors \citep{fahlman1989cascade}, and GradMax uses gradient information to initialize network growth \citep{evci2022gradmax}. TSR extends this perspective to candidate ports at interior sites and relates their sensitivity to removal. Its candidate objective is connected to covariance selection, with the centering and norm distinctions derived in \cref{app:candidates}. Net2Net provides a related foundation for preserving an existing function in a larger parameterization \citep{Chen2016}. Skeletonization and Taylor pruning measure the sensitivity of existing units \citep{mozer1988skeletonization,molchanov2017pruning}. Curvature refines the linear estimate when trained gradients become small \citep{lecun1989optimal,hassibi1992second}. DepGraph addresses the dependencies that constrain channel removal \citep{10204583}. Our coupling calculus extends this discipline to bidirectional edits and optimizer state. Width-allocation methods such as MorphNet and AutoSlim are relevant comparisons because they also redistribute capacity within an architectural family \citep{gordon2018morphnet,yu2020autoslim}. TSR makes these decisions from the evolving task gradient. Its edits produce dense networks with different widths, whereas dynamic sparse methods such as RigL reallocate individual connections \citep{evci2020rigging}. Further discussion appears in \cref{app:related}.
+\textbf{Growth and removal.} Cascade-Correlation learns candidate features from residual errors \citep{fahlman1989cascade}, Net2Net preserves a function while enlarging its parameterization \citep{Chen2016}, and GradMax uses gradient information to initialize new units \citep{evci2022gradmax}. TSR carries this perspective to candidate ports at interior sites and reads their sensitivity from the same backward pass as removal; its candidate objective is connected to covariance selection in \cref{app:candidates}. On the removal side, skeletonization and Taylor pruning measure the sensitivity of existing units \citep{mozer1988skeletonization,molchanov2017pruning}, curvature refines the linear estimate when trained gradients become small \citep{lecun1989optimal,hassibi1992second}, channel pruning removes dimensions from a trained network \citep{han2015learning,li2016pruning,he2017channel,liu2017learning}, and DepGraph resolves the dependencies that constrain channel removal \citep{10204583}. Our coupling calculus extends that discipline to edits in both directions and to optimizer state.
 
-Channel pruning removes dimensions from a trained network \citep{li2016pruning,he2017channel,liu2017learning}, while growth methods add them when new features appear useful. TSR combines the two as budgeted exchanges, so that an addition is always weighed against the cost of what it displaces. Dynamic sparse training reallocates a mask over individual weights and leaves the ambient shapes alone \citep{evci2020rigging}. Its structured form, SRigL, constrains that mask to whole neurons so the trained network can afterwards be condensed \citep{lasby2024dynamic}, and BilevelPruning learns a channel mask during training and applies it statically at the end \citep{gao2024bilevelpruning}. NeST grows connections and then prunes them in separate phases \citep{dai2019nest}, and structured continuous sparsification grows widths under a joint accuracy and sparsity objective \citep{yuan2021growing}. These are the closest training-time relatives of TSR. What separates them is what gets decided. A mask chooses which of the existing channels survive. TSR changes how many channels each site has, and can put capacity where the reference had none, editing every dependent tensor and every optimizer state to match. An unstructured sparsity result is context for this work rather than a control, and a structured mask controls the removal half of an exchange without controlling its growth half. MorphNet and AutoSlim redistribute capacity inside a family through regularization or a slimmable supernetwork \citep{8822c3c89a3f4ee0bf3b01a679aabd6b}, where TSR makes discrete decisions from the evolving task gradient. It also keeps a transparent correspondence between a discovered width vector and a retrainable static control, which is what allows the controls of \cref{sec:experiments} to locate the source of an effect. \Cref{app:related} expands these comparisons.
+\textbf{Structure changed during training.} Dynamic sparse training reallocates a mask over individual weights and leaves the ambient shapes alone \citep{evci2020rigging}; its structured form, SRigL, constrains the mask to whole neurons so the trained network can afterwards be condensed \citep{lasby2024dynamic}, and BilevelPruning learns a channel mask during training and applies it statically at the end \citep{gao2024bilevelpruning}. NeST grows connections and then prunes them in separate phases \citep{dai2019nest}, structured continuous sparsification grows widths under a joint accuracy and sparsity objective \citep{yuan2021growing}, and \citet{swiderski2025growing} grow and shrink networks during training with structural decisions guided by Monte Carlo tree search. MorphNet and AutoSlim redistribute capacity within an architectural family through a resource regularizer or a slimmable supernetwork \citep{gordon2018morphnet,8822c3c89a3f4ee0bf3b01a679aabd6b,yu2020autoslim}. What separates TSR is what gets decided and from what evidence. A mask chooses which existing channels survive; TSR changes how many channels each site has, can put capacity where the reference had none, and edits every dependent tensor and optimizer state to match, with growth and removal read from one backward pass and spent against one budget. An unstructured sparsity result is therefore context rather than a control, and a structured mask controls the removal half of an exchange without its growth half. TSR also keeps a transparent correspondence between a discovered width vector and a retrainable static control, which is what lets the controls of \cref{sec:experiments} locate the source of an effect. \Cref{app:related} expands these comparisons.
 
 \section{Structural Optimization}
 \label{sec:problem}
@@ -80,39 +80,39 @@ Channel pruning removes dimensions from a trained network \citep{li2016pruning,h
 \label{fig:method}
 \end{figure}
 
-\Cref{fig:method} shows the loop these definitions serve: the coupling groups the calculus recovers, the tests that decide which of them may be edited, the two signals read at a dormant candidate and at an incumbent, and the budgeted exchange that spends one against the other. The rest of this section and \cref{sec:theory} define its quantities in order.
+\Cref{fig:method} summarizes one structural update. Channels whose indices must change together, because a residual addition, a normalization layer or a consumer's input ties them, form a \emph{coupling group}, and only whole groups are resized. A group is editable when four tests pass (\cref{app:admissibility}): it has both a producer and a consumer; every normalizer over it computes per-channel statistics (Condition (N) below); no hard-coded reshape depends on its width (Condition (R)); and it is not fixed by the task, as the input and class dimensions are. For each editable group the controller reads two signals from the ordinary backward pass, a growth signal at \emph{candidate} channels that are attached but silent and a removal signal at \emph{incumbent} channels that already exist, divides each by the group's per-channel parameter cost $\kappa_\ell$, and moves capacity between groups under a budget. The rest of this section and \cref{sec:theory} define these quantities in order; \cref{tab:notation} collects the notation.
 
-Let $\Sset$ index channel groups that can be edited independently, with admissible widths $\bm n\in\mathcal N$ and weights $\theta\in\Theta(\bm n)$. We consider
+Let $\Sset$ index the editable coupling groups and collect their widths in a vector $\bm n$. The admissible set $\mathcal N$ contains the width vectors the architecture accepts, each width at or above a floor and consistent with the conditions of \cref{app:admissibility}, and $\theta\in\Theta(\bm n)$ are the weights of the network at widths $\bm n$. We consider
 \begin{equation}
 \min_{\bm n\in\mathcal N}\ \min_{\theta\in\Theta(\bm n)}
 \Lcal(\theta,\bm n)\quad\text{subject to}\quad C(\bm n)\le B,
 \label{eq:problem}
 \end{equation}
-where $\Lcal=\E[\ell(f_{\theta,\bm n}(x),y)]$ and $C$ counts deployed parameters. The architecture skeleton and task dimensions remain fixed.
+where $\Lcal=\E[\ell(f_{\theta,\bm n}(x),y)]$, $C$ counts deployed parameters, and $B$ is the budget, a prescribed parameter count (any additive cost can take its place, \cref{app:flops}). The architecture skeleton and task dimensions remain fixed.
 
-A coupling group $G$ carries an abstract index set $I_G$. Each occurrence of this index in a parameter or state tensor has a map $\rho_b:I_G\times\{1,\ldots,m_b\}\to\mathbb N$, where $m_b$ handles layouts such as a flattened spatial block. Residual addition identifies index sets, whereas concatenation preserves separate blocks and their offsets. An admissible edit changes $I_G$ through every represented map and respects divisibility, reshape, normalization, and task-interface constraints. Counting each shared parameter tensor once gives
+A coupling group $G$ carries an abstract index set $I_G$. Each occurrence $b$ of this index in a parameter or state tensor, such as a producer's output axis, a consumer's input axis, a normalization buffer or an optimizer moment, has a map $\rho_b:I_G\times\{1,\ldots,m_b\}\to\mathbb N$ to positions along that tensor's axis, where $m_b>1$ handles layouts in which one channel occupies several positions, such as a flattened spatial block. Residual addition identifies index sets, whereas concatenation preserves separate blocks and their offsets. An admissible edit changes $I_G$ through every represented map and respects divisibility, reshape, normalization, and task-interface constraints. Counting each shared parameter tensor once gives
 \begin{equation}
 C(\bm n)=\sum_T\prod_a d_{T,a}(\bm n),
 \label{eq:main-cost}
 \end{equation}
 so the exact resource change is a finite difference of $C$, not necessarily a sum of isolated marginal costs. Cross terms occur when two edited groups index different axes of one tensor. The complete index calculus and its operator-specific limitations are developed in \cref{app:coupling}.
 
-A candidate has incoming parameters $w_c$ and a port $v_c$ containing every independent outgoing coordinate through which it can affect retained computation. An admissible silent embedding satisfies $f_{\theta,w_c,0}=f_\theta$. Consequently,
+A candidate has incoming parameters $w_c$ and a \emph{port} $v_c$, its outgoing weights: every independent outgoing coordinate through which it can affect retained computation. An admissible silent embedding satisfies $f_{\theta,w_c,0}=f_\theta$. Consequently,
 \begin{equation}
 \nabla_\theta\Lcal(\theta,w_c,0)=\nabla_\theta\Lcal(\theta),
 \qquad \nabla_{w_c}\Lcal(\theta,w_c,0)=0,
 \label{eq:main-embedding}
 \end{equation}
-while $\nabla_{v_c}\Lcal$ need not vanish. Silence requires all paths from the candidate into retained outputs to be blocked, including statistical paths. Condition (N) excludes normalizers whose statistics span the edited axis: appending one value to $n$ shifts their shared mean by $q/(n+1)$ and their variance by an $O(1/n)$ amount (\cref{eq:normstats}), so a zero outgoing port cannot prevent LayerNorm over the edited feature axis or ordinary GroupNorm from perturbing retained coordinates. Condition (R) requires compatibility with hardcoded reshapes such as multi-head splits. Here ``topological'' is used in the sense of the topological derivative of shape optimization \citep{sokolowski1999topological,novotny2012topological}: it refers to adjoining a graph coordinate and differentiating at its silent embedding, and it is not a coordinate-free graph invariant. When the original weights are stationary, a nonzero $u_c$ makes the silent embedding non-stationary and a vanishing $u_c$ with a nonzero mixed block makes it a strict saddle \citep{ge2015escaping} (\cref{prop:escape}). \Cref{app:embedding,app:admissibility} supply the proofs and the full analytic and architectural conditions.
+while $\nabla_{v_c}\Lcal$ need not vanish. Silence requires all paths from the candidate into retained outputs to be blocked, including statistical paths, which gives two architectural conditions. Condition (N): no normalizer may compute statistics that span the edited axis. Appending one value to $n$ shifts such a shared mean by $q/(n+1)$ and the variance by an $O(1/n)$ amount (\cref{eq:normstats}), so a zero port cannot stop LayerNorm \citep{ba2016layer} over the edited feature axis or ordinary GroupNorm \citep{wu2018group} from perturbing retained coordinates; per-channel BatchNorm and InstanceNorm \citep{ioffe2015batch,ulyanov2016instance} satisfy (N). Condition (R): the width must remain compatible with hard-coded reshapes, such as the head split of multi-head attention \citep{vaswani2017attention}. Here ``topological'' is used in the sense of the topological derivative of shape optimization \citep{sokolowski1999topological,novotny2012topological}: it refers to adjoining a graph coordinate and differentiating at its silent embedding, and it is not a coordinate-free graph invariant. When the original weights are stationary, a nonzero $u_c$ makes the silent embedding non-stationary and a vanishing $u_c$ with a nonzero mixed block makes it a strict saddle \citep{ge2015escaping} (\cref{prop:escape}). \Cref{app:embedding,app:admissibility} supply the proofs and the full analytic and architectural conditions.
 
 \section{From Sensitivity to Reallocation}
 \label{sec:theory}
-The topological derivative is
+Throughout, the \emph{sensitivity} of a channel is the gradient of the loss with respect to its port. At a silent candidate it is called the topological derivative,
 \begin{equation}
 u_c=\left.\nabla_{v_c}\Lcal(\theta,w_c,v_c)\right|_{v_c=0}.
 \label{eq:derivative}
 \end{equation}
-If an independent port coordinate $s$ is tied across uses $q\in\mathcal U_s$, reverse-mode differentiation gives
+A port coordinate $s$ can be used at several places in the computation; for a convolution, one weight is applied at every spatial position. Writing $\mathcal U_s$ for the set of those uses, and $a_{s,q}$ and $g_{s,q}$ for the activation entering use $q$ and the loss gradient leaving it, reverse-mode differentiation gives
 \begin{equation}
 (u_c)_s=\E\!\left[\sum_{q\in\mathcal U_s}a_{s,q}g_{s,q}\right].
 \label{eq:main-port-uses}
@@ -135,7 +135,29 @@ Because dormant incoming weights receive no task gradient (\cref{eq:main-embeddi
 \qquad C(\bm n')\le B,
 \label{eq:exchange}
 \end{equation}
-where $\eta$ covers estimation error, model remainder, and interaction between edits, and the true decrease then exceeds $\delta$ (\cref{app:exchange}). The released controller does not evaluate this test. Under the same calibrated quantities, three further statements hold. A fractional relaxation is stable at a tight budget exactly when a single shadow price separates every growth density from every removal density, which does not characterize indivisible exchanges (\cref{app:allocation}). A gradient-directed birth has a $\Theta(\sqrt d)$ first-order advantage over a uniformly random port direction, and a random bank needs exponentially many directions in $d$ to recover a fixed fraction of it (\cref{app:random}). And the number of certified events is bounded by the initial loss and the positive variation of every other transition (\cref{app:events}). None of these three transfers to the released heuristic, whose forced feasibility removals and tolerance-based edits are not certified events. What it does inherit is everything above the certificate: the silent embedding, the port derivative and the consistency of a group edit hold for the released controller as they stand, and the calibrated results delimit what its surrogate scores can be expected to recover.
+where $\eta$ covers estimation error, model remainder, and interaction between edits, and the true decrease then exceeds $\delta$ (\cref{app:exchange}). The released controller does not evaluate this test. Under the same calibrated quantities, three further statements hold. A fractional relaxation is stable at a tight budget exactly when a single shadow price separates every growth density from every removal density, which does not characterize indivisible exchanges (\cref{app:allocation}). A gradient-directed birth has a $\Theta(\sqrt d)$ first-order advantage over a uniformly random port direction, and a random bank needs exponentially many directions in $d$ to recover a fixed fraction of it (\cref{app:random}). And the number of certified events is bounded by the initial loss and the positive variation of every other transition (\cref{app:events}). None of these three transfers to the released heuristic, whose forced feasibility removals and tolerance-based edits are not certified events. What it does inherit is everything above the certificate: the silent embedding, the port derivative and the consistency of a group edit hold for the released controller as they stand, and the calibrated results delimit what its surrogate scores can be expected to recover. \Cref{tab:theory-scope} lists each result against the two levels.
+
+\begin{table}[t]
+\centering
+\caption{Scope of the analysis. ``Proved'' results hold under the assumptions stated with them; the right column says what carries over to the released controller.}
+\label{tab:theory-scope}
+\footnotesize
+\setlength{\tabcolsep}{3.0pt}
+\begin{tabular}{@{}p{0.42\textwidth}p{0.13\textwidth}p{0.42\textwidth}@{}}
+\toprule
+Result & Calibrated & Released controller \\
+\midrule
+Silent embedding and gradient structure (\cref{lem:embed}) & proved & holds \\
+Port derivative at tied uses (\cref{prop:port}) & proved & holds \\
+Consistent group edit, exact deployed count (\cref{app:coupling}) & proved & holds \\
+Birth along the measured direction (\cref{prop:blockbirth}) & proved & holds for growth after the revision of \cref{app:materialization}; $60\%$ of archived births before it \\
+Loss-decrease certificate for an exchange (\cref{eq:exchange}) & proved & not evaluated; scores used as ranks \\
+Shadow-price stability at a tight budget (\cref{app:allocation}) & proved & no \\
+$\Theta(\sqrt d)$ advantage over a random port (\cref{app:random}) & proved & for births along the measured direction \\
+Bound on the number of certified events (\cref{app:events}) & proved & no; feasibility removals are forced \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \section{Methodology}
 \label{sec:method}
@@ -149,9 +171,9 @@ The implementation traces a model with PyTorch's symbolic tracer, propagates sha
 \label{fig:network-phases}
 \end{figure}
 
-Condition (N) admits per-channel BatchNorm and InstanceNorm \citep{ioffe2015batch,ulyanov2016instance} on their channel axes and excludes feature-spanning LayerNorm and GroupNorm \citep{ba2016layer,wu2018group}. Condition (R) excludes incompatible reshapes and head arithmetic \citep{vaswani2017attention}. Input variates, lookback, class count, and forecast horizon remain task-fixed even when an isolated tensor could be sliced. The plastic set this leaves in each backbone, and the one-index probe the forecasting harness runs before attaching candidates, are given in \cref{app:admissibility}.
+In the backbones used here, the two conditions leave the convolutional channel groups plastic, the feature-mixing hidden widths of TSMixer, and in the transformers only the feed-forward widths, since LayerNorm spans the residual width and head arithmetic constrains the attention projections. Input variates, lookback, class count, and forecast horizon remain task-fixed even when an isolated tensor could be sliced. The plastic set this leaves in each backbone, and the one-index probe the forecasting harness runs before attaching candidates, are given in \cref{app:admissibility}.
 
-For each eligible width, the bank appends $k$ random producer rows and zero consumer columns. These rows cost computation despite functional silence, about $2\%$ of the dense parameters and compute at $k=4$ (\cref{app:candidate-bank}). For disjoint consumer blocks, the released growth score is
+For each eligible width, the bank appends $k$ random producer rows and zero consumer columns. These rows cost computation despite functional silence: about $2\%$ of the dense parameters at $k=4$, and $5$--$10\%$ of its training compute, since candidates sit at every editable site including the early high-resolution ones (\cref{app:candidate-bank,app:compute}). For disjoint consumer blocks, the released growth score is
 \begin{equation}
 \bar q_c=K^{-1}\sum_{t=1}^K\norm{u_{t,c}}_2,
 \qquad \norm{u_{t,c}}_2^2=\sum_r\norm{u_{t,c}^{(r)}}_2^2.
@@ -235,9 +257,9 @@ EfficientNet-B0& C-10 & $-15.01$ & 90.78 & 90.61 & 90.21 & $-0.17$ & $-0.57$ & $
 
 \section{Vision Results}
 \label{sec:vision-results}
-\Cref{tab:vision} reports the complete vision grid, four backbones on four datasets with all three arms archived in every one of the sixteen cells. A single training run discovers a width vector that carries the dense model's accuracy at $15.0$--$18.1\%$ fewer parameters: the median difference is $0.22$ points, and ten of the sixteen differences are smaller than the range the dense reference itself covers across seeds (\cref{app:seeds}). No dense pre-training stage, proxy task or search budget beyond that run is involved. Three cells cost more than a point, all of them MobileNetV2, the smallest and most parameter-efficient backbone in the suite, whose inverted residuals leave the least redundancy to reclaim. The largest gain, $+0.48$ points at $16.4\%$ fewer parameters, is EfficientNet-B0 on ImageNet-100. Against structured pruning of the same reference to the same count, the online arm lands within the seed spread of a fine-tuned pipeline that costs $40$ more epochs and needs a trained network to start from, and the discovered allocation is ahead of a magnitude-ranked one by $0.26$ points on average when neither inherits those weights, a margin most cells do not separate from the seed (\cref{app:pruning}). \Cref{app:vision-results} gives the per-cell figures.
+\Cref{tab:vision} reports the complete vision grid, four backbones on four datasets with all three arms archived in every one of the sixteen cells. A single training run discovers a width vector that carries the dense model's accuracy at $15.0$--$18.1\%$ fewer parameters: the median difference is $0.22$ points, and ten of the sixteen differences are within the $0.28$-point range that the dense reference covers across three seeds in the repeated MobileNetV2 cell (\cref{app:seeds}). No dense pre-training stage, proxy task or search budget beyond that run is involved. Three cells cost more than a point, all of them MobileNetV2, the smallest and most parameter-efficient backbone in the suite, whose inverted residuals leave the least redundancy to reclaim. The largest gain, $+0.48$ points at $16.4\%$ fewer parameters, is EfficientNet-B0 on ImageNet-100. Against structured pruning of the same reference to the same count, the online arm lands within the seed spread of a fine-tuned pipeline that needs a trained network to start from and costs more training compute in every cell where both are measured (\cref{app:compute}), and the discovered allocation is ahead of a magnitude-ranked one by $0.26$ points on average when neither inherits those weights, a margin most cells do not separate from the seed (\cref{app:pruning}). \Cref{app:vision-results} gives the per-cell figures.
 
-What the controller exports is a transferable architecture rather than a trajectory-dependent solution: the online arm's median difference against its own retrained twin is $-0.03$ points. That comparison never involves the dense arm, so it is unaffected by how well the reference was trained, and it says that searching and training at once costs essentially nothing against retraining the same shape from scratch. The controller optimizes the resource it is given. Under the parameter budget forward FLOPs fall in seven of the fifteen measured cells and rise in eight, because parameters concentrate in late, narrow-spatial layers while computation concentrates in early, wide ones. That dependence is actionable rather than incidental, because $\kappa$ is defined against any additive cost: re-running EfficientNet-B0 and MobileNetV2 under a FLOP budget, with the same controller, schedule and recipe, delivers a $13$--$15\%$ compute reduction in all four cells at one seed each, including the one where a parameter budget had instead raised FLOPs by $40.2\%$ and where the FLOP-budgeted model now matches the dense reference exactly (\cref{app:flops}).
+What the controller exports is a transferable architecture rather than a trajectory-dependent solution: the online arm's median difference against its own retrained twin is $-0.03$ points. That comparison never involves the dense arm, so it is unaffected by how well the reference was trained, and it says that searching and training at once costs essentially nothing against retraining the same shape from scratch. The controller optimizes the resource it is given. Under the parameter budget forward FLOPs fall in seven of the sixteen cells and rise in nine, because parameters concentrate in late, narrow-spatial layers while computation concentrates in early, wide ones. That dependence is actionable rather than incidental, because $\kappa$ is defined against any additive cost: re-running EfficientNet-B0 and MobileNetV2 under a FLOP budget, with the same controller, schedule and recipe, delivers a $13$--$15\%$ compute reduction in all four cells at one seed each, including the one where a parameter budget had instead raised FLOPs by $40.2\%$ and where the FLOP-budgeted model now matches the dense reference exactly (\cref{app:flops}).
 
 \begin{table}[t]
 \centering
@@ -267,16 +289,16 @@ TSMixer    & Elec.  & $-86.2$ & 0.1706 & 0.1563 & 0.1742 & $-0.0143$ & $-8.38^{\
            & Traffic& $-81.3$ & 0.4896 & 0.4985 & 0.5354 & $+0.0089$ & $+1.82$ & $+1.98$ & $+2.04$ & $+0.74$ & $+0.94$ & $+0.74$ \\
            & Weather& $-45.0$ & 0.1609 & 0.1582 & 0.1814 & $-0.0027$ & $-1.68$ & -- & -- & -- & -- & $-1.12$ \\
 \midrule
-\multicolumn{7}{@{}l}{mean, eight Electricity and Traffic knees} & $-0.30$ & $-0.53$ & $-0.66$ & $-0.64$ & $+0.15$ & -- \\
+\multicolumn{7}{@{}l}{mean, seven Electricity and Traffic knees (excl.\ $\dagger$)} & $+0.86$ & $+0.44$ & $+0.36$ & $+0.44$ & $+1.42$ & -- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \section{Forecasting Results}
 \label{sec:ts-results}
-\Cref{tab:timeseries} reports the forecasting campaign in the format of \cref{tab:vision}, with test MSE in place of top-1 accuracy. One difference in protocol matters for reading it: each configuration is swept across a range of budgets and the table reports its \emph{knee}, the tightest budget whose retrained architecture stays within $3\%$ of the dense reference, a tolerance fixed before the results were read. Its right-hand block is structured pruning at those same knees, on which the discovered and the pruned allocations are level (\cref{app:pruning}). Compression at that tolerance spans an order of magnitude, from $17\%$ to $86\%$ fewer parameters, and the sweep locates that figure for each configuration rather than assuming it. The share left plastic by the admissibility conditions of \cref{app:admissibility} orders the backbones and the variate count orders the datasets, so the same TCN reaches a knee at $17\%$ on one dataset and $86\%$ on another. The knee is therefore a measurement of how much capacity the task uses, one that no single fixed budget would have produced. On three Weather cells it is the tightest budget swept, so the reduction reported there is a lower bound (\cref{app:ts-results}).
+\Cref{tab:timeseries} reports the forecasting campaign in the format of \cref{tab:vision}, with test MSE in place of top-1 accuracy. One difference in protocol matters for reading it: each configuration is swept across a range of budgets and the table reports its \emph{knee}, the tightest budget whose retrained architecture stays within $3\%$ of the dense reference, a tolerance fixed before the results were read. Its right-hand block is structured pruning at those same knees, where pruning is slightly ahead of the retrained allocation, by under half a percent of the metric on average (\cref{app:pruning}). Compression at that tolerance spans an order of magnitude, from $17\%$ to $86\%$ fewer parameters, and the sweep locates that figure for each configuration rather than assuming it. The share left plastic by the admissibility conditions of \cref{app:admissibility} orders the backbones and the variate count orders the datasets, so the same TCN reaches a knee at $17\%$ on one dataset and $86\%$ on another. The knee is therefore a measurement of how much capacity the task uses, one that no single fixed budget would have produced. On three Weather cells it is the tightest budget swept, so the reduction reported there is a lower bound (\cref{app:ts-results}).
 
-The random-width control asks whether the task signal chose the allocation or whether any allocation of that size would have served. At the knee the discovered allocation has lower test MSE than a random one of the same parameter count in all eight Electricity and Traffic cells, by $2.3$--$5.2\%$ of the metric on TSMixer and the TCN, well clear of the seed spread (\cref{app:seeds}). Where little capacity has to move, or where the task does not use what is being moved, the margins fall inside that spread, which is what a controller whose only objective is the resource constraint should produce.
+The random-width control asks whether the task signal chose the allocation or whether any allocation of that size would have served. At the knee the discovered allocation has lower test MSE than a random one of the same parameter count in all eight Electricity and Traffic cells, by $2.3$--$5.2\%$ of the metric on TSMixer and the TCN. Where repeats exist those margins are clear of the seed spread, except on the TCN for Electricity, where the random control's own spread is of the same order (\cref{app:seeds}). Where little capacity has to move, or where the task does not use what is being moved, the margins fall inside that spread, which is what a controller whose only objective is the resource constraint should produce.
 
 Two readings depend on keeping the arms separate. The online arm is measured at its search-converged architecture, reached early on Weather, so the anneal applies most of its removals to a network that has already converged and its error sits above the reference. The retrained arm on the identical architecture lands inside the tolerance at every Weather knee, which localizes that cost to the schedule rather than to the search. In the other direction, TSMixer on Electricity places the retrained arm $8.4\%$ below its own dense reference while the online run only matches it. That reference is undertrained: its recipe is the worst of six settings swept, and a better-tuned dense arm reaches a test MSE of $0.1519$, against which the retrained model is $2.9\%$ worse rather than $8.4\%$ better. We exclude the cell rather than count it as a gain. A two-arm design would have reported it as the headline number (\cref{app:ts-results}).
 
@@ -290,7 +312,7 @@ Three boundaries remain. Most cells are single-seed, with the repeats of \cref{a
 
 \section{Conclusion}
 \label{sec:conclusion}
-Topological Self-Regulation treats channel width as a budgeted, revisable part of a model and gives training the means to revise it. Its two components are separable. A coupling calculus makes a proposed edit valid across every dependent tensor, with exact accounting of the parameters it moves. A sensing rule reads a topological derivative from the ordinary backward pass at a silent candidate and pairs it with a removal saliency at incumbents. Across four image-classification families and four forecasters, the combination reallocates a fixed skeleton to a smaller budget inside a single training run, without the trained network and fine-tuning stage that structured pruning requires, at a median cost of $0.28$ points of accuracy for that run and $0.22$ for the allocation it exports in vision, and inside a fixed tolerance of test error for the exported allocation in forecasting. The allocation it exports trains on its own, beats a random one of the same size where the budget forces capacity to move, and can be spent on parameters or on compute. A neural network, we believe, should be allowed to decide its own structure.
+Topological Self-Regulation treats channel width as a budgeted, revisable part of a model and gives training the means to revise it. Its two components are separable. A coupling calculus makes a proposed edit valid across every dependent tensor, and the deployed count is computed exactly from the edited tensors. A sensing rule reads a topological derivative from the ordinary backward pass at a silent candidate and pairs it with a removal saliency at incumbents. Across four image-classification families and four forecasters, the combination reallocates a fixed skeleton to a smaller budget inside a single training run, without the trained network and fine-tuning stage that structured pruning requires, at a median cost of $0.28$ points of accuracy for that run and $0.22$ for the allocation it exports in vision, and inside a fixed tolerance of test error for the exported allocation in forecasting. The allocation it exports trains on its own, beats a random one of the same size where the budget forces capacity to move, and can be spent on parameters or on compute. A neural network, we believe, should be allowed to decide its own structure.
 
 \label{main:end}
 
@@ -358,6 +380,7 @@ the evidence separates from run-to-run variation and which it does not. The cont
 \pdfbookmark[1]{Appendix contents}{appendix_contents}
 \small
 \setlength{\parskip}{2pt}
+\appendixcontentsentry{app:notation}
 \appendixcontentsentry{app:embedding}
 \appendixcontentsentry{app:candidates}
 \appendixcontentsentry{app:growth}
@@ -389,11 +412,48 @@ the evidence separates from run-to-run variation and which it does not. The cont
 \appendixcontentsentry{app:experiments}
 \appendixcontentsentry{app:vision-results}
 \appendixcontentsentry{app:flops}
+\appendixcontentsentry{app:compute}
 \appendixcontentsentry{app:pruning}
 \appendixcontentsentry{app:ts-results}
 \appendixcontentsentry{app:seeds}
 \appendixcontentsentry{app:case-studies}
 \normalsize
+\clearpage
+
+\section{Notation}
+\label{app:notation}
+\begin{table}[h]
+\centering
+\caption{Notation. Defaults are those of the released controller and the archived campaign.}
+\label{tab:notation}
+\footnotesize
+\setlength{\tabcolsep}{4.0pt}
+\begin{tabular}{@{}p{0.22\textwidth}p{0.72\textwidth}@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$\Sset$, $\ell$ & the editable coupling groups; one group \\
+$\bm n$, $n_\ell$, $\mathcal N$ & width vector; width of group $\ell$; admissible width vectors (floor $8$) \\
+$\theta$, $\Theta(\bm n)$ & weights; weights of the network at widths $\bm n$ \\
+$C(\bm n)$ & deployed parameter count, shared tensors counted once (\cref{eq:main-cost}) \\
+$B$; $C_0$, $B^*$, $B(t)$ & budget; initial count, target ($0.85\,C_0$ in vision) and annealed ceiling at step $t$ \\
+$\alpha$ & fraction of training over which $B(t)$ anneals ($0.5$ vision, $0.3$ forecasting) \\
+$I_G$, $b$, $\rho_b$, $m_b$ & index set of group $G$; one occurrence of it in a tensor; its map to tensor positions; positions per channel \\
+$w_c$, $v_c$ & a candidate's incoming weights and its port (outgoing weights), held at $v_c=0$ while dormant \\
+$u_c$ & topological derivative: loss gradient at the candidate's port at $v_c=0$ (\cref{eq:derivative}) \\
+$v_j$, $u_j$ & an incumbent's port and the loss gradient there \\
+$\mathcal U_s$; $a_{s,q}$, $g_{s,q}$ & uses of port coordinate $s$; activation entering and gradient leaving use $q$ \\
+$k$ & dormant candidates per editable group ($4$) \\
+$K$ ($=T_{\mathrm{struct}}$) & optimizer steps between structural updates, and the sensing window ($100$) \\
+$\bar q_c$, $\bar s_j$ & windowed growth score of a candidate and removal score of an incumbent (\cref{eq:implemented-growth-score,eq:implemented-removal-score}) \\
+$\widetilde H$ & curvature coefficient in the removal score ($1.0$) \\
+$\kappa_\ell$, $\widetilde\kappa_\ell$ & per-channel parameter cost of group $\ell$; its bundle-based estimate used by the controller \\
+$\widetilde\gamma_\ell$, $\widetilde\rho_\ell$ & growth and removal densities, score per unit cost (\cref{eq:main-practical-densities}) \\
+$\delta$, $\varepsilon$ & exchange margin ($10^{-7}$); norm of a newborn port ($10^{-3}$) \\
+$G_c$, $R_j$, $\eta$ & calibrated variant only: lower bound on a birth's gain, upper bound on a deletion's damage, error allowance (\cref{eq:gainremoval,eq:exchange}) \\
+\bottomrule
+\end{tabular}
+\end{table}
 \clearpage
 
 \section{Silent Embeddings and the Port Derivative}
@@ -1035,7 +1095,7 @@ This section collects the execution details supporting the short methodology in 
 \label{app:candidate-bank}
 In the released controller, the most recent minibatch gradient, rather than the scalar window average, supplies the block directions used at birth. Each optimizer step is immediately followed by projecting candidate ports to zero. Projection does not clear optimizer moments, and candidate gradients can affect global clipping; the complete execution order follows.
 
-For a group with $n_\ell$ real channels, a bank of $k$ candidates extends the associated tensors with $k$ additional indices. The overhead is that of $k$ extra channels per editable group and nothing else: the bank adds $k\sum_\ell\kappa_\ell$ parameters, where $\kappa_\ell$ is the per-channel parameter cost of group $\ell$, and the same fraction of forward and backward computation, since a candidate is an ordinary channel whose outgoing weights happen to be zero. For the archived runs at $k=4$ this is $266{,}396$ parameters on ResNet-18 ($2.4\%$ of the dense reference) and $284{,}056$ on VGG-16-BN ($1.9\%$), computed exactly from the replayed group costs of \cref{app:case-studies}; memory grows by the same fraction plus the optimizer moments of those rows. Sensing costs no additional pass, because the port derivative is read from the gradients the training step already produces, and the structural update itself runs once every $K=100$ steps. Incoming producer rows are Kaiming-initialized. Every independent consumer coordinate through which a candidate can affect retained outputs is set to zero. A candidate port may span several tensors. In a block with squeeze-and-excitation, it must include connections into the gate-generating branch as well as ordinary downstream consumers, as derived in \cref{app:coupling}.
+For a group with $n_\ell$ real channels, a bank of $k$ candidates extends the associated tensors with $k$ additional indices. The overhead is that of $k$ extra channels per editable group and nothing else: the bank adds $k\sum_\ell\kappa_\ell$ parameters, where $\kappa_\ell$ is the per-channel parameter cost of group $\ell$, and the forward and backward computation of those channels, since a candidate is an ordinary channel whose outgoing weights happen to be zero. The two fractions differ: early, high-resolution groups have cheap channels in parameters and expensive ones in computation, so the bank's share of training compute, $5$ to $10$ percent across the archived runs (\cref{app:compute}), exceeds its share of parameters. For the archived runs at $k=4$ this is $266{,}396$ parameters on ResNet-18 ($2.4\%$ of the dense reference) and $284{,}056$ on VGG-16-BN ($1.9\%$), computed exactly from the replayed group costs of \cref{app:case-studies}; memory grows by the same fraction plus the optimizer moments of those rows. Sensing costs no additional pass, because the port derivative is read from the gradients the training step already produces, and the structural update itself runs once every $K=100$ steps. Incoming producer rows are Kaiming-initialized. Every independent consumer coordinate through which a candidate can affect retained outputs is set to zero. A candidate port may span several tensors. In a block with squeeze-and-excitation, it must include connections into the gate-generating branch as well as ordinary downstream consumers, as derived in \cref{app:coupling}.
 
 The parameter gradient at these zero entries is the measured port derivative. It must be read after backpropagation and before an optimizer update replaces the current state. An ordinary update would generally move the entries away from zero. All dormant ports are therefore re-zeroed after every optimizer step and once more after a batch of structural edits. No subsequent forward pass should intervene before this projection. The projected model retains silence even though its stored optimizer state may contain nonzero port moments. If an optimizer applies a coupled transformation to the entire gradient, such as global-norm clipping, unmasked candidate port gradients can rescale updates of the real weights even while the represented function remains unchanged. The function-preserving embedding guarantees equality of raw task gradients on real coordinates, not equality of every optimizer update. This effect should be tested or avoided when comparing discovery training with ordinary training.
 
@@ -1121,7 +1181,8 @@ The released operation that promotes a selected candidate into the real index se
 v_c^{(r)}=-\varepsilon\,u_c^{(r)}/\norm{u_c^{(r)}}_2.
 \label{eq:materialize}
 \end{equation}
-Its first-order change is $-\varepsilon\sum_r\norm{u_c^{(r)}}_2$ and its joint step norm is $\varepsilon\sqrt{m}$ when all $m$ blocks are nonzero, as shown in \cref{prop:blockbirth}. The routine uses the gradient left by the most recent minibatch backward pass, not a vector averaged over the sensing window. If a consumer gradient is absent, it falls back to a small random block, for which no measured-direction guarantee applies. The calibrated Euclidean variant instead uses the single joint denominator $v_c=-\varepsilon u_c/\norm{u_c}_2$. For a single consumer the two rules coincide.
+Its first-order change is $-\varepsilon\sum_r\norm{u_c^{(r)}}_2$ and its joint step norm is $\varepsilon\sqrt{m}$ when all $m$ blocks are nonzero, as shown in \cref{prop:blockbirth}. The routine uses the gradient left by the most recent minibatch backward pass, not a vector averaged over the sensing window. If a consumer gradient is absent, it falls back to a small random block, for which no measured-direction guarantee applies. In the released controller this fallback is not rare. An exchange applies its removal first, and a removal replaces every tensor it edits, discarding that tensor's gradient; when the removal touches the grown group's consumer, which is always the case when both halves of the exchange fall in one group, the newborn port opens in a random direction. Replaying the archived decision logs, this happened for $1{,}512$ of the $3{,}801$ births ($40\%$): none in EfficientNet-B0, MobileNetV2 or the VGG-16-BN CIFAR runs, $33\%$ on VGG-16-BN Tiny-ImageNet, and $12$ to $60\%$ on ResNet-18, whose exchanges almost always remove and add within the same group. Applying the growth half first keeps the gradient attached and is otherwise index-identical, because a promoted channel is appended after every existing index. The revised controller does so; every other result in this paper uses the released order, and the two are compared directly in the growth ablation.
+% TODO(rebuttal): cite the grow-first vs prune-first ablation (results/ablations) once complete. The calibrated Euclidean variant instead uses the single joint denominator $v_c=-\varepsilon u_c/\norm{u_c}_2$. For a single consumer the two rules coincide.
 
 A fresh candidate with random incoming weights and a zero port replenishes the bank so it retains $k$ dormant proposals. The promoted feature changes the represented function when its port opens. Only its preceding silent embedding is exactly function-preserving under the stated admissibility conditions.
 
@@ -1151,11 +1212,11 @@ Resource-aware width methods are closer in spirit, but they use different eviden
 
 \section{Experimental Protocol Details}
 \label{app:experiments}
-The vision benchmark characteristics extend the motivation in \cref{sec:experiments}. CIFAR-10 and CIFAR-100 each use $32\times32$ images and the official 50,000/10,000 train/test split, but differ by a factor of ten in label cardinality. Tiny-ImageNet-200 uses 200 classes of $64\times64$ images with 100,000 training and 10,000 validation examples. ImageNet-100 is a fixed 100-class subset with approximately 126,689 training and 5,000 validation images at $224\times224$. CIFAR training uses random $32\times32$ crops with four-pixel padding and horizontal flips. Tiny-ImageNet uses random $64\times64$ crops with eight-pixel padding and horizontal flips. ImageNet-100 uses random resized $224\times224$ crops and horizontal flips, followed at evaluation by resizing to 256 and taking a $224\times224$ center crop. Every transform is shared across its three arms. CIFAR and Tiny-ImageNet use a $3\times3$, stride-one stem without the ImageNet max-pooling reduction where applicable. ImageNet-100 retains the standard $7\times7$, stride-two stem and max pool. VGG uses global adaptive pooling, while MobileNetV2 and EfficientNet-B0 reduce the initial stride on the lower-resolution datasets.
+The vision benchmark characteristics extend the motivation in \cref{sec:experiments}. CIFAR-10 and CIFAR-100 each use $32\times32$ images and the official 50,000/10,000 train/test split, but differ by a factor of ten in label cardinality. Tiny-ImageNet-200 uses 200 classes of $64\times64$ images with 100,000 training and 10,000 validation examples. ImageNet-100 is a fixed 100-class subset with 126,689 training and 5,000 validation images at $224\times224$. CIFAR training uses random $32\times32$ crops with four-pixel padding and horizontal flips. Tiny-ImageNet uses random $64\times64$ crops with eight-pixel padding and horizontal flips. ImageNet-100 uses random resized $224\times224$ crops and horizontal flips, followed at evaluation by resizing to 256 and taking a $224\times224$ center crop. Every transform is shared across its three arms. CIFAR and Tiny-ImageNet use a $3\times3$, stride-one stem without the ImageNet max-pooling reduction where applicable. ImageNet-100 retains the standard $7\times7$, stride-two stem and max pool. VGG uses global adaptive pooling, while MobileNetV2 and EfficientNet-B0 reduce the initial stride on the lower-resolution datasets.
 
 Vision models train for 100 epochs with cross-entropy, SGD with Nesterov momentum $0.9$, initial learning rate $0.1$, weight decay $5\times10^{-4}$, and per-step cosine decay. The usual batch size is 128, reduced to 64 for ImageNet-100. The discovery run uses $k=4$ candidates per eligible group, a 100-step structural window, minimum width 8, and a target equal to $85\%$ of the reference parameter count. The ceiling reaches this target halfway through training. Automatic mixed precision is applied consistently across matched arms when enabled. These values describe the archived campaign rather than a tuned optimum for each dataset. In particular, the $85\%$ target is held fixed across every vision configuration by design, as \cref{sec:experiments} states; the archived vision campaign contains no sweep over it, and none of the conclusions below rest on that value being a limit.
 
-For forecasting, Weather, Electricity, and Traffic \citep{lai2018modeling,zhou2021informer} contain respectively 21, 321, and 862 variates, and all three use chronological 70/10/20-percent partitions. Validation and test windows may read the preceding split for input context, but their targets remain inside the held-out interval. Per-variate means and standard deviations are fitted on the training partition only. TCN and TSMixer use lookback 96. PatchTST and iTransformer use lookback 336, matching their standard long-range configuration. Forecast horizons are 96 and 720, with the four-backbone compression frontier run first at horizon 96.
+For forecasting, Weather, Electricity, and Traffic \citep{lai2018modeling,zhou2021informer} contain respectively 21, 321, and 862 variates, and all three use chronological 70/10/20-percent partitions. Validation and test windows may read the preceding split for input context, but their targets remain inside the held-out interval. Per-variate means and standard deviations are fitted on the training partition only. TCN and TSMixer use lookback 96. PatchTST and iTransformer use lookback 336, matching their standard long-range configuration. Every reported forecasting result is at horizon 96; runs at horizon 720 are not reported because their controls are incomplete (\cref{sec:discussion}).
 
 The TCN has four residual dilated-convolution blocks with dilations $1,2,4,8$, hidden width 64, and BatchNorm. PatchTST uses patch length 16, stride 8, $d_{\rm model}=128$, three blocks, eight heads, and $d_{\rm ff}=512$. iTransformer uses variate tokens with the same model width, block count, and head count, with $d_{\rm ff}=256$. TSMixer uses four blocks and feature-mixing width 256. TSR edits the TCN channel groups, the per-block feed-forward widths of PatchTST and iTransformer, and the feature-mixing hidden widths of TSMixer. Residual dimensions spanned by LayerNorm, attention head arithmetic, input variates, and lookback axes remain fixed according to \cref{app:admissibility}. A preliminary TCN ablation also compares channel-mixing, channel-independent, and no-RevIN variants, but it does not replace the four-backbone benchmark. Two natural alternatives were excluded from the backbone set: DLinear \citep{zeng2023transformers} has no hidden width for TSR to reallocate, and the data-dependent FFT shapes in TimesNet \citep{wu2023timesnet} do not fit the present static tracing assumptions. RevIN is used where specified by the architecture configuration \citep{kim2021reversible}.
 
@@ -1169,7 +1230,7 @@ Every reported matched comparison checks the width source, deployed parameter eq
 
 \section{Vision Result Details and Artifact Audit}
 \label{app:vision-results}
-\Cref{tab:vision-details} gives the resource and top-5 measurements omitted from the main table. The static-matched and online models have the same deployed count and shape in every row, though the online arm's stored tensors are larger than that count because they carry the candidate ports that the deployed count excludes. We define $\Delta F=100(F_{\rm C2}/F_{\rm ref}-1)$, so a negative value denotes a FLOP reduction and a positive value a FLOP increase. Top-5 accuracies are measured from the archived checkpoints together with the top-1 values, on the full held-out split under each run's own transform and on the graph each run was trained with. The ResNet-18 CIFAR-10 entry has no recomputed FLOP value.
+\Cref{tab:vision-details} gives the resource and top-5 measurements omitted from the main table. The static-matched and online models have the same deployed count and shape in every row, though the online arm's stored tensors are larger than that count because they carry the candidate ports that the deployed count excludes. We define $\Delta F=100(F_{\rm C2}/F_{\rm ref}-1)$, so a negative value denotes a FLOP reduction and a positive value a FLOP increase. Top-5 accuracies are measured from the archived checkpoints together with the top-1 values, on the full held-out split under each run's own transform and on the graph each run was trained with.
 
 \begin{table}[h]
 \centering
@@ -1181,7 +1242,7 @@ Every reported matched comparison checks the width source, deployed parameter eq
 \toprule
 Backbone & Data & $P_{\rm ref}$ & $P_{\rm C2}$ & $\Delta F$ (\%) & Top-5 (\%) \\
 \midrule
-ResNet-18 & C-10    & 11,173,962 & 9,497,686 & --      & 99.83/99.91/99.85 \\
+ResNet-18 & C-10    & 11,173,962 & 9,497,686 & $+31.11$& 99.83/99.91/99.85 \\
           & C-100   & 11,220,132 & 9,536,305 & $+1.80$ & 93.85/93.84/93.88 \\
           & Tiny-IN & 11,271,432 & 9,580,578 & $-19.61$& 85.00/84.66/84.96 \\
           & IN-100  & 11,227,812 & 9,543,190 & $+12.04$& 95.90/95.58/95.88 \\
@@ -1208,7 +1269,7 @@ The distribution behind the headline is as follows. Thirteen of the sixteen diff
 
 On ImageNet-100 the reference parameter counts of VGG-16-BN, MobileNetV2 and EfficientNet-B0 coincide with their CIFAR-100 counts, because these three backbones change only the initial stride between the two resolutions and no channel width. ResNet-18 does coincide in every width but its stem, a $7\times7$ convolution here against a $3\times3$ one on the smaller images, which accounts for the $7{,}680$-parameter difference between its two rows.
 
-The table also explains why a claim of joint improvement must name its resource. C2 reduces parameters in every row but reduces FLOPs in only seven of the fifteen measured. VGG moves capacity toward computationally expensive feature maps in all four of its cells. MobileNetV2 reduces both resources in all four. The controller used parameter cost, so neither outcome is anomalous, and replacing that cost with an audited FLOP cost changes the outcome accordingly (\cref{app:flops}).
+The table also explains why a claim of joint improvement must name its resource. C2 reduces parameters in every row but reduces FLOPs in only seven of the sixteen. VGG moves capacity toward computationally expensive feature maps in all four of its cells. MobileNetV2 reduces both resources in all four. The controller used parameter cost, so neither outcome is anomalous, and replacing that cost with an audited FLOP cost changes the outcome accordingly (\cref{app:flops}).
 
 Every accuracy in \cref{tab:vision} and here is measured directly from the archived checkpoint, by loading each of the three arms and scoring it on the full held-out split under the transform its own run was trained with, rather than read from any training summary.
 
@@ -1248,13 +1309,73 @@ Budgeting compute reduces compute. All four cells land between $13.1$ and $15.4\
 What the two backbones do with the switch differs, and the difference is the mechanism. Splitting each network's editable groups at its midpoint and summing widths, EfficientNet-B0 under a parameter budget \emph{adds} channels to the early half, $+5.2\%$ on CIFAR-10 and $+4.9\%$ on CIFAR-100, while taking $7.0\%$ and $7.6\%$ from the late half: parameters are cheap early and expensive late, so the controller moves capacity forward, into exactly the wide, high-resolution layers where computation is spent. Under a FLOP budget that sign reverses, the early half losing $4.7\%$ and $3.4\%$ and the late half $14.4\%$ and $14.7\%$. MobileNetV2 shows the complementary case. Its two budgets place capacity almost identically, $-5.0\%$ against $-4.7\%$ early and $-15.3\%$ against $-15.1\%$ late on CIFAR-10, because its parameter cost and its compute cost are already distributed alike, which is why its parameter-budgeted runs reduced FLOPs by $11\%$ without being asked to. The allocations diverge exactly where the two resources do, and agree where they do not.
 
 Two measurements deserve their exact statement. First, MobileNetV2 lands on its cap, $0.00\%$ and $0.42\%$ inside it, while EfficientNet-B0 overshoots by $1.04\%$ and $2.26\%$. The controller ranks and projects with $\kappa_{\rm flops}$, a per-index marginal read from the traced shapes, whereas the reported figure is an exact forward count of the exported network; the two agree on MobileNetV2's depthwise groups and disagree on EfficientNet-B0's squeeze-and-excitation branches, where the normalizer and bias arithmetic is not part of the marginal. This is the compute-currency form of the accounting distinction in \cref{app:coupling-accounting}, and a controller projecting with an exact finite difference would land on the cap in both. Second, these are four cells of two backbones at one seed each, run to show that the cost function is substitutable and to measure what the substitution buys, not to establish a compute-reduction result across the suite.
+\section{Training Compute by Arm}
+\label{app:compute}
+Parameters and forward FLOPs describe the exported model; what each arm costs to train is a
+separate quantity. \Cref{tab:compute} measures it for every vision cell whose discovery log is
+archived with the reported run. The width of every editable group is replayed from the decision
+log across training, and each step is priced at the forward FLOPs of the network actually trained
+at that step. For the online arm that is the deployed widths plus the $k=4$ dormant candidates per
+group, which are computed in full although their ports are zero. Training compute is taken as
+proportional to forward FLOPs times steps, a common factor for every arm; elementwise operations,
+the per-step sensing reductions and the evaluation passes are excluded throughout. The replay
+reproduces each archived checkpoint's widths at its saved epoch, and the analytic FLOP count equals
+the hook-based count of \cref{app:vision-results} on rebuilt models. Pruning pipelines include the
+dense reference they start from and are priced at the $\ell_1$-pruned widths, which are archived in
+six cells.
+
+\begin{table}[h]
+\centering
+\caption{Training compute relative to the dense reference ($=1.00$). TSR is the online discovery
+run including its candidate bank, ``w/o cand.'' the same trajectory without it, C2 the discovery
+run plus a 100-epoch retrain, $\ell_1$/ft the dense reference plus 40 fine-tuning epochs at the
+pruned widths and $\ell_1$/s the dense reference plus 100 epochs from scratch. $\Delta F$ is the
+exported architecture's forward-FLOP change, as in \cref{tab:vision-details}.}
+\label{tab:compute}
+\footnotesize
+\setlength{\tabcolsep}{4.0pt}
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+Backbone & Data & $\Delta F$ (\%) & TSR & w/o cand. & C2 & $\ell_1$/ft & $\ell_1$/s \\
+\midrule
+ResNet-18 & C-10 & $+31.1$ & 1.17 & 1.10 & 2.48 & 1.32 & 1.79 \\
+ & C-100 & $+1.8$ & 1.05 & 0.98 & 2.07 & -- & -- \\
+ & Tiny-IN & $-19.6$ & 0.90 & 0.83 & 1.70 & 1.23 & 1.57 \\
+ & IN-100 & $+12.0$ & 1.21 & 1.11 & 2.33 & -- & -- \\
+\midrule
+VGG-16-BN & C-10 & $+27.1$ & 1.09 & 1.04 & 2.36 & 1.35 & 1.86 \\
+ & C-100 & $+27.7$ & 1.10 & 1.05 & 2.37 & -- & -- \\
+ & Tiny-IN & $+47.5$ & 1.22 & 1.16 & 2.70 & 1.23 & 1.57 \\
+\midrule
+MobileNetV2 & C-10 & $-11.1$ & 1.03 & 0.94 & 1.92 & 1.28 & 1.69 \\
+ & C-100 & $-11.3$ & 1.03 & 0.93 & 1.92 & -- & -- \\
+\midrule
+EfficientNet-B0 & C-10 & $+40.2$ & 1.16 & 1.07 & 2.56 & 1.31 & 1.78 \\
+ & C-100 & $-3.6$ & 1.07 & 0.99 & 2.03 & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The online arm costs between $0.90$ and $1.22$ times the dense reference. It trains a larger
+network than it exports during the anneal and carries the candidate bank throughout, which adds
+$0.05$ to $0.10$ of the reference's cost, and under a parameter budget the network it converges to
+can be computationally heavier than the reference; in ten of the eleven cells discovery therefore
+costs more than dense training. Against the fine-tuned pruning pipeline it is cheaper in all six
+cells where both are measured, by $1$ to $27$ percent, a narrower margin than the epoch count alone
+suggests. The retrained arm is the most expensive in every cell, $1.70$ to $2.70$ times the
+reference, because it adds a full training run to discovery; its role is to isolate the allocation,
+not to be the economical route. Wall-clock time additionally depends on how the per-step sensing is
+implemented, which these counts exclude.
+% TODO(rebuttal): add measured wall-clock per epoch (Ref / TSR / C2 / prune-ft), sequential runs on one GPU.
+
 \section{Structured Pruning at a Matched Count}
 \label{app:pruning}
 The control that places the compression claim against the standard alternative is structured
-pruning of the same dense reference down to the same deployed count. It is built on the coupling
-groups of \cref{app:coupling} rather than on an external library's dependency analysis, so both
-arms edit exactly the same plastic set with the same width floor and the same exact accounting,
-and the only thing pruning cannot do is add capacity. Four criteria rank channels for removal:
+pruning of the same dense reference down to the same deployed count. The $\ell_1$, BatchNorm and
+Taylor arms are built on the coupling groups of \cref{app:coupling}; the DepGraph arm runs
+DepGraph's own dependency analysis and is refused unless its groups coincide with those coupling
+groups. Every arm therefore edits exactly the same plastic set with the same width floor and the
+same exact accounting, and the only thing pruning cannot do is add capacity. Four criteria rank channels for removal:
 the $\ell_1$ norm of a channel's producer weights \citep{li2016pruning}, the mean absolute
 BatchNorm scale of its group \citep{liu2017learning}, the first-order activation--gradient
 product \citep{molchanov2017pruning}, which is the controller's own removal statistic, and
@@ -1265,8 +1386,8 @@ report the vision cells and the forecasting knees.
 
 Two training modes follow, and the distinction decides what each comparison means. In the
 fine-tuned mode the pruned network keeps the reference's trained weights and is fine-tuned for 40
-epochs, which is the practical pipeline and costs 140 epochs in total including the dense
-reference it requires. In the from-scratch mode the pruned width vector is reinitialized and
+epochs, which is the practical pipeline: 140 epochs in total including the dense reference it
+requires, or $1.23$ to $1.35$ times the reference's training compute (\cref{app:compute}). In the from-scratch mode the pruned width vector is reinitialized and
 trained for 100 epochs under the recipe C2 itself uses \citep{liu2018rethinking}. Only the second
 isolates the allocation, because only there do both arms begin without the dense model's weights.
 
@@ -1275,10 +1396,13 @@ on the criterion, and it ends above its own dense reference in seven of the twel
 the correct expectation rather than a surprise, because the arms are not matched in what they
 consume: a fine-tuned pruned model has been given a 100-epoch dense reference plus 40 further
 epochs, and it starts from weights that have already solved the task, whereas C2 is a 100-epoch
-discovery run followed by a 100-epoch retrain that never sees those weights.
+discovery run followed by a 100-epoch retrain that never sees those weights, and is the more
+expensive of the two in every cell (\cref{tab:compute}).
 
-The arm matched on cost is the online one, a single 100-epoch run and therefore $40$ epochs
-cheaper than the fine-tuned pipeline and free of any dense pre-training. It reaches that
+The arm closer in cost is the online one, a single 100-epoch run free of any dense pre-training.
+Counting its candidate bank and the widths it trains at each step, it is cheaper than the
+fine-tuned pipeline in every cell where both are measured, by $1$ to $27$ percent of the
+pipeline's training compute (\cref{tab:compute}). It reaches that
 pipeline's accuracy: $0.14$ points behind $\ell_1$ on average, $0.09$ behind network slimming,
 $0.04$ ahead of DepGraph and $0.30$ behind Taylor, all within the seed spread of
 \cref{app:seeds}. It is also the stronger of the two TSR arms here, averaging $0.12$ points below
@@ -1295,10 +1419,11 @@ spread of \cref{app:seeds}, the aggregate supports the claim that a task-directe
 better on average than a magnitude-ranked one, not that it wins in any particular cell.
 
 The forecasting knees of \cref{tab:timeseries} behave differently, and the difference is
-informative. Over the eight Electricity and Traffic knees the two allocations are level: C2 is
-better than $\ell_1$ fine-tuned in three cells and than $\ell_1$ from scratch in four, with mean
-differences of $0.24$ and $0.35$ percent of the metric, which is the same order as the seed
-spreads reported in \cref{app:seeds}. On the four Weather knees, where three seeds are available,
+informative. Over the seven Electricity and Traffic knees with a valid reference (TSMixer on
+Electricity is excluded for the undertrained reference of \cref{app:ts-results}), pruning is
+slightly ahead: C2 is better than $\ell_1$ fine-tuned in two cells and than $\ell_1$ from scratch in
+three, and trails both by about $0.4$ percent of the metric on average, which is the same order as
+the seed spreads reported in \cref{app:seeds}. On the four Weather knees, where three seeds are available,
 C2 is ahead of the best pruning arm on the TCN and TSMixer and behind it on the two
 transformers. The vision advantage therefore does not carry
 over to the tightest budgets, where a larger share of the network must move; that boundary is the
@@ -1389,12 +1514,14 @@ the more variable arm, at $0.19$ and $0.40$ points, as expected of a smaller mod
 scratch.
 
 Read against \cref{tab:vision}, this settles which of its rows are effects and which are parity.
-Ten of the sixteen differences are at most $0.28$ points, inside the range the reference covers
-on its own, and are reported as parity for that reason; a sign that changes across seeds, as the
+Ten of the sixteen differences are at most $0.28$ points, inside the range the CIFAR-10 reference
+covers on its own, and are reported as parity for that reason; a sign that changes across seeds, as the
 CIFAR-10 difference does at $+0.08\pm0.26$, is the signature of such a row rather than a defect
-in it. All three differences above one point are more than an order of magnitude larger than this spread.
+in it. This floor is measured on one backbone and is applied to the other three as an estimate, not
+a per-cell interval. All three differences above one point exceed that range at least fourfold.
 One of them is the CIFAR-100 cell repeated here: it is negative in all three seeds and averages
-$-0.86$ points, smaller than the $-1.29$ of the reported seed but far outside the spread. The
+$-0.86\pm0.37$ points, smaller than the $-1.29$ of the reported seed and more than two standard
+deviations below zero. The
 other two, on Tiny-ImageNet and ImageNet-100, were not repeated, so those comparisons carry the
 CIFAR spread of the same backbone across datasets and are indicative rather than measured. Seed 42 is the less favorable draw for the method in both
 cells, and it is the one the main table reports.
