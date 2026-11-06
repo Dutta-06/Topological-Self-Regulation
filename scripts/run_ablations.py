@@ -29,6 +29,8 @@ Examples:
 
 import argparse
 import json
+import os
+import queue
 import subprocess
 import sys
 import threading
@@ -85,19 +87,29 @@ def summarize(path: Path, meta: dict, seconds: float) -> dict:
     return out
 
 
-def run_job(out: Path, cmd: list, meta: dict, dry_run: bool) -> bool:
+_t_start = time.time()
+_stop_after_s = None  # --stop-starting-after, in seconds
+
+
+def run_job(out: Path, cmd: list, meta: dict, dry_run: bool, gpu: str = None) -> bool:
     if done(out):
         say(f"skip  {out.parent.name}/{out.name} (complete)")
         return True
-    say(f"start {out.parent.name}/{out.name}")
+    if _stop_after_s is not None and time.time() - _t_start > _stop_after_s:
+        say(f"defer {out.parent.name}/{out.name} (past --stop-starting-after; rerun to resume)")
+        return False
+    say(f"start {out.parent.name}/{out.name}" + (f" [gpu {gpu}]" if gpu is not None else ""))
     if dry_run:
         say("      $ " + " ".join(map(str, cmd)))
         return True
     out.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     t0 = time.time()
     logfile = out.with_suffix(".log")
     with logfile.open("w", encoding="utf-8") as fh:
-        res = subprocess.run(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
+        res = subprocess.run(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, env=env)
     if res.returncode != 0 or not out.exists():
         say(f"FAIL  {out.parent.name}/{out.name} (exit {res.returncode}; see {logfile})")
         return False
@@ -118,8 +130,11 @@ def build_chains(args) -> list:
     common = ["--epochs", str(args.epochs), "--batch-size", "128",
               "--num-workers", str(args.num_workers), "--data-root", args.data_root]
     chains = []
+    skip = set(args.skip or [])
     for seed in args.seeds:
         for cell in args.cells:
+            if f"{cell}:{seed}" in skip:
+                continue
             arch, ds = cell.split("/")
             cdir = Path(args.out_root) / f"{ARCH_KEY[arch]}_{ds}"
             if "ref" in args.arms:
@@ -148,11 +163,19 @@ def build_chains(args) -> list:
     return chains
 
 
+_gpu_pool = None  # queue of free GPU ids when --gpus is given
+
+
 def run_chain(chain: list, dry_run: bool) -> None:
-    for out, cmd, meta in chain:
-        if not run_job(out, cmd, meta, dry_run):
-            say(f"chain stopped after failure of {out.name}")
-            return
+    gpu = _gpu_pool.get() if _gpu_pool is not None else None
+    try:
+        for out, cmd, meta in chain:
+            if not run_job(out, cmd, meta, dry_run, gpu):
+                say(f"chain stopped after failure of {out.name}")
+                return
+    finally:
+        if _gpu_pool is not None:
+            _gpu_pool.put(gpu)
 
 
 def main() -> None:
@@ -168,11 +191,29 @@ def main() -> None:
     ap.add_argument("--concurrent", type=int, default=2, help="chains trained at the same time on this GPU")
     ap.add_argument("--data-root", default="./data")
     ap.add_argument("--out-root", default=str(ROOT / "results" / "ablations"))
+    ap.add_argument("--gpus", nargs="*", default=None,
+                    help="GPU ids; each running chain is pinned to one (CUDA_VISIBLE_DEVICES) and "
+                         "--concurrent defaults to their number. e.g. --gpus 0 1 on a Kaggle T4x2")
+    ap.add_argument("--skip", nargs="*", default=None,
+                    help="cell:seed slices another machine is running, e.g. vgg16_bn/cifar100:44")
+    ap.add_argument("--stop-starting-after", type=float, default=None, metavar="HOURS",
+                    help="start no new job after this many hours (running jobs finish); for capped "
+                         "sessions such as Kaggle's 12 h")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    global _gpu_pool, _stop_after_s
+    if args.stop_starting_after is not None:
+        _stop_after_s = args.stop_starting_after * 3600
+    if args.gpus:
+        _gpu_pool = queue.Queue()
+        for g in args.gpus:
+            _gpu_pool.put(g)
+        args.concurrent = len(args.gpus)
+
     chains = build_chains(args)
-    say(f"{len(chains)} chains, {sum(len(c) for c in chains)} jobs, concurrent={args.concurrent}")
+    say(f"{len(chains)} chains, {sum(len(c) for c in chains)} jobs, concurrent={args.concurrent}"
+        + (f", gpus={args.gpus}" if args.gpus else ""))
     with ThreadPoolExecutor(max_workers=max(1, args.concurrent)) as pool:
         for f in [pool.submit(run_chain, c, args.dry_run) for c in chains]:
             f.result()
