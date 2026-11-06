@@ -138,6 +138,8 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_loader))
 
     best = 0.0
+    history = []  # per-epoch val accuracy and wall-clock
+    t_train_start = time.time()
     for epoch in range(args.epochs):
         model.train()
         t0, tot, n = time.time(), 0.0, 0
@@ -163,11 +165,20 @@ def main():
         acc = evaluate(model, val_loader, args.device, batch_tf=eval_batch_tf, use_amp=use_amp)
         is_best = acc > best
         best = max(best, acc)
+        history.append({"epoch": epoch, "val_acc": acc, "seconds": time.time() - t0})
         print(f"epoch {epoch+1:3d}/{args.epochs}  loss={tot/n:.4f}  val_acc={acc:.4f}  best={best:.4f}  ({time.time()-t0:.1f}s)")
         if is_best:
             torch.save({"model_state_dict": model.state_dict(), "epoch": epoch,
                          "val_acc": acc, "best_val_acc": best, "params": matched_params,
                          "control": "C2_static_matched", "args": vars(args)}, args.out)
+
+    # Last-epoch accuracy (selection-free) and wall-clock, added to the best checkpoint.
+    if Path(args.out).exists():
+        saved = torch.load(args.out, map_location="cpu", weights_only=False)
+        saved["final_val_acc"] = history[-1]["val_acc"] if history else None
+        saved["history"] = history
+        saved["train_seconds"] = time.time() - t_train_start
+        torch.save(saved, args.out)
 
     tsrx_acc = ck.get("best_val_acc")
     print(f"\n{'='*70}")

@@ -74,13 +74,20 @@ def _make_loaders(
     val_set = dataset_cls(root=root, train=False, download=True, transform=eval_tf)
 
     pin = torch.cuda.is_available()
+    # Persistent training workers: on Windows every worker is a spawned
+    # process that re-imports torch (~1.5 GB commit each), and without
+    # persistence that happens every epoch -- slow, and with two jobs on one
+    # machine it exhausted the commit limit (MemoryError at worker spawn).
+    # Evaluation runs in-process: the eval transform is ToTensor+Normalize on
+    # 10k images, not worth a second worker pool held for the whole run.
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=pin, drop_last=True,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin,
+        num_workers=0, pin_memory=pin,
     )
     return train_loader, val_loader
 

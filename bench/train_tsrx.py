@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ from data.cifar import get_cifar10_loaders, get_cifar100_loaders
 from data.tiny_imagenet import get_tiny_imagenet_loaders, GPUBatchTransform
 from data.imagenet100 import get_imagenet100_loaders
 from tsrx.alloc.cost import kappa_params
-from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange
+from tsrx.alloc.exchange import evaluate_structural_update, apply_exchange, GROWTH_MODES
 from tsrx.alloc.schedule import budget_at
 from tsrx.graph.bundle import build_all_bundles
 from tsrx.graph.groups import discover_groups
@@ -95,6 +96,19 @@ def main():
                          "held at target after. Stretch toward 0.7 for aggressive (tight) budgets.")
     ap.add_argument("--max-prunes-per-update", type=int, default=4,
                     help="Feasibility-regime cap: at most this many groups pruned (one index each) per update")
+    ap.add_argument("--growth", choices=list(GROWTH_MODES), default="grad",
+                    help="Growth ablation: grad = released controller; off = removal-only; "
+                         "random / cost = released cadence, growth group drawn at random / cheapest "
+                         "(see tsrx/alloc/exchange.py)")
+    ap.add_argument("--exchange-order", choices=["prune_first", "grow_first"], default="prune_first",
+                    help="prune_first = released controller (a same-group exchange then opens its port "
+                         "randomly, the consumer's .grad having been dropped); grow_first keeps the "
+                         "measured direction")
+    ap.add_argument("--growth-seed", type=int, default=None,
+                    help="RNG seed for --growth random (defaults to --seed); separate from torch's RNG")
+    ap.add_argument("--save-final", dest="save_final", action="store_true", default=True,
+                    help="Also write <out>_final.pt with the last-epoch weights (selection-free online arm)")
+    ap.add_argument("--no-save-final", dest="save_final", action="store_false")
     ap.add_argument("--verbose-decisions", action="store_true",
                     help="Print a compact line for every structural-update decision, including no-ops")
     ap.add_argument("--seed", type=int, default=42)
@@ -158,7 +172,9 @@ def main():
     print(f"  Target Parameter Budget Cap  : {cap_str}")
     print(f"  Candidate Bank Size (k)      : {args.k}")
     print(f"  Structural Update Interval   : Every {args.update_interval} steps")
+    print(f"  Growth Mode / Exchange Order : {args.growth} / {args.exchange_order}")
     print(f"{'='*70}\n")
+    growth_rng = random.Random(args.seed if args.growth_seed is None else args.growth_seed)
 
     # 2. Graph Tracing & Coupling Group Discovery
     it = iter(train_loader)
@@ -188,7 +204,9 @@ def main():
     n_saliency_seen = 0
     h_max_value = args.H_max
     decisions_path = out_path.parent / f"{out_path.stem}_decisions.jsonl"
-    decisions_file = open(decisions_path, "a")
+    # "w", not "a": a rerun after an interruption must not append its decisions
+    # onto the dead run's log (each run owns exactly one trace).
+    decisions_file = open(decisions_path, "w")
 
     # Assert dormancy holds before training starts (should be exactly 0.0).
     assert bank.max_port_magnitude() == 0.0, "candidate ports must start dormant"
@@ -197,8 +215,12 @@ def main():
     best_acc = 0.0
     structural_events_count = 0
     events_log = []
+    port_init_counts: Dict[str, int] = {}
+    history = []          # per-epoch val accuracy / params / wall-clock
+    t_train_start = time.time()
 
     for epoch in range(args.epochs):
+        t_epoch = time.time()
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
         total_loss, n_samples = 0.0, 0
@@ -284,11 +306,18 @@ def main():
                     act_stats=act_stats,
                     H_max=h_max_value,
                     max_prunes_per_update=args.max_prunes_per_update,
+                    growth_mode=args.growth,
+                    rng=growth_rng,
                 )
 
                 applied = [d for d in decisions if d.action != "none"]
                 for dec in applied:
-                    apply_exchange(dec, bank, optimizer=opt, eps=1e-3)
+                    info = apply_exchange(dec, bank, optimizer=opt, eps=1e-3,
+                                          grow_first=(args.exchange_order == "grow_first"))
+                    if "port_init" in info:
+                        kinds = set(info["port_init"].values())
+                        key = "grad" if kinds == {"grad"} else ("random" if "grad" not in kinds else "mixed")
+                        port_init_counts[key] = port_init_counts.get(key, 0) + 1
 
                 if applied:
                     # materialize_candidate writes a NONZERO port for the
@@ -334,6 +363,8 @@ def main():
                         "prune_idx": dec.prune_idx,
                         "prune_rho": dec.prune_rho,
                         "delta_loss_bound": dec.delta_loss_bound,
+                        "growth_mode": args.growth,
+                        "applied": dec.applied_info,
                         "details": {k: v for k, v in dec.details.items()
                                     if not isinstance(v, (dict, list)) or k in ("grow", "prune")},
                     }, default=str) + "\n")
@@ -362,6 +393,8 @@ def main():
         best_acc = max(best_acc, val_acc)
         curr_p = bank.deployed_params()
         pct_saved = (1.0 - curr_p / baseline_params) * 100.0
+        history.append({"epoch": epoch, "val_acc": val_acc, "params": curr_p,
+                        "events": structural_events_count, "seconds": time.time() - t_epoch})
 
         print(
             f"Epoch {epoch+1:3d}/{args.epochs}  loss={total_loss/max(n_samples, 1):.4f}  "
@@ -395,17 +428,41 @@ def main():
     # The checkpoint above is the best-val epoch, whose widths can predate the
     # search converging. Record the converged architecture alongside it; C2
     # rebuilds from `final_widths` (the same fix as the forecasting harness).
+    final_widths = {str(t): h.base_size for t, h in bank.handles.items()}
+    final_val_acc = history[-1]["val_acc"] if history else None
+    train_seconds = time.time() - t_train_start
     if out_path.exists():
         ck = torch.load(out_path, map_location="cpu", weights_only=False)
-        ck["final_widths"] = {str(t): h.base_size for t, h in bank.handles.items()}
+        ck["final_widths"] = final_widths
         ck["final_params"] = final_p
+        ck["final_val_acc"] = final_val_acc
+        ck["history"] = history
+        ck["train_seconds"] = train_seconds
+        ck["port_init_counts"] = port_init_counts
+        ck["complete"] = True  # absent while training: an interrupted run is never read as final
         torch.save(ck, out_path)
+    if args.save_final:
+        # Last-epoch weights: scores the online arm without best-epoch
+        # selection (CIFAR's "val" split is the test split).
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "epoch": len(history) - 1,
+            "val_acc": final_val_acc,
+            "params": final_p,
+            "baseline_params": baseline_params,
+            "final_widths": final_widths,
+            "max_port_magnitude": bank.max_port_magnitude(),
+            "port_init_counts": port_init_counts,
+            "args": vars(args),
+        }, out_path.with_name(f"{out_path.stem}_final.pt"))
     print(f"\n{'='*70}")
     print(f"  TSR-X Training Complete")
     print(f"  Baseline Reference Params : {baseline_params:,}")
     print(f"  Final Discovered Params   : {final_p:,} ({final_saved:+.1f}% parameter reduction)")
     print(f"  Best Validation Accuracy  : {best_acc:.4f}")
     print(f"  Total Structural Events   : {structural_events_count}")
+    print(f"  Births by port init       : {port_init_counts or 'none'}")
+    print(f"  Wall-clock (train+eval)   : {train_seconds/3600:.2f} h")
     print(f"  Checkpoint Saved To       : {out_path}")
     print(f"  Decision Trace Saved To   : {decisions_path}")
     print(f"{'='*70}\n")

@@ -196,14 +196,21 @@ def materialize_candidate(
     cand_idx: int,
     eps: float = 1e-3,
     optimizer: Optional[torch.optim.Optimizer] = None,
-) -> None:
+) -> Dict[str, str]:
     """Materialize candidate `cand_idx` (0 <= cand_idx < k) into a real channel.
 
     1. Moves candidate `cand_idx` into the real channel set at index `base_size`.
     2. Initializes consumer port weights along optimal descent direction v* = -eps * u_c / ||u_c|| (Theorem 3.4).
     3. Expands tensors so exactly `k` candidate slots remain available for subsequent steps.
     4. Increments base_size and bundle.size.
+
+    Returns how each consumer block's port was opened, keyed by module name:
+    "grad" (along the measured gradient), "random_nograd" (the consumer
+    weight carried no .grad -- e.g. it was replaced by an earlier edit in the
+    same update), or "random_nonfinite" (the gradient held inf/nan, as after a
+    GradScaler-skipped step). Only "grad" births follow the measured direction.
     """
+    port_init: Dict[str, str] = {}
     h = bank.handles[tap]
     model = bank.model
     modules = _modules_by_name(model)
@@ -322,14 +329,18 @@ def materialize_candidate(
         real_cols = w.data[:, : base_size * mult]
         cand_cols = slice(cand_slot_idx * mult, (cand_slot_idx + 1) * mult)
 
-        if g is not None:
-            cand_g = g.data[:, cand_cols]
+        cand_g = g.data[:, cand_cols] if g is not None else None
+        if cand_g is not None and bool(torch.isfinite(cand_g).all()):
             norm = cand_g.norm().clamp_min(1e-12)
             v_star = -eps * (cand_g / norm)
+            port_init[slot.module_name] = "grad"
         else:
+            # No usable measured direction: fall back to a small random block.
+            # A non-finite gradient would otherwise write NaN into a real weight.
             v_star = torch.empty(w.shape[0], mult, *w.shape[2:], device=device, dtype=dtype)
             nn.init.kaiming_uniform_(v_star.reshape(w.shape[0], -1), a=math.sqrt(5))
             v_star *= eps
+            port_init[slot.module_name] = "random_nograd" if cand_g is None else "random_nonfinite"
 
         cands_all = w.data[:, base_size * mult :].clone()
         # Zero out the refilled candidate slot
@@ -345,3 +356,4 @@ def materialize_candidate(
     # 4. Increment sizes
     h.base_size += 1
     h.bundle.size += 1
+    return port_init

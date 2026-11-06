@@ -22,10 +22,24 @@ Both regimes compare against the SAME `deployed_params` (from
 `bank.deployed_params()`), never `sum(p.numel() for p in model.parameters())`
 — the latter includes dormant candidate mass and made the optimality
 regime's pure-growth case permanently unreachable under any budget.
+
+Growth ablations (`growth_mode`, default "grad" = the released controller):
+
+  "off"     no growth at all: Cases A and C are disabled, so the controller
+            is removal-only on the same schedule, scores and candidate bank.
+  "random"  the released rule decides WHETHER and WHEN to grow; the group
+            that grows is then drawn uniformly from the budget-feasible ones.
+  "cost"    as "random", but the cheapest budget-feasible group (min kappa).
+
+In "random" and "cost" only the choice of GROUP changes -- the candidate
+within the chosen group is still its argmax-signal one, and its port still
+opens along its own measured gradient -- so the width vector (the allocation)
+is the only thing the ablation moves. Event cadence is unchanged by design.
 """
 
+import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,6 +64,42 @@ class ExchangeDecision:
     prune_rho: float = 0.0
     delta_loss_bound: float = 0.0
     details: dict = field(default_factory=dict)
+    # Filled by apply_exchange: how the edit was executed (edit order, how
+    # each grown port was initialised). Empty until the decision is applied.
+    applied_info: dict = field(default_factory=dict)
+
+
+GROWTH_MODES = ("grad", "off", "random", "cost")
+
+
+def _substitute_growth_site(
+    growth_options: List[dict],
+    best_g: dict,
+    mode: str,
+    rng: Optional[random.Random],
+    fits: Callable[[dict], bool],
+) -> dict:
+    """For the "random"/"cost" ablations: replace the gradient-chosen growth
+    GROUP, keeping each group's own argmax-signal candidate. `fits` is the
+    same budget test the released rule applied to `best_g`, so `best_g`
+    itself is always feasible and the feasible set is never empty."""
+    if mode == "grad":
+        return best_g
+    feasible = sorted((g for g in growth_options if fits(g)), key=lambda g: g["tap"])
+    if not feasible:  # unreachable while best_g fits; kept as a guard
+        return best_g
+    if mode == "random":
+        choice = (rng or random).choice(feasible)
+    elif mode == "cost":
+        choice = min(feasible, key=lambda g: (g["kappa"], g["tap"]))
+    else:
+        raise ValueError(f"unknown growth_mode {mode!r}")
+    out = dict(choice)
+    out["growth_mode"] = mode
+    out["grad_choice_tap"] = best_g["tap"]
+    out["grad_choice_kappa"] = best_g["kappa"]
+    out["grad_choice_gamma"] = best_g["gamma"]
+    return out
 
 
 def _gather_removal_options(
@@ -162,6 +212,8 @@ def evaluate_exchange(
     act_stats=None,
     H_max: float = 1.0,
     deployed_params: Optional[int] = None,
+    growth_mode: str = "grad",
+    rng: Optional[random.Random] = None,
 ) -> ExchangeDecision:
     """Optimality-regime core: argmax growth density vs argmin removal
     density, Definition 4.5's accept rule. Assumes the caller has already
@@ -172,7 +224,12 @@ def evaluate_exchange(
     `deployed_params` should be `bank.deployed_params()`. Falling back to
     `sum(p.numel() for p in model.parameters())` (candidate-inflated) is
     kept only for callers that predate the dormancy-accounting fix.
+
+    `growth_mode` selects a growth ablation (module docstring); "grad" is the
+    released controller and leaves every decision unchanged.
     """
+    if growth_mode not in GROWTH_MODES:
+        raise ValueError(f"growth_mode must be one of {GROWTH_MODES}, got {growth_mode!r}")
     model = bank.model
     current_params = deployed_params if deployed_params is not None else sum(
         p.numel() for p in model.parameters() if p.requires_grad
@@ -181,6 +238,8 @@ def evaluate_exchange(
     # 1. Gather growth densities gamma_ell for all groups
     growth_options: List[dict] = []
     for tap, h in bank.handles.items():
+        if growth_mode == "off":
+            break
         if h.base_size >= max_size_per_group:
             continue
         kp = kappa_params(h.bundle, model)
@@ -213,7 +272,7 @@ def evaluate_exchange(
 
     best_g = growth_options[0] if growth_options else None
     worst_p = removal_options[0] if removal_options else None
-    skip_reasons: List[str] = []
+    skip_reasons: List[str] = ["growth_off"] if growth_mode == "off" else []
 
     # Case A: Budget Slack — Pure Growth (Theorem 4.7(ii)).
     # An absent budget means UNLIMITED slack, not "no growth allowed": gating
@@ -224,15 +283,19 @@ def evaluate_exchange(
         cost_after_grow = current_params + best_g["kappa"]
         budget_ok_grow = (budget_params is None) or (cost_after_grow <= budget_params)
         if budget_ok_grow and best_g["kappa"] * best_g["gamma"] > delta:
+            g = _substitute_growth_site(
+                growth_options, best_g, growth_mode, rng,
+                fits=lambda o: budget_params is None or current_params + o["kappa"] <= budget_params,
+            )
             return ExchangeDecision(
                 action="pure_grow",
                 regime="optimality",
                 reason="accepted",
-                grow_tap=best_g["tap"],
-                grow_cand_idx=best_g["cand_idx"],
-                grow_gamma=best_g["gamma"],
-                delta_loss_bound=-best_g["kappa"] * best_g["gamma"],
-                details=best_g,
+                grow_tap=g["tap"],
+                grow_cand_idx=g["cand_idx"],
+                grow_gamma=g["gamma"],
+                delta_loss_bound=-g["kappa"] * g["gamma"],
+                details=g,
             )
         skip_reasons.append("grow_over_budget" if not budget_ok_grow else "grow_gain_below_delta")
 
@@ -278,18 +341,27 @@ def evaluate_exchange(
             budget_ok = net_delta <= budget_params
 
         if gain > cost + delta and budget_ok:
+            def _exchange_fits(o: dict) -> bool:
+                net = current_params + o["kappa"] - worst_p["kappa"]
+                if budget_params is None:
+                    return True
+                if current_params > budget_params:
+                    return net < current_params
+                return net <= budget_params
+
+            g = _substitute_growth_site(growth_options, best_g, growth_mode, rng, fits=_exchange_fits)
             return ExchangeDecision(
                 action="exchange",
                 regime="optimality",
                 reason="accepted",
-                grow_tap=best_g["tap"],
-                grow_cand_idx=best_g["cand_idx"],
-                grow_gamma=best_g["gamma"],
+                grow_tap=g["tap"],
+                grow_cand_idx=g["cand_idx"],
+                grow_gamma=g["gamma"],
                 prune_tap=worst_p["tap"],
                 prune_idx=worst_p["unit_idx"],
                 prune_rho=worst_p["rho"],
-                delta_loss_bound=cost - gain,
-                details={"grow": best_g, "prune": worst_p},
+                delta_loss_bound=cost - g["kappa"] * g["gamma"],
+                details={"grow": g, "prune": worst_p},
             )
         skip_reasons.append("exchange_over_budget" if not budget_ok else "exchange_gain_below_cost")
 
@@ -312,6 +384,8 @@ def evaluate_structural_update(
     act_stats=None,
     H_max: float = 1.0,
     max_prunes_per_update: int = 4,
+    growth_mode: str = "grad",
+    rng: Optional[random.Random] = None,
 ) -> List[ExchangeDecision]:
     """Entry point: dispatch feasibility vs optimality regime by comparing
     `deployed_params` (bank.deployed_params(), NOT candidate-inflated) to
@@ -338,6 +412,8 @@ def evaluate_structural_update(
         act_stats=act_stats,
         H_max=H_max,
         deployed_params=deployed_params,
+        growth_mode=growth_mode,
+        rng=rng,
     )
     return [dec]
 
@@ -347,18 +423,53 @@ def apply_exchange(
     bank: CandidateBank,
     optimizer: Optional[torch.optim.Optimizer] = None,
     eps: float = 1e-3,
-) -> None:
-    """Execute an accepted structural decision on the model."""
-    if decision.action == "none":
-        return
+    grow_first: bool = False,
+) -> dict:
+    """Execute an accepted structural decision on the model.
 
-    # 1. Apply pruning first if requested
-    if decision.action in ("exchange", "pure_prune"):
+    Edit order for an exchange: the released controller prunes first. Pruning
+    replaces every Parameter it touches, which drops that tensor's `.grad`; if
+    the grown group's consumer is among them (always so when both halves hit
+    the same group), `materialize_candidate` finds no gradient and opens the
+    port in a RANDOM direction. `grow_first=True` materializes while the
+    gradients are still attached, then prunes. That is index-safe: growth only
+    appends the promoted unit at index `base_size`, so the pruned index (always
+    < the old base_size) still names the same unit, in its own group or in any
+    group sharing a module on another axis.
+
+    Returns (and stores on `decision.applied_info`) the edit order and, for
+    growth, how each consumer block's port was opened.
+    """
+    info: dict = {}
+    if decision.action == "none":
+        decision.applied_info = info
+        return info
+
+    do_prune = decision.action in ("exchange", "pure_prune")
+    do_grow = decision.action in ("exchange", "pure_grow")
+    if do_prune:
         assert decision.prune_tap is not None and decision.prune_idx is not None
+    if do_grow:
+        assert decision.grow_tap is not None and decision.grow_cand_idx is not None
+
+    def _prune() -> None:
         h_prune = bank.handles[decision.prune_tap]
         prune_group_index(bank.model, h_prune.bundle, idx=decision.prune_idx, optimizer=optimizer, bank=bank)
 
-    # 2. Apply growth if requested
-    if decision.action in ("exchange", "pure_grow"):
-        assert decision.grow_tap is not None and decision.grow_cand_idx is not None
-        materialize_candidate(bank, tap=decision.grow_tap, cand_idx=decision.grow_cand_idx, eps=eps, optimizer=optimizer)
+    def _grow() -> None:
+        info["port_init"] = materialize_candidate(
+            bank, tap=decision.grow_tap, cand_idx=decision.grow_cand_idx, eps=eps, optimizer=optimizer)
+
+    if do_grow and do_prune and grow_first:
+        info["order"] = "grow_first"
+        _grow()
+        _prune()
+    else:
+        if do_prune and do_grow:
+            info["order"] = "prune_first"
+        if do_prune:
+            _prune()
+        if do_grow:
+            _grow()
+    decision.applied_info = info
+    return info
