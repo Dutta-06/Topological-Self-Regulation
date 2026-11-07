@@ -77,6 +77,50 @@ def widths_log_ratio(ckpt_path: Path) -> dict:
     return {t: math.log2(final[t] / start[t]) for t in final}
 
 
+_ORBITS = {}
+
+
+def cost_equivalent_orbits(arch: str, dataset: str) -> list:
+    """Sets of coupling groups whose widths can be swapped with no change in
+    parameters or FLOPs: the inner convs of the identity-shortcut blocks of one
+    ResNet stage (same input stream, same resolution, same shape). A width
+    vector that grows block 0's inner conv and one that grows block 1's spend
+    the budget identically, so stability is also reported modulo these swaps.
+    Sequential nets (VGG) have none."""
+    key = (arch, dataset)
+    if key in _ORBITS:
+        return _ORBITS[key]
+    import re
+    import torch
+    sys.path.insert(0, str(ROOT))
+    from bench.models import build_model
+    from tsrx.graph.groups import discover_groups
+    from tsrx.graph.trace import trace_model
+    model = build_model(arch, 10 if dataset == "cifar10" else 100, cifar_stem=True).eval()
+    res = discover_groups(trace_model(model, (torch.randn(1, 3, 32, 32),)))
+    names = {n for n, _ in model.named_modules()}
+    by_slot = collections.defaultdict(list)
+    for g in (res.groups.values() if isinstance(res.groups, dict) else res.groups):
+        tap = g.tap  # the id the decision logs and width dicts use
+        prods = [b.module_name for b in g.producers]
+        m = re.fullmatch(r"(layer\d+)\.(\d+)\.(conv\d+)", prods[0]) if len(prods) == 1 else None
+        if m and f"{m[1]}.{m[2]}.downsample" not in names:
+            by_slot[(m[1], m[3])].append(int(tap))
+    _ORBITS[key] = [sorted(v) for v in by_slot.values() if len(v) > 1]
+    return _ORBITS[key]
+
+
+def canonical(vec: dict, orbits: list) -> dict:
+    """Sort each orbit's values (largest first) onto its group ids, so two
+    vectors that differ only by a cost-free swap become equal. Sorting both
+    vectors this way maximises their dot product over orbit permutations."""
+    out = dict(vec)
+    for orb in orbits:
+        vals = sorted((vec.get(t, 0.0) for t in orb), reverse=True)
+        out.update(zip(orb, vals))
+    return out
+
+
 def cosine(a: dict, b: dict) -> float:
     keys = sorted(set(a) & set(b))
     num = sum(a[k] * b[k] for k in keys)
@@ -175,15 +219,23 @@ def main():
                 vecs[s] = widths_log_ratio(ckp)
             if len(vecs) >= 2:
                 ss = sorted(vecs)
-                cos = [cosine(vecs[a], vecs[b]) for i, a in enumerate(ss) for b in ss[i + 1:]]
+                r0 = R[(arm, "online", ss[0])]
+                orbits = cost_equivalent_orbits(r0["arch"], r0["dataset"])
+                cvecs = {s: canonical(vecs[s], orbits) for s in ss}
+                pairs = [(a, b) for i, a in enumerate(ss) for b in ss[i + 1:]]
+                cos = [cosine(vecs[a], vecs[b]) for a, b in pairs]
+                ccos = [cosine(cvecs[a], cvecs[b]) for a, b in pairs]
                 top = [max(vecs[s], key=lambda t: vecs[s][t]) for s in ss]
                 rows.append(f"| {arm} | {len(ss)} | {st.mean(cos):.3f} (min {min(cos):.3f}) | "
+                            f"{st.mean(ccos):.3f} (min {min(ccos):.3f}) | "
                             f"{'same' if len(set(top)) == 1 else 'differs'}: {top} |")
         if rows:
+            orbits = cost_equivalent_orbits(R[next(iter(R))]["arch"], R[next(iter(R))]["dataset"])
             emit("Discovery stability across seeds: cosine similarity of log2(width/ref) vectors "
-                 "(final widths), and the most-grown group per seed.\n")
-            emit("| arm | seeds | mean pairwise cosine | most-grown group |")
-            emit("|---|---|---|---|")
+                 "(final widths), raw and modulo cost-free swaps between interchangeable groups "
+                 f"({orbits or 'none in this architecture'}), and the most-grown group per seed.\n")
+            emit("| arm | seeds | mean pairwise cosine | modulo swaps | most-grown group |")
+            emit("|---|---|---|---|---|")
             for r in rows:
                 emit(r)
             emit("")

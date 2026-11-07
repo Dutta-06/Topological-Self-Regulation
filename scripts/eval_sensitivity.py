@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from scripts.eval_ablations import cosine, growth_stats, widths_log_ratio  # noqa: E402
+from scripts.eval_ablations import canonical, cosine, cost_equivalent_orbits, growth_stats, widths_log_ratio  # noqa: E402
 from scripts.run_sensitivity import SETTINGS  # noqa: E402
 
 
@@ -41,19 +41,26 @@ def main():
         ck = Path(args.root) / args.cell / f"{name}_s{args.seed}.pt"
         rows.append((name + "  " + " ".join(SETTINGS[name]), ck, rec(ck)))
 
+    arch, ds = args.cell.split("_", 1)
+    arch = {"vgg16bn": "vgg16_bn", "mobilenetv2": "mobilenet_v2"}.get(arch, arch)
+    orbits = cost_equivalent_orbits(arch, ds)
     cw = widths_log_ratio(centre_ck) if centre else None
     lines = [f"# Sensitivity, {args.cell} seed {args.seed} (online arm)\n",
-             "| setting | best | last | Δlast vs centre | params | births | top-group share | cos vs centre |",
-             "|---|---|---|---|---|---|---|---|"]
+             "| setting | best | last | Δlast vs centre | params | births | top-group share | cos vs centre | modulo swaps |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for label, ck, r in rows:
         if r is None:
-            lines.append(f"| {label} | -- | -- | -- | -- | -- | -- | -- |")
+            lines.append(f"| {label} | -- | -- | -- | -- | -- | -- | -- | -- |")
             continue
         best, last = 100 * r["best_val_acc"], 100 * (r.get("final_val_acc") or float("nan"))
         d = last - 100 * centre["final_val_acc"] if centre and centre.get("final_val_acc") else float("nan")
         b, top, _, _, _ = growth_stats(ck.with_name(f"{ck.stem}_decisions.jsonl"))
-        c = cosine(widths_log_ratio(ck), cw) if cw else float("nan")
-        lines.append(f"| {label} | {best:.2f} | {last:.2f} | {d:+.2f} | {r['params']:,} | {b} | {top:.0%} | {c:.3f} |")
+        w = widths_log_ratio(ck)
+        c = cosine(w, cw) if cw else float("nan")
+        cc = cosine(canonical(w, orbits), canonical(cw, orbits)) if cw else float("nan")
+        lines.append(f"| {label} | {best:.2f} | {last:.2f} | {d:+.2f} | {r['params']:,} | {b} | {top:.0%} "
+                     f"| {c:.3f} | {cc:.3f} |")
+    lines.append(f"\nInterchangeable (cost-free swap) groups: {orbits or 'none'}.")
     print("\n".join(lines))
     if args.markdown:
         Path(args.markdown).write_text("\n".join(lines) + "\n", encoding="utf-8")
