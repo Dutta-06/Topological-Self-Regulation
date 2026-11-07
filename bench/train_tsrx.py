@@ -211,6 +211,13 @@ def main():
     # Assert dormancy holds before training starts (should be exactly 0.0).
     assert bank.max_port_magnitude() == 0.0, "candidate ports must start dormant"
 
+    # Edits replace parameters, never modules, so one name->module map serves
+    # the whole run (rebuilt after each batch of edits anyway, for safety).
+    modules_by_name = dict(model.named_modules())
+    # The deployed count changes only at structural updates; recount there,
+    # not every step (it is shown in the progress bar only).
+    current_params = bank.deployed_params()
+
     global_step = 0
     best_acc = 0.0
     structural_events_count = 0
@@ -247,9 +254,9 @@ def main():
             # Sense candidate gradients u_c and compute removal saliency
             with torch.no_grad():
                 for tap, h in bank.handles.items():
-                    u = compute_uc_norms(bank, tap)
+                    u = compute_uc_norms(bank, tap, modules=modules_by_name)
                     win.record(tap, u)
-                    sal = first_order_saliency(model, h.bundle, h.base_size)
+                    sal = first_order_saliency(model, h.bundle, h.base_size, modules=modules_by_name)
                     saliency_sum[tap] = sal if saliency_sum[tap] is None else saliency_sum[tap] + sal
 
             n_saliency_seen += 1
@@ -270,7 +277,6 @@ def main():
             loss_val = loss.item()
             total_loss += loss_val * xb.size(0)
             n_samples += xb.size(0)
-            current_params = bank.deployed_params()
 
             pbar.set_postfix({
                 "loss": f"{loss_val:.4f}",
@@ -327,12 +333,14 @@ def main():
                     bank.zero_ports()
                     act_stats.remove()
                     act_stats = ActivationStats(model, bank)
+                    modules_by_name = dict(model.named_modules())
                     structural_events_count += len(applied)
                     if args.device.startswith("cuda"):
                         torch.cuda.empty_cache()
 
                 overhead_ms = (time.time() - t0_struct) * 1000
                 new_p = bank.deployed_params()
+                current_params = new_p
 
                 for dec in decisions:
                     if args.verbose_decisions or dec.action != "none":

@@ -14,11 +14,14 @@ import torch
 import torch.nn as nn
 
 
-def first_order_saliency(model: nn.Module, bundle, group_base_size: int) -> torch.Tensor:
+def first_order_saliency(model: nn.Module, bundle, group_base_size: int,
+                         modules: Optional[Dict[str, nn.Module]] = None) -> torch.Tensor:
     """|<u_j,v_j>| per real unit j in [0, group_base_size) of this group,
     summed across all of the group's consumers (mirrors Theorem 5.7's
-    concatenated-port sum for the candidate side)."""
-    modules = dict(model.named_modules())
+    concatenated-port sum for the candidate side). `modules`: optional
+    cached `dict(model.named_modules())` (see topo.compute_uc_norms)."""
+    if modules is None:
+        modules = dict(model.named_modules())
     device = next(model.parameters()).device
     total = torch.zeros(group_base_size, device=device)
     for slot in bundle.consumer_slots:

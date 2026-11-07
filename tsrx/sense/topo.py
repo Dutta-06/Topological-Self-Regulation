@@ -38,12 +38,18 @@ def _consumer_candidate_grad(mod: nn.Module, base_size: int, k: int, multiplicit
     return sq  # (k,) sum-of-squares contribution from this consumer
 
 
-def compute_uc_norms(bank: CandidateBank, tap: int) -> torch.Tensor:
+def compute_uc_norms(bank: CandidateBank, tap: int,
+                     modules: Optional[Dict[str, nn.Module]] = None) -> torch.Tensor:
     """||u_c|| per candidate in group `tap`, aggregated over all of the
     group's consumers (Theorem 5.7: concatenated port, so squared norms
-    sum across consumers before the final sqrt)."""
+    sum across consumers before the final sqrt).
+
+    `modules` is an optional cached `dict(model.named_modules())`. Edits
+    replace parameters but never modules, so a map built once stays valid;
+    passing it saves a module-tree walk per group per step."""
     h = bank.handles[tap]
-    modules = dict(bank.model.named_modules())
+    if modules is None:
+        modules = dict(bank.model.named_modules())
     device = next(bank.model.parameters()).device
     total_sq = torch.zeros(h.k, device=device)
     for slot in h.bundle.consumer_slots:
@@ -63,13 +69,18 @@ class WindowedSignal:
         self._buf: Dict[int, deque] = {}
 
     def record(self, tap: int, uc_norms: torch.Tensor) -> None:
-        self._buf.setdefault(tap, deque(maxlen=self.window)).append(uc_norms.detach().cpu())
+        # Kept on its device: a per-step .cpu() here forces a host sync per
+        # group per step. The values are copied to the host only when read.
+        self._buf.setdefault(tap, deque(maxlen=self.window)).append(uc_norms.detach())
 
     def mean(self, tap: int) -> Optional[torch.Tensor]:
         buf = self._buf.get(tap)
         if not buf:
             return None
-        return torch.stack(list(buf)).mean(dim=0)
+        # Stack, move to the host, then average there: the same float32
+        # values averaged by the same CPU kernel as when each record was
+        # copied to the host on arrival, so the result is bit-identical.
+        return torch.stack(list(buf)).cpu().mean(dim=0)
 
     def best(self, tap: int) -> float:
         m = self.mean(tap)
