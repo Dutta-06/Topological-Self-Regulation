@@ -13,6 +13,7 @@
 | off | c2 | 3 | 77.41 ± 0.25 | -0.22 ± 0.40 | 9,533,186 |
 | random | online | 3 | 77.41 ± 0.13 | -0.22 ± 0.33 | 9,536,231 |
 | cost | online | 3 | 77.24 ± 0.19 | -0.39 ± 0.38 | 9,536,823 |
+| oto | online | 3 | 77.20 ± 0.26 | -0.42 ± 0.11 | 9,533,098 |
 
 Paired same-seed differences, a − b (points); `wins` = seeds where a > b.
 
@@ -26,6 +27,8 @@ Paired same-seed differences, a − b (points); `wins` = seeds where a > b.
 | fixed − released | c2 | 3 | -0.17 ± 0.34 | 1/3 | does keeping the measured birth direction help? |
 | fixed − random | online | 3 | -0.11 ± 0.17 | 1/3 | does the gradient choose the growth site better than chance? |
 | fixed − cost | online | 3 | 0.06 ± 0.10 | 1/3 | does the gradient beat 'grow the cheapest group'? |
+| released − oto | online | 3 | 0.34 ± 0.41 | 2/3 | TSR vs OTOv2 (one run from scratch, same count) |
+| off − oto | online | 3 | -0.02 ± 0.44 | 1/3 | removal-only TSR vs OTOv2 (one run from scratch, same count) |
 
 Growth mechanics (online arms, from decision logs).
 
@@ -70,6 +73,7 @@ Discovery stability across seeds: cosine similarity of log2(width/ref) vectors (
 | off | c2 | 3 | 73.28 ± 0.21 | -0.19 ± 0.07 | 12,555,150 |
 | random | online | 3 | 73.14 ± 0.53 | -0.32 ± 0.41 | 12,557,139 |
 | cost | online | 3 | 73.19 ± 0.72 | -0.28 ± 0.63 | 12,554,433 |
+| oto | online | 3 | 73.18 ± 0.37 | -0.29 ± 0.25 | 12,554,891 |
 
 Paired same-seed differences, a − b (points); `wins` = seeds where a > b.
 
@@ -83,6 +87,8 @@ Paired same-seed differences, a − b (points); `wins` = seeds where a > b.
 | fixed − released | c2 | 3 | -0.01 ± 0.02 | 0/3 | does keeping the measured birth direction help? |
 | fixed − random | online | 3 | 0.05 ± 0.21 | 2/3 | does the gradient choose the growth site better than chance? |
 | fixed − cost | online | 3 | 0.00 ± 0.00 | 0/3 | does the gradient beat 'grow the cheapest group'? |
+| released − oto | online | 3 | 0.10 ± 0.71 | 2/3 | TSR vs OTOv2 (one run from scratch, same count) |
+| off − oto | online | 3 | 0.10 ± 0.60 | 2/3 | removal-only TSR vs OTOv2 (one run from scratch, same count) |
 
 Growth mechanics (online arms, from decision logs).
 

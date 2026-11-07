@@ -26,13 +26,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost"]
+ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost", "oto"]
 PAIRS = [  # (a, b, question answered by a - b)
     ("released", "off", "does growth help, as published?"),
     ("fixed", "off", "does growth help, with measured-direction births?"),
     ("fixed", "released", "does keeping the measured birth direction help?"),
     ("fixed", "random", "does the gradient choose the growth site better than chance?"),
     ("fixed", "cost", "does the gradient beat 'grow the cheapest group'?"),
+    ("released", "oto", "TSR vs OTOv2 (one run from scratch, same count)"),
+    ("off", "oto", "removal-only TSR vs OTOv2 (one run from scratch, same count)"),
 ]
 
 
@@ -214,7 +216,8 @@ def main():
             vecs = {}
             for s in seeds:
                 ckp = root / cell / f"{arm}_s{s}.pt"
-                if (arm, "online", s) not in R or not ckp.exists():
+                log = ckp.with_name(f"{ckp.stem}_decisions.jsonl")
+                if (arm, "online", s) not in R or not ckp.exists() or not log.exists():
                     continue
                 vecs[s] = widths_log_ratio(ckp)
             if len(vecs) >= 2:
