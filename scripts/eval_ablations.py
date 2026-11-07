@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost", "oto"]
+ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost", "nobank", "oto"]
 PAIRS = [  # (a, b, question answered by a - b)
     ("released", "off", "does growth help, as published?"),
     ("fixed", "off", "does growth help, with measured-direction births?"),
@@ -35,6 +35,8 @@ PAIRS = [  # (a, b, question answered by a - b)
     ("fixed", "cost", "does the gradient beat 'grow the cheapest group'?"),
     ("released", "oto", "TSR vs OTOv2 (one run from scratch, same count)"),
     ("off", "oto", "removal-only TSR vs OTOv2 (one run from scratch, same count)"),
+    ("nobank", "oto", "bank-free removal-only TSR vs OTOv2 (same count)"),
+    ("nobank", "off", "does dropping the dormant bank change removal-only TSR?"),
 ]
 
 

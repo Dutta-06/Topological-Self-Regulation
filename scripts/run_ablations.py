@@ -49,7 +49,9 @@ ARMS = {  # name -> (--growth, --exchange-order)
     "off": ("off", "prune_first"),
     "random": ("random", "grow_first"),
     "cost": ("cost", "grow_first"),
+    "nobank": ("off", "prune_first"),   # removal-only with no candidate bank (--k 0)
 }
+ARM_EXTRA = {"nobank": ["--k", "0"]}  # extra train_tsrx flags per arm
 _print_lock = threading.Lock()
 
 
@@ -149,7 +151,8 @@ def build_chains(args) -> list:
                 chain = [(disc,
                           [py, "-m", "bench.train_tsrx", "--arch", arch, "--dataset", ds,
                            "--seed", str(seed), "--budget-ratio", str(args.budget_ratio),
-                           "--growth", growth, "--exchange-order", order, "--out", str(disc)] + common,
+                           "--growth", growth, "--exchange-order", order, "--out", str(disc)]
+                          + ARM_EXTRA.get(arm, []) + common,
                           {"arm": arm, "arch": arch, "dataset": ds, "seed": seed, "kind": "online",
                            "growth": growth, "exchange_order": order})]
                 if arm in args.c2_arms:

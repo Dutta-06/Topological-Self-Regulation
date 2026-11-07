@@ -48,6 +48,8 @@ def compute_uc_norms(bank: CandidateBank, tap: int,
     replace parameters but never modules, so a map built once stays valid;
     passing it saves a module-tree walk per group per step."""
     h = bank.handles[tap]
+    if h.k == 0:  # bank-free (removal-only) mode: there are no candidates to read
+        return torch.zeros(0, device=next(bank.model.parameters()).device)
     if modules is None:
         modules = dict(bank.model.named_modules())
     device = next(bank.model.parameters()).device

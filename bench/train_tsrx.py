@@ -186,6 +186,13 @@ def main():
     res = discover_groups(traced)
     bundles = build_all_bundles(res, model)
 
+    if args.k == 0 and args.growth != "off":
+        raise SystemExit("--k 0 (no candidate bank) is only meaningful with --growth off")
+    # With growth off the candidate window is never read, so it is not
+    # recorded; with --k 0 there is no bank to read at all ("bank-free"
+    # removal-only TSR: same controller, same removal scores, no dormant
+    # candidates in any tensor).
+    sense_growth = args.growth != "off"
     bank = CandidateBank(model, bundles, k=args.k)
     bank = bank.to(args.device)
 
@@ -254,8 +261,9 @@ def main():
             # Sense candidate gradients u_c and compute removal saliency
             with torch.no_grad():
                 for tap, h in bank.handles.items():
-                    u = compute_uc_norms(bank, tap, modules=modules_by_name)
-                    win.record(tap, u)
+                    if sense_growth:  # the growth signal is read only when growth is on
+                        u = compute_uc_norms(bank, tap, modules=modules_by_name)
+                        win.record(tap, u)
                     sal = first_order_saliency(model, h.bundle, h.base_size, modules=modules_by_name)
                     saliency_sum[tap] = sal if saliency_sum[tap] is None else saliency_sum[tap] + sal
 
@@ -271,7 +279,8 @@ def main():
             # become live channels, u_c stops being the topological derivative
             # at the silent point, and accuracy gets measured on a model that
             # deployed_params() does not count.
-            bank.zero_ports()
+            if bank.k > 0:
+                bank.zero_ports()
             sched.step()
 
             loss_val = loss.item()
