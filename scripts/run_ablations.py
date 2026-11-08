@@ -50,8 +50,14 @@ ARMS = {  # name -> (--growth, --exchange-order)
     "random": ("random", "grow_first"),
     "cost": ("cost", "grow_first"),
     "nobank": ("off", "prune_first"),   # removal-only with no candidate bank (--k 0)
+    # ResNet-18 only: start from a deliberately mis-allocated network at the dense
+    # count (scripts/make_misalloc_widths.py); the ratio puts the target on 85% of
+    # the DENSE count, as in every other arm
+    "misalloc_released": ("grad", "prune_first"),
+    "misalloc_off": ("off", "prune_first"),
 }
-ARM_EXTRA = {"nobank": ["--k", "0"]}  # extra train_tsrx flags per arm
+_MISALLOC = ["--init-widths", "results/misalloc/resnet18_cifar100.json", "--budget-ratio", "0.8482104"]
+ARM_EXTRA = {"nobank": ["--k", "0"], "misalloc_released": _MISALLOC, "misalloc_off": _MISALLOC}
 _print_lock = threading.Lock()
 
 

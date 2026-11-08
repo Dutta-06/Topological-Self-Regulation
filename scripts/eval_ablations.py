@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost", "nobank", "oto"]
+ARM_ORDER = ["ref", "released", "fixed", "off", "random", "cost", "nobank", "oto",
+             "misalloc_static", "misalloc_released", "misalloc_off"]
 PAIRS = [  # (a, b, question answered by a - b)
     ("released", "off", "does growth help, as published?"),
     ("fixed", "off", "does growth help, with measured-direction births?"),
@@ -37,6 +38,9 @@ PAIRS = [  # (a, b, question answered by a - b)
     ("off", "oto", "removal-only TSR vs OTOv2 (one run from scratch, same count)"),
     ("nobank", "oto", "bank-free removal-only TSR vs OTOv2 (same count)"),
     ("nobank", "off", "does dropping the dormant bank change removal-only TSR?"),
+    ("misalloc_released", "misalloc_off", "from a mis-allocated start: does growth repair it?"),
+    ("misalloc_released", "misalloc_static", "TSR at 85% vs the mis-allocated start at 100% (both retrained)"),
+    ("misalloc_off", "misalloc_static", "removal-only at 85% vs the mis-allocated start at 100% (both retrained)"),
 ]
 
 

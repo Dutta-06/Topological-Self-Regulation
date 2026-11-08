@@ -77,6 +77,10 @@ def main():
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--weight-decay", type=float, default=5e-4)
     ap.add_argument("--k", type=int, default=4, help="Candidate bank size per group")
+    ap.add_argument("--init-widths", default=None,
+                    help="JSON {tap: width}: start from these coupling-group widths instead of the "
+                         "standard ones (fresh initialization); the budget is then a fraction of "
+                         "this starting count")
     ap.add_argument("--update-interval", type=int, default=100, help="Steps between structural updates")
     ap.add_argument("--budget-ratio", type=float, default=0.85, help="Max param budget as ratio of baseline (e.g. 0.85)")
     ap.add_argument("--delta", type=float, default=1e-7, help="Exchange acceptance margin")
@@ -155,6 +159,14 @@ def main():
 
     # 1. Build Reference Model
     model = build_model(args.arch, num_classes, cifar_stem=args.cifar_stem).to(args.device)
+    if args.init_widths:
+        from bench.resize import resize_model_to_widths
+        spec = json.loads(Path(args.init_widths).read_text(encoding="utf-8"))
+        start_widths = spec.get("widths", spec)
+        in_hw = 64 if args.dataset in ("tiny_imagenet", "tiny-imagenet") else 32
+        model = resize_model_to_widths(model, start_widths,
+                                       torch.zeros(2, 3, in_hw, in_hw, device=args.device)).to(args.device)
+        print(f"  Starting widths from {args.init_widths}: {start_widths}")
 
     baseline_params = count_params(model)
     if args.budget_ratio is None or args.budget_ratio <= 0 or args.budget_ratio >= 100.0:

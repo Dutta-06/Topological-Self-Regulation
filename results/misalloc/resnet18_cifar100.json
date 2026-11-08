@@ -1,0 +1,35 @@
+{
+ "arch": "resnet18",
+ "dataset": "cifar100",
+ "widths": {
+  "1": 16,
+  "3": 16,
+  "4": 16,
+  "5": 32,
+  "8": 32,
+  "9": 32,
+  "10": 256,
+  "13": 256,
+  "14": 256,
+  "15": 541,
+  "18": 541,
+  "19": 541
+ },
+ "stage_of_tap": {
+  "1": 1,
+  "3": 1,
+  "4": 1,
+  "5": 2,
+  "8": 2,
+  "9": 2,
+  "10": 3,
+  "13": 3,
+  "14": 3,
+  "15": 4,
+  "18": 4,
+  "19": 4
+ },
+ "params": 11243805,
+ "dense_params": 11220132,
+ "description": "stage 1 at 16 and stage 2 at 32 channels, stage 3 unchanged, stage 4 widened uniformly to the smallest width reaching the dense count"
+}

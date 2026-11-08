@@ -1,0 +1,22 @@
+{
+ "arm": "misalloc_static",
+ "arch": "resnet18",
+ "dataset": "cifar100",
+ "seed": 43,
+ "final_widths": {
+  "4": 16,
+  "1": 16,
+  "3": 16,
+  "5": 32,
+  "9": 32,
+  "8": 32,
+  "10": 256,
+  "14": 256,
+  "13": 256,
+  "15": 541,
+  "19": 541,
+  "18": 541
+ },
+ "params": 11243805,
+ "widths_from": "make_misalloc_widths.py"
+}
