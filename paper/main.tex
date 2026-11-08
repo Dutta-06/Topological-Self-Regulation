@@ -54,14 +54,14 @@
 \begin{document}
 \maketitle
 \begin{abstract}
-A neural network learns how to use its channels during training, but where those channels sit is decided before the first gradient is taken, by convention rather than by the task. One part of a network can be starved of channels while another carries channels it barely uses. We ask whether training itself can revise this allocation. Topological Self-Regulation (TSR) treats channel width as a budgeted, revisable part of the model: silent candidate channels are attached throughout the network, the ordinary backward pass reveals which of them would be worth introducing and which incumbents contribute least, and capacity is transferred between them through edits that keep every dependent tensor consistent. A coupling calculus makes such edits valid across residual trunks, depthwise stacks, normalization state and optimizer moments, and the deployed parameter count is computed exactly from the edited tensors. Across four image-classification families and four forecasting backbones, the discovered architectures match the dense reference at roughly fifteen percent fewer parameters in vision and at reductions reaching well over half the network in forecasting. On the convolutional and mixing forecasters, the task-directed allocation outperforms a random one of the same size, and pruning the same reference to the same count shows how much of that is reallocation rather than removal. A three-seed ablation locates the source of the allocation: disabling growth, or placing it at random, leaves the retrained architecture's accuracy unchanged, so its value lies in budgeted, removal-led reallocation rather than in gradient-directed growth, and the allocation itself is stable across seeds and controller settings. Without the candidate bank that growth requires, removal-only TSR matches OTOv2, a one-run structured pruning method, at lower training cost.
+A neural network learns how to use its channels during training, but where those channels sit is decided before the first gradient is taken, by convention rather than by the task. One part of a network can be starved of channels while another carries channels it barely uses. We ask whether training itself can revise this allocation. Topological Self-Regulation (TSR) treats channel width as a budgeted, revisable part of the model: silent candidate channels are attached throughout the network, the ordinary backward pass reveals which of them would be worth introducing and which incumbents contribute least, and capacity is transferred between them through edits that keep every dependent tensor consistent. A coupling calculus makes such edits valid across residual trunks, depthwise stacks, normalization state and optimizer moments, with exact accounting of the parameters they move. Across four image-classification families and four forecasting backbones, the discovered architectures match the dense reference at roughly fifteen percent fewer parameters in vision and at reductions reaching well over half the network in forecasting. Where the reduction is large, the task-directed allocation outperforms a random one of the same size, and pruning the same reference to the same count shows how much of that is reallocation rather than removal.
 \end{abstract}
 
 \section{Introduction}
 \label{sec:intro}
 A network can learn how to use its channels without learning where those channels should be. Conventional widths are chosen before training, often by doubling channels after downsampling or imposing a fixed expansion ratio. Weights then adapt within that allocation, even when a useful feature cannot be expressed at one site and capacity at another contributes little. We ask whether the task loss can also guide a revision of the network's internal dimensions. This requires a connection between redundancy and opportunity. Removal asks what the network would lose, while growth asks what a proposed feature could contribute, which depends on how it enters the computation. We evaluate that opportunity through a candidate whose outgoing weights are zero. Its presence leaves the current function unchanged, yet the loss gradient at those weights need not vanish, and that gradient is the direction along which the feature would enter. The same sensitivity read at an incumbent recovers the activation-gradient product of Taylor pruning \citep{molchanov2017pruning}.
 
-Topological Self-Regulation uses this connection to revise widths during a discovery run. Its contributions are a coupling calculus, an index representation that makes edits in both directions valid across every dependent tensor; a budgeted controller that revises widths inside a single training run; and a protocol that separates the value of an allocation from the run that found it. The protocol also tests the controller's own premise, and a growth ablation (\cref{sec:ablation}) finds that the allocation's value does not come from gradient-directed growth. Two levels are analyzed: the released controller reallocates capacity using gradient-derived surrogate scores, and a calibrated reference rule replaces those scores by loss-change bounds that admit a local descent certificate. That certificate belongs to the calibrated variant rather than to every practical edit.
+Topological Self-Regulation uses this connection to revise widths during a discovery run. Its contribution is a common description of growth and removal, coupled to an index representation that makes supported edits valid across dependent tensors. Two levels are analyzed: the released controller reallocates capacity using gradient-derived surrogate scores, and a calibrated reference rule replaces those scores by loss-change bounds that admit a local descent certificate. That certificate belongs to the calibrated variant rather than to every practical edit.
 
 Width allocation occupies a middle ground between post hoc pruning, which asks which components of a chosen architecture can be discarded \citep{han2015learning,li2016pruning,he2017channel}, and architecture search, which evaluates many designs under a separate search procedure or a proxy training budget \citep{zoph2017neural,liu2018darts,JMLR:v20:18-598}. TSR instead holds the computational skeleton fixed and lets training redistribute a prescribed resource among its editable groups. When a model family has already fixed its operators and its connectivity, can the task signal improve the allocation of channels inside that family? Asking it this way is what makes the comparison possible, against a dense reference and against the same discovered widths trained from scratch. That comparison also separates effects that dynamic-architecture results can otherwise confound. A compact network may be better because its widths are better allocated, or because its parameters took a particular sequence of edits and a different optimization trajectory. We therefore treat the online discovery run and the static retraining of its exported shape as different experimental objects, the first measuring what self-regulation costs during learning and the second asking whether the discovered allocation is valuable on its own. Structural validity and resource accounting carry as much weight here as the saliency rule does, as do the empirical controls.
 
@@ -69,7 +69,7 @@ Width allocation occupies a middle ground between post hoc pruning, which asks w
 \label{sec:related}
 \textbf{Growth and removal.} Cascade-Correlation learns candidate features from residual errors \citep{fahlman1989cascade}, Net2Net preserves a function while enlarging its parameterization \citep{Chen2016}, and GradMax uses gradient information to initialize new units \citep{evci2022gradmax}. TSR carries this perspective to candidate ports at interior sites and reads their sensitivity from the same backward pass as removal; its candidate objective is connected to covariance selection in \cref{app:candidates}. On the removal side, skeletonization and Taylor pruning measure the sensitivity of existing units \citep{mozer1988skeletonization,molchanov2017pruning}, curvature refines the linear estimate when trained gradients become small \citep{lecun1989optimal,hassibi1992second}, channel pruning removes dimensions from a trained network \citep{han2015learning,li2016pruning,he2017channel,liu2017learning}, DepGraph resolves the dependencies that constrain channel removal \citep{10204583}, and Isomorphic Pruning ranks each sub-structure only against structurally matching ones \citep{fang2024isomorphic}. Our coupling calculus extends that discipline to edits in both directions and to optimizer state.
 
-\textbf{Structure changed during training.} Dynamic sparse training reallocates a mask over individual weights and leaves the ambient shapes alone \citep{evci2020rigging}; its structured form, SRigL, constrains the mask to whole neurons so the trained network can afterwards be condensed \citep{lasby2024dynamic}, and BilevelPruning learns a channel mask during training and applies it statically at the end \citep{gao2024bilevelpruning}. NeST grows connections and then prunes them in separate phases \citep{dai2019nest}, structured continuous sparsification grows widths under a joint accuracy and sparsity objective \citep{yuan2021growing}, incremental growth with variance transfer expands a small network during training to cut its cost \citep{yuan2023accelerated}, and \citet{swiderski2025growing} grow and shrink networks during training with structural decisions guided by Monte Carlo tree search. OTOv2 trains and structurally prunes a network in one run from scratch, over zero-invariant groups derived from its dependency graph, with a sparsity-inducing optimizer \citep{chen2023otov2}; it is the closest relative of removal-only TSR (\cref{sec:ablation}), which removes by a budgeted ranking instead and also admits growth. MorphNet and AutoSlim redistribute capacity within an architectural family through a resource regularizer or a slimmable supernetwork \citep{gordon2018morphnet,8822c3c89a3f4ee0bf3b01a679aabd6b,yu2020autoslim}. What separates TSR is what gets decided and from what evidence. A mask chooses which existing channels survive; TSR changes how many channels each site has, can put capacity where the reference had none, and edits every dependent tensor and optimizer state to match, with growth and removal read from one backward pass and spent against one budget. An unstructured sparsity result is therefore context rather than a control, and a structured mask controls the removal half of an exchange without its growth half. TSR also keeps a transparent correspondence between a discovered width vector and a retrainable static control, which is what lets the controls of \cref{sec:experiments} locate the source of an effect. \Cref{app:related} expands these comparisons.
+\textbf{Structure changed during training.} Dynamic sparse training reallocates a mask over individual weights and leaves the ambient shapes alone \citep{evci2020rigging}; its structured form, SRigL, constrains the mask to whole neurons so the trained network can afterwards be condensed \citep{lasby2024dynamic}, and BilevelPruning learns a channel mask during training and applies it statically at the end \citep{gao2024bilevelpruning}. NeST grows connections and then prunes them in separate phases \citep{dai2019nest}, structured continuous sparsification grows widths under a joint accuracy and sparsity objective \citep{yuan2021growing}, incremental growth with variance transfer expands a small network during training to cut its cost \citep{yuan2023accelerated}, and \citet{swiderski2025growing} grow and shrink networks during training with structural decisions guided by Monte Carlo tree search. OTOv2 trains and structurally prunes a network in one run from scratch, over zero-invariant groups derived from its dependency graph, with a sparsity-inducing optimizer \citep{chen2023otov2}. MorphNet and AutoSlim redistribute capacity within an architectural family through a resource regularizer or a slimmable supernetwork \citep{gordon2018morphnet,8822c3c89a3f4ee0bf3b01a679aabd6b,yu2020autoslim}. What separates TSR is what gets decided and from what evidence. A mask chooses which existing channels survive; TSR changes how many channels each site has, can put capacity where the reference had none, and edits every dependent tensor and optimizer state to match, with growth and removal read from one backward pass and spent against one budget. An unstructured sparsity result is therefore context rather than a control, and a structured mask controls the removal half of an exchange without its growth half. TSR also keeps a transparent correspondence between a discovered width vector and a retrainable static control, which is what lets the controls of \cref{sec:experiments} locate the source of an effect. \Cref{app:related} expands these comparisons.
 
 \section{Structural Optimization}
 \label{sec:problem}
@@ -153,7 +153,7 @@ Consistent group edit, exact deployed count (\cref{app:coupling}) & proved & hol
 Birth along the measured direction (\cref{prop:blockbirth}) & proved & holds for growth after the revision of \cref{app:materialization}; $60\%$ of archived births before it \\
 Loss-decrease certificate for an exchange (\cref{eq:exchange}) & proved & not evaluated; scores used as ranks \\
 Shadow-price stability at a tight budget (\cref{app:allocation}) & proved & no \\
-$\Theta(\sqrt d)$ advantage over a random port (\cref{app:random}) & proved & for births along the measured direction; not visible in accuracy (\cref{sec:ablation}) \\
+$\Theta(\sqrt d)$ advantage over a random port (\cref{app:random}) & proved & for births along the measured direction \\
 Bound on the number of certified events (\cref{app:events}) & proved & no; feasibility removals are forced \\
 \bottomrule
 \end{tabular}
@@ -252,37 +252,9 @@ EfficientNet-B0& C-10 & $-15.01$ & 90.78 & 90.61 & 90.21 & $-0.17$ & $-0.57$ & $
 
 \section{Vision Results}
 \label{sec:vision-results}
-\Cref{tab:vision} reports the eleven complete vision cells, with all three arms archived in each. A single training run discovers a width vector that carries the dense model's accuracy at $15.0$--$16.3\%$ fewer parameters: the median difference is $0.21$ points, and eight of the eleven differences are within the $0.28$-point range that the dense reference covers across three seeds in the repeated MobileNetV2 cell (\cref{app:seeds}). No dense pre-training stage, proxy task or search budget beyond that run is involved. One cell costs more than a point, MobileNetV2 on CIFAR-100, the smallest and most parameter-efficient backbone in the suite, whose inverted residuals leave the least redundancy to reclaim; it is repeated across seeds in \cref{app:seeds}. The retrained arm never exceeds the reference by more than $0.07$ points. Against structured pruning of the same reference to the same count, the online arm lands within the seed spread of a fine-tuned pipeline that needs a trained network to start from and uses more training FLOPs in every cell where both are measured, though less wall-clock time in our implementation (\cref{app:compute}), and the discovered allocation is ahead of a magnitude-ranked one by $0.49$ points on average when neither inherits those weights, by more than a point in three cells and inside the seed spread in the rest (\cref{app:pruning}). \Cref{app:vision-results} gives the per-cell figures.
+\Cref{tab:vision} reports the eleven complete vision cells, with all three arms archived in each. A single training run discovers a width vector that carries the dense model's accuracy at $15.0$--$16.3\%$ fewer parameters: the median difference is $0.21$ points, and eight of the eleven differences are within the $0.28$-point range that the dense reference covers across three seeds in the repeated MobileNetV2 cell (\cref{app:seeds}). No dense pre-training stage, proxy task or search budget beyond that run is involved. One cell costs more than a point, MobileNetV2 on CIFAR-100, the smallest and most parameter-efficient backbone in the suite, whose inverted residuals leave the least redundancy to reclaim; it is repeated across seeds in \cref{app:seeds}. The retrained arm never exceeds the reference by more than $0.07$ points. Against structured pruning of the same reference to the same count, the online arm lands within the seed spread of a fine-tuned pipeline that needs a trained network to start from and costs more training compute in every cell where both are measured (\cref{app:compute}), and the discovered allocation is ahead of a magnitude-ranked one by $0.49$ points on average when neither inherits those weights, by more than a point in three cells and inside the seed spread in the rest (\cref{app:pruning}). \Cref{app:vision-results} gives the per-cell figures.
 
 What the controller exports trains on its own: the online arm's median difference against its own retrained twin is $-0.20$ points, so retraining the discovered shape from scratch recovers at least what the run that found it reached. That comparison never involves the dense arm, so it is unaffected by how well the reference was trained, and it prices searching and training at once at about a fifth of a point at the median, with MobileNetV2 on CIFAR-100 and ResNet-18 on Tiny-ImageNet the two cells where the online arm is clearly ahead. The controller optimizes the resource it is given. Under the parameter budget forward FLOPs fall in four of the eleven cells and rise in seven, because parameters concentrate in late, narrow-spatial layers while computation concentrates in early, wide ones. That dependence is actionable rather than incidental, because $\kappa$ is defined against any additive cost: re-running EfficientNet-B0 and MobileNetV2 under a FLOP budget, with the same controller, schedule and recipe, delivers a $13$--$15\%$ compute reduction in all four cells at one seed each, including the one where a parameter budget had instead raised FLOPs by $40.2\%$ and where the FLOP-budgeted model now matches the dense reference exactly (\cref{app:flops}).
-
-\subsection{Where the allocation comes from}
-\label{sec:ablation}
-The controller reads growth and removal from one backward pass, so \cref{tab:vision} cannot say which of the two produces the allocation. We reran discovery on ResNet-18 and VGG-16-BN on CIFAR-100 with three seeds per arm, keeping the schedule, budget and candidate bank and changing only growth: disabled, placed in a random group, placed in the cheapest group, or applied before the removal of an exchange so that every birth opens along its measured direction (\cref{app:materialization}). \Cref{tab:ablation} gives the paired differences. Disabling growth leaves the retrained allocation unchanged on both backbones, a random growth site does as well as the gradient's, and the measured-direction order does not raise accuracy. The one effect attributable to growth is online: $+0.37\pm0.15$ points on ResNet-18, in all three seeds, and none on VGG-16-BN. What the allocation owes to the controller is therefore its budgeted, removal-led reallocation rather than gradient-directed growth, which in every gradient-directed run spends all of its births in a single group. It is still reallocation rather than generic compression. Retrained, the growth-off allocations land $0.22$ and $0.19$ points below their dense references, where $\ell_1$ pruning to the same count trained from scratch lands $1.48$ and $0.37$ points below in the single-seed runs of \cref{tab:vision}, so where the remaining capacity sits is what matters. Growth is the only mechanism that can move capacity when the budget does not shrink, since at the dense count a removal-only controller can only delete channels it scores as dead; there, on ResNet-18, the reallocated network retrains to $0.21\pm0.30$ points below the dense model, so moving capacity at constant size does not improve on the standard widths either (\cref{app:ablation}). Growth is also what the candidate bank exists for, and the bank is most of TSR's training cost (\cref{app:compute}). Dropping it leaves removal-only TSR without any dormant channel: this bank-free controller reaches $77.35\pm0.16$ and $73.46\pm0.61$, level with the dense VGG-16-BN reference, at $1.14$ to $1.17$ times the dense model's step time. OTOv2, the closest published relative of removal-only TSR, run from its official implementation at the same count and recipe, costs $1.17$ to $1.24$ times and lands at the same accuracy: the released controller leads it by $0.34\pm0.41$ and $0.10\pm0.71$ points in paired seeds, the bank-free one by $0.14\pm0.26$ and $0.28\pm0.86$, all inside the spread (\cref{app:ablation}). The allocation itself is reproducible. Across seeds the exported width vectors have a mean pairwise cosine similarity of $0.99$ on both backbones, once the two cost-identical identity blocks of ResNet-18's first stage are counted as one, and eight one-at-a-time changes to $\widetilde H$, $k$, $K$ and $\alpha$ move online accuracy by $-0.12$ to $+0.22$ points (\cref{app:ablation}).
-
-\begin{table}[t]
-\centering
-\caption{Growth ablation on CIFAR-100, three seeds per arm with discovery rerun for each. Paired same-seed differences in last-epoch top-1 (points, mean $\pm$ s.d.); C2 retrains each run's exported widths. (a) released controller; (b) growth disabled; (c) growth in a random group; (d) growth in the cheapest group; (e) growth applied before the exchange's removal. On VGG-16-BN the cheapest group is the gradient's own choice, so (d) and (e) are the same run. The last three rows compare with OTOv2 \citep{chen2023otov2} trained once from scratch at the same deployed count; ``bank-free'' is arm (b) without the candidate bank. Per-arm accuracies, sensitivity and stability in \cref{app:ablation}.}
-\label{tab:ablation}
-\footnotesize
-\setlength{\tabcolsep}{4.0pt}
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-& \multicolumn{2}{c}{ResNet-18} & \multicolumn{2}{c}{VGG-16-BN} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}
-Difference & online & C2 & online & C2 \\
-\midrule
-(a) $-$ (b), growth on vs.\ off & $+0.37\pm0.15$ & $+0.01\pm0.59$ & $+0.00\pm0.20$ & $-0.10\pm0.19$ \\
-(e) $-$ (b), measured births vs.\ off & $+0.12\pm0.12$ & $-0.16\pm0.27$ & $-0.09\pm0.33$ & $-0.11\pm0.19$ \\
-(e) $-$ (c), gradient vs.\ random site & $-0.11\pm0.17$ & -- & $+0.05\pm0.21$ & -- \\
-(e) $-$ (d), gradient vs.\ cheapest site & $+0.06\pm0.10$ & -- & $0.00$ & -- \\
-(e) $-$ (a), measured vs.\ released births & $-0.25\pm0.15$ & $-0.17\pm0.34$ & $-0.09\pm0.16$ & $-0.01\pm0.02$ \\
-(a) $-$ OTOv2, same count & $+0.34\pm0.41$ & -- & $+0.10\pm0.71$ & -- \\
-(b) $-$ OTOv2, same count & $-0.02\pm0.44$ & -- & $+0.10\pm0.60$ & -- \\
-bank-free (b) $-$ OTOv2, same count & $+0.14\pm0.26$ & -- & $+0.28\pm0.86$ & -- \\
-\bottomrule
-\end{tabular}
-\end{table}
 
 \begin{table}[t]
 \centering
@@ -329,13 +301,13 @@ Two readings depend on keeping the arms separate. The online arm is measured at 
 \label{sec:discussion}
 The question posed in \cref{sec:intro}, whether the task signal can improve the allocation of channels within a fixed model family, is answered here for allocation under a budget. TSR discovers allocations inside a single training run rather than through a separate search. Retrained from scratch, they hold the dense model's accuracy to a median of $0.21$ points at $15$ to $16\%$ fewer parameters in vision, and the run that discovered them ends $0.28$ below the dense model on its own. In forecasting the retrained allocation reaches $17\%$ to $86\%$ fewer parameters inside a fixed tolerance. Parity at a reduced budget is the claim, and it is a measured one, since every arm is scored from its archived checkpoint.
 
-The static-matched arm reaches the online arm's accuracy, and exceeds it by a median of $0.20$ points over the eleven vision cells, so what TSR exports is a width vector that trains on its own. The random-width control adds a second distinction, between a task-directed allocation and an arbitrary one of the same size, which the from-scratch pruning arm carries in vision with a stronger comparator. On the TCN and TSMixer at Electricity and Traffic the task-directed allocation beats an arbitrary one of the same size, by more than the seed spread wherever repeats exist; on the two transformers, whose plastic set is only their feed-forward widths, and on Weather the two are indistinguishable, which is what a controller whose only objective is the resource constraint should produce where little of the network can move. The released controller carries no accuracy objective. It enforces structural validity exactly and spends the budget where its scores rank capacity highest, and the descent certificate belongs to its calibrated form. The ablation of \cref{sec:ablation} shows which score does the work: on the two backbones tested the removal ranking carries the allocation, and the growth ranking, despite its first-order advantage over a random direction (\cref{app:random}), does not change what the exported architecture is worth. When the budget shrinks, the controller is therefore best run without its candidate bank, which removes most of its training cost (\cref{app:compute}). Exported networks that are smaller and not worse are therefore the designed outcome, and the design leaves a direct route open. A small accuracy term in the exchange rule, or a protection interval for recently promoted channels, would push toward allocations that are better, and neither touches the coupling machinery that makes the edits valid. What can be reallocated is set by the coupling structure and the task interface rather than by the sensing rule.
+The static-matched arm reaches the online arm's accuracy, and exceeds it by a median of $0.20$ points over the eleven vision cells, so what TSR exports is a width vector that trains on its own. The random-width control adds a second distinction, between a task-directed allocation and an arbitrary one of the same size, which the from-scratch pruning arm carries in vision with a stronger comparator. On the TCN and TSMixer at Electricity and Traffic the task-directed allocation beats an arbitrary one of the same size, by more than the seed spread wherever repeats exist; on the two transformers, whose plastic set is only their feed-forward widths, and on Weather the two are indistinguishable, which is what a controller whose only objective is the resource constraint should produce where little of the network can move. The released controller carries no accuracy objective. It enforces structural validity exactly and spends the budget where the sensing rule finds capacity worth most, and the descent certificate belongs to its calibrated form. Exported networks that are smaller and not worse are therefore the designed outcome, and the design leaves a direct route open. A small accuracy term in the exchange rule, or a protection interval for recently promoted channels, would push toward allocations that are better, and neither touches the coupling machinery that makes the edits valid. What can be reallocated is set by the coupling structure and the task interface rather than by the sensing rule.
 
-Three boundaries remain. Most cells are single-seed, with the repeats of \cref{app:seeds} bounding the spread; discovery itself is repeated across seeds on two backbones, and the controller's settings are swept one at a time on one cell (\cref{app:ablation}). The growth ablation covers two backbones on one dataset, so whether growth matters for depthwise or compound-scaled networks, or at tighter budgets, remains open; at a budget equal to the dense count it did not help on ResNet-18. The vision budget is a fixed control rather than a swept quantity, so sensitivity to the budget is characterized on the forecasting side. The third is coverage. Eleven of the sixteen vision cells are complete, and structured pruning at the matched count runs in ten of them, the ImageNet-100 cell not yet covered (\cref{app:pruning}). The longer forecast horizon is excluded for the reason the Electricity cell is, that an arm enters the tables only when its controls are complete.
+Three boundaries remain. Most cells are single-seed, with the repeats of \cref{app:seeds} bounding the spread, and the controller's own settings ($k$, $K$, $\varepsilon$, $\delta$) were fixed across the campaign rather than swept. The vision budget is a fixed control rather than a swept quantity, so sensitivity to the budget is characterized on the forecasting side. The third is coverage. Eleven of the sixteen vision cells are complete, and structured pruning at the matched count runs in ten of them, the ImageNet-100 cell not yet covered (\cref{app:pruning}). The longer forecast horizon is excluded for the reason the Electricity cell is, that an arm enters the tables only when its controls are complete.
 
 \section{Conclusion}
 \label{sec:conclusion}
-Topological Self-Regulation treats channel width as a budgeted, revisable part of a model and gives training the means to revise it. Its two components are separable. A coupling calculus makes a proposed edit valid across every dependent tensor, and the deployed count is computed exactly from the edited tensors. A sensing rule reads a topological derivative from the ordinary backward pass at a silent candidate and pairs it with a removal saliency at incumbents. Ablating the growth half locates the allocation's value in the budgeted, removal-led reallocation, with growth adding at most a small online gain; without the candidate bank that growth needs, the controller matches OTOv2 at lower training cost. Across four image-classification families and four forecasters, the combination reallocates a fixed skeleton to a smaller budget inside a single training run, without the trained network and fine-tuning stage that structured pruning requires, at a median cost of $0.28$ points of accuracy for that run and $0.21$ for the allocation it exports in vision, and inside a fixed tolerance of test error for the exported allocation in forecasting. The allocation it exports trains on its own, beats a random one of the same size on the convolutional and mixing forecasters, and can be spent on parameters or on compute. A neural network, we believe, should be allowed to decide its own structure.
+Topological Self-Regulation treats channel width as a budgeted, revisable part of a model and gives training the means to revise it. Its two components are separable. A coupling calculus makes a proposed edit valid across every dependent tensor, and the deployed count is computed exactly from the edited tensors. A sensing rule reads a topological derivative from the ordinary backward pass at a silent candidate and pairs it with a removal saliency at incumbents. Across four image-classification families and four forecasters, the combination reallocates a fixed skeleton to a smaller budget inside a single training run, without the trained network and fine-tuning stage that structured pruning requires, at a median cost of $0.28$ points of accuracy for that run and $0.21$ for the allocation it exports in vision, and inside a fixed tolerance of test error for the exported allocation in forecasting. The allocation it exports trains on its own, beats a random one of the same size on the convolutional and mixing forecasters, and can be spent on parameters or on compute. A neural network, we believe, should be allowed to decide its own structure.
 
 \label{main:end}
 
@@ -439,7 +411,6 @@ the evidence separates from run-to-run variation and which it does not. The cont
 \appendixcontentsentry{app:pruning}
 \appendixcontentsentry{app:ts-results}
 \appendixcontentsentry{app:seeds}
-\appendixcontentsentry{app:ablation}
 \appendixcontentsentry{app:case-studies}
 \normalsize
 \clearpage
@@ -1205,7 +1176,7 @@ The released operation that promotes a selected candidate into the real index se
 v_c^{(r)}=-\varepsilon\,u_c^{(r)}/\norm{u_c^{(r)}}_2.
 \label{eq:materialize}
 \end{equation}
-Its first-order change is $-\varepsilon\sum_r\norm{u_c^{(r)}}_2$ and its joint step norm is $\varepsilon\sqrt{m}$ when all $m$ blocks are nonzero, as shown in \cref{prop:blockbirth}. The routine uses the gradient left by the most recent minibatch backward pass, not a vector averaged over the sensing window. If a consumer gradient is absent, it falls back to a small random block, for which no measured-direction guarantee applies. In the released controller this fallback is not rare. An exchange applies its removal first, and a removal replaces every tensor it edits, discarding that tensor's gradient; when the removal touches the grown group's consumer, which is always the case when both halves of the exchange fall in one group, the newborn port opens in a random direction. Replaying the archived decision logs, this happened for $1{,}512$ of the $3{,}801$ births ($40\%$): none in EfficientNet-B0, MobileNetV2 or the VGG-16-BN CIFAR runs, $33\%$ on VGG-16-BN Tiny-ImageNet, and $12$ to $60\%$ on ResNet-18, whose exchanges almost always remove and add within the same group. Applying the growth half first keeps the gradient attached and is otherwise index-identical, because a promoted channel is appended after every existing index. The revised controller does so; every other result in this paper uses the released order, and the two are compared directly in the growth ablation of \cref{sec:ablation}. The revised order does not raise accuracy. Over three seeds it trails the released order by $0.25\pm0.15$ points online on ResNet-18, where the fallback affects about half of all births, and the two are indistinguishable on VGG-16-BN, where it affects almost none (\cref{tab:ablation}). The released controller's accuracy therefore does not depend on births opening along their measured direction. The calibrated Euclidean variant instead uses the single joint denominator $v_c=-\varepsilon u_c/\norm{u_c}_2$. For a single consumer the two rules coincide.
+Its first-order change is $-\varepsilon\sum_r\norm{u_c^{(r)}}_2$ and its joint step norm is $\varepsilon\sqrt{m}$ when all $m$ blocks are nonzero, as shown in \cref{prop:blockbirth}. The routine uses the gradient left by the most recent minibatch backward pass, not a vector averaged over the sensing window. If a consumer gradient is absent, it falls back to a small random block, for which no measured-direction guarantee applies. In the released controller this fallback is not rare. An exchange applies its removal first, and a removal replaces every tensor it edits, discarding that tensor's gradient; when the removal touches the grown group's consumer, which is always the case when both halves of the exchange fall in one group, the newborn port opens in a random direction. Replaying the archived decision logs, this happened for $1{,}512$ of the $3{,}801$ births ($40\%$): none in EfficientNet-B0, MobileNetV2 or the VGG-16-BN CIFAR runs, $33\%$ on VGG-16-BN Tiny-ImageNet, and $12$ to $60\%$ on ResNet-18, whose exchanges almost always remove and add within the same group. Applying the growth half first keeps the gradient attached and is otherwise index-identical, because a promoted channel is appended after every existing index. The revised controller does so; every result in this paper uses the released order. The calibrated Euclidean variant instead uses the single joint denominator $v_c=-\varepsilon u_c/\norm{u_c}_2$. For a single consumer the two rules coincide.
 
 A fresh candidate with random incoming weights and a zero port replenishes the bank so it retains $k$ dormant proposals. The promoted feature changes the represented function when its port opens. Only its preceding silent embedding is exactly function-preserving under the stated admissibility conditions.
 
@@ -1382,75 +1353,8 @@ costs more than dense training. Against the fine-tuned pruning pipeline it is ch
 cells where both are measured, by $1$ to $27$ percent, a narrower margin than the epoch count alone
 suggests. The retrained arm is the most expensive in every cell, $1.70$ to $2.70$ times the
 reference, because it adds a full training run to discovery; its role is to isolate the allocation,
-not to be the economical route.
-
-Forward FLOPs do not determine wall-clock time, so \cref{tab:wallclock} measures it. Each arm's
-training step was timed on one T4 GPU under the recipe of \cref{app:experiments} (batch 128, mixed
-precision) on a fixed synthetic CIFAR batch, in five interleaved rounds of 200 steps, and the median
-kept. The online step includes everything the controller adds: the sensing window, the saliency and
-activation-statistics updates, port re-zeroing, and a structural update every 100 steps. Data
-loading and evaluation are the same for every arm and are excluded. Each pipeline is assembled from
-its steps as in \cref{tab:compute}. The C2 widths are those of a released-controller run of the
-growth ablation (\cref{app:ablation}), and the pruned widths those of $\ell_1$ pruning to the same
-count.
-
-\begin{table}[h]
-\centering
-\caption{Wall-clock training time relative to the dense reference ($=1.00$), on one T4, assembled
-from measured step times. ``Released sensing'' is the online arm with the sensing path as
-originally implemented; the default path returns bit-identical scores. The last two rows are the
-step time of an exported network relative to the dense one, with its forward-FLOP change.
-$^{\dagger}$Measured in a second session on the same GPU type, whose rows shared with the first agree
-within $0.02$. The bank-free figure times the full-size network and is an upper bound, since the run
-shrinks it during the anneal; OTOv2's weights 96 epochs of its plain step and 4 of its penalty phase,
-as observed in its runs (\cref{app:ablation}).}
-\label{tab:wallclock}
-\footnotesize
-\setlength{\tabcolsep}{5.0pt}
-\begin{tabular}{@{}lrr@{}}
-\toprule
-Pipeline & ResNet-18 & VGG-16-BN \\
-\midrule
-Dense reference & 1.00 & 1.00 \\
-Online TSR & 1.60 & 1.52 \\
-Online TSR, released sensing & 1.65 & 1.59 \\
-Prune + 40-epoch fine-tune & 1.39 & 1.39 \\
-Prune + retrain from scratch & 1.97 & 1.97 \\
-C2 (discovery + retrain) & 2.72 & 2.91 \\
-Bank-free removal-only TSR$^{\dagger}$ & 1.14 & 1.17 \\
-OTOv2$^{\dagger}$ & 1.17 & 1.24 \\
-\midrule
-C2 step (FLOP change) & 1.12 ($+0.5\%$) & 1.39 ($+28.9\%$) \\
-$\ell_1$-pruned step (FLOP change) & 0.97 ($-20.8\%$) & 0.97 ($-13.8\%$) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-In wall-clock time the online arm costs $1.52$ to $1.60$ times the reference, against about $1.05$
-to $1.10$ in FLOPs for the same cells. That is $9$ to $15\%$ more than fine-tuned pruning and $19$ to
-$23\%$ less than pruning followed by retraining from scratch, at an accuracy inside the range of the
-four fine-tuned pruning methods (\cref{tab:vision}). When a trained dense model already exists,
-fine-tuned pruning needs only its 40 fine-tuning epochs and is the cheaper route; the online arm is
-for the case where no trained model exists. Most of the gap comes from the
-candidate bank rather than from the controller's arithmetic. The $k=4$ dormant channels make every
-editable width four larger than the deployed one, and convolution kernels process channels in
-tiles, so a few extra channels cost far more time than they cost FLOPs: on an RTX 4060, widening a
-$64$-channel $3\times3$ convolution at $32\times32$ resolution to $68$ channels raises its forward
-and backward time by $67\%$ for $13\%$ more FLOPs. The exported networks show the same effect at
-their irregular widths. ResNet-18's C2 adds $0.5\%$ FLOPs and takes $12\%$ longer per step, and the
-pruned networks remove $14$ to $21\%$ of the FLOPs and save $3\%$ of the time. Per-step sensing is
-the smaller cost: a sensing path that avoids per-group module lookups and host synchronization,
-with bit-identical outputs, saves $3$ to $5\%$ of the online step. Measured end to end in the growth
-ablation, with data loading and evaluation included, an online epoch took $1.59$ (ResNet-18) and
-$1.30$ (VGG-16-BN) times a dense epoch on the same GPU.
-
-The candidate bank serves growth alone, and growth adds nothing to the allocation when the budget
-shrinks (\cref{sec:ablation}), so removal-only TSR can run without it. With no dormant channel in
-any tensor, the online step costs $1.14$ (ResNet-18) and $1.17$ (VGG-16-BN) times the dense step,
-less than fine-tuned pruning ($1.39$ to $1.40$) and than OTOv2 ($1.17$ to $1.24$), whose optimizer
-reads and rewrites every group's parameters at every step. End to end, with two runs sharing each
-machine, a bank-free run took $0.87$ and $0.76$ hours, against $0.92$ and $0.82$ for OTOv2, $1.17$
-and $0.84$ for the released controller, and $0.74$ and $0.64$ for the dense reference.
+not to be the economical route. Wall-clock time additionally depends on the implementation and the
+hardware, which these counts exclude.
 
 \section{Structured Pruning at a Matched Count}
 \label{app:pruning}
@@ -1563,9 +1467,9 @@ The complete frontier, every budget from $0.95$ down to each architecture's admi
 The main tables report one run per cell. This appendix gives the repeats that were run to
 establish whether the differences in those tables are separable from the seed: on the vision
 side both CIFAR cells of MobileNetV2, the backbone that carries the largest shortfalls, and on
-the forecasting side every Weather knee. In the vision repeats here only the reference and the
-retrained arm are repeated, at the seed-42 discovered widths, so their spread is training noise
-alone; repeats that rerun discovery itself, on ResNet-18 and VGG-16-BN, are in \cref{app:ablation}.
+the forecasting side every Weather knee. In the vision repeats only the reference and the retrained
+arm are repeated, at the seed-42 discovered widths, so their spread is training noise alone; on the
+forecasting side the whole pipeline, discovery included, is rerun for every seed.
 All values are measured by the procedures of \cref{app:vision-results} and
 \cref{app:ts-results}; nothing here is inherited from a training summary.
 
@@ -1650,95 +1554,6 @@ Two gaps remain. The repeats estimate the spread of the protocol, not of every c
 per-cell interval is not available for the nine unrepeated vision cells and the Electricity and Traffic
 budgets away from the knee that were run once. And the forecasting reference is single-seed in
 at least one cell, so its own variance does not enter the differences reported there.
-
-\section{Growth Ablation, Sensitivity and Discovery Stability}
-\label{app:ablation}
-\Cref{sec:ablation} summarizes three experiments that rerun discovery itself rather than retraining a fixed architecture. All use the recipe of \cref{app:experiments} on CIFAR-100: 100 epochs, the parameter ceiling annealed to $85\%$ of the dense count over the first half of training, $k=4$ candidates per group, one structural update every $K=100$ steps, $\widetilde H=1$ and $\alpha=0.5$. Each arm is run at seeds 42, 43 and 44, and every seed reruns the whole discovery. Accuracy is the last epoch's top-1 on the held-out split, which for CIFAR is the test split, so no checkpoint is selected on it; scoring each run at its best epoch instead changes no conclusion below (growth on minus off: $+0.24\pm0.14$ online and $-0.08\pm0.55$ retrained on ResNet-18, $+0.08\pm0.15$ and $-0.05\pm0.16$ on VGG-16-BN). The VGG-16-BN runs and ResNet-18 seed 43 ran on T4 GPUs and ResNet-18 seed 44 on an A100. For ResNet-18 seed 42 the dense, released and revised-order arms ran on an RTX 4060 and the rest on a T4. Runs on the same hardware are close to deterministic: on VGG-16-BN seed 42 the released and revised-order arms make identical decisions, because no birth there falls back to a random port, and they end at the same accuracy to two decimals.
-
-\paragraph{Growth ablation.} The five arms of \cref{tab:ablation} change only what the controller does with growth. (a) is the released controller. (b) never grows: every growth option is withdrawn before the cascade of \cref{app:budget-controller}, so the controller only removes, under the same ceiling. (c) and (d) keep every growth event of the released cascade but move it to a group drawn uniformly at random, or to the group with the smallest marginal cost, among the groups whose growth fits the ceiling; the promoted candidate is the chosen group's own best. (e) applies the growth half of an exchange before its removal, so every birth opens along its measured direction (\cref{app:materialization}). Arms (a), (b) and (e) are also retrained from scratch at their exported widths.
-
-\begin{table}[h]
-\centering
-\caption{Growth ablation, per arm, with OTOv2 at the same count. Last-epoch top-1 (\%), mean $\pm$ s.d.\ over three seeds; $\Delta$ is the paired difference from the same-seed dense reference. Exported parameters are within $0.04\%$ of one another across TSR arms and within $0.1\%$ of them for OTOv2.}
-\label{tab:ablation-full}
-\footnotesize
-\setlength{\tabcolsep}{4.0pt}
-\begin{tabular}{@{}lrrrrrrrr@{}}
-\toprule
-& \multicolumn{4}{c}{ResNet-18} & \multicolumn{4}{c}{VGG-16-BN} \\
-\cmidrule(lr){2-5}\cmidrule(lr){6-9}
-Arm & online & $\Delta$ & C2 & $\Delta$ & online & $\Delta$ & C2 & $\Delta$ \\
-\midrule
-dense reference & $77.63\pm0.20$ & & & & $73.46\pm0.26$ & & & \\
-(a) released & $77.55\pm0.17$ & $-0.08$ & $77.42\pm0.46$ & $-0.20$ & $73.27\pm0.58$ & $-0.19$ & $73.18\pm0.02$ & $-0.28$ \\
-(b) growth off & $77.18\pm0.26$ & $-0.45$ & $77.41\pm0.25$ & $-0.22$ & $73.27\pm0.39$ & $-0.19$ & $73.28\pm0.21$ & $-0.19$ \\
-(c) random site & $77.41\pm0.13$ & $-0.22$ & -- & & $73.14\pm0.53$ & $-0.32$ & -- & \\
-(d) cheapest site & $77.24\pm0.19$ & $-0.39$ & -- & & $73.19\pm0.72$ & $-0.28$ & -- & \\
-(e) measured births & $77.30\pm0.17$ & $-0.33$ & $77.25\pm0.25$ & $-0.37$ & $73.19\pm0.72$ & $-0.28$ & $73.17\pm0.04$ & $-0.30$ \\
-(b) bank-free & $77.35\pm0.16$ & $-0.28$ & -- & & $73.46\pm0.61$ & $0.00$ & -- & \\
-OTOv2 & $77.20\pm0.26$ & $-0.42$ & -- & & $73.18\pm0.37$ & $-0.29$ & -- & \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The decision logs show how differently the arms grow. Every gradient-directed run, released or revised order, places all of its births in a single group: on ResNet-18, $247$ to $261$ births in the inner convolution of one stage-1 block; on VGG-16-BN, $113$ to $193$ births in the first convolution, which is also the cheapest group, so (d) and (e) coincide there. The random-site arm spreads a similar number of births over $9$ to $13$ groups, and the growth-off arm makes none, and yet the retrained architectures of (a) and (b) are equally accurate on both backbones. The released order's random-direction births, about half of all births on ResNet-18, do not hurt: (e) is below (a) in all three ResNet-18 seeds online.
-
-\paragraph{Comparison with OTOv2.} OTOv2 trains a network once from scratch and drives whole zero-invariant groups to exactly zero with its DHSPG optimizer, so like removal-only TSR it delivers a smaller network from a single run without a trained model to start from \citep{chen2023otov2}. It was run from the official implementation (only\_train\_once 2.0.16, the last release that ships DHSPG) under the recipe above, at the same three seeds, with the settings of the official ResNet-18 CIFAR tutorial: half-space threshold $0.95$, pruning started at a fifth of training (the tutorial's is a sixth), and group penalty $10^{-2}$, which the tutorial prescribes when the default $10^{-3}$ does not produce group sparsity, as it did not here. DHSPG targets a fraction of groups rather than of parameters, and its groups differ in size; at its partition step the fraction was therefore set, by binary search in DHSPG's own score order, to the smallest one whose removal brings the exactly counted network to $85\%$ of the dense count. That count needs the coupling engine, because DHSPG's group vectors omit the consumer columns a removed channel frees. The six runs export $84.92$ to $85.00\%$ of the dense count, against $84.99\%$ for TSR, and every penalized group reaches zero within five epochs of the partition, leaving three quarters of training to recover. OTOv2 reaches $77.20\pm0.26$ (ResNet-18) and $73.18\pm0.37$ (VGG-16-BN), $0.42$ and $0.29$ points below the dense references. The released TSR controller is ahead by $0.34\pm0.41$ and $0.10\pm0.71$ points in paired seeds, in two of three seeds on each backbone, and removal-only TSR is level with OTOv2; none of these differences is outside the seed spread. On the same GPUs, with two runs sharing each machine, an OTOv2 run took $0.92$ (ResNet-18) and $0.82$ (VGG-16-BN) hours end to end, against $1.17$ and $0.84$ for TSR, since it carries no candidate bank.
-
-\paragraph{Bank-free removal-only TSR.} Arm (b) disables growth but still carries the candidate bank, whose only use is to sense growth. The bank-free arm is the same controller with no candidates at all ($k=0$): every coupling group is still tracked, scored and edited, but no tensor carries a dormant extent and the growth signal is never read. Over the same three seeds it reaches $77.35\pm0.16$ (ResNet-18) and $73.46\pm0.61$ (VGG-16-BN), $0.17$ and $0.19$ points above arm (b) in paired seeds and $0.14\pm0.26$ and $0.28\pm0.86$ above OTOv2, all inside the spread; its exported counts are $84.94$ to $84.99\%$ of the dense count. Its cost is in \cref{app:compute}: $1.14$ to $1.17$ times the dense step, and $0.87$ and $0.76$ hours end to end.
-
-\paragraph{A budget equal to the dense count.} At this budget the ceiling never falls, so capacity can move only through exchanges and through growth into the slack a removed dead channel leaves; a removal-only controller would only delete dead channels. The released controller was run at this budget on ResNet-18 with the same three seeds and recipe, online and retrained from scratch at its exported widths. It moves capacity throughout training, with $369$ to $371$ births per run, $194$ to $236$ of them in exchanges, all in a single group, and exports $11.219$ million parameters against $11.220$ million. The online run ends $0.15\pm0.47$ points and the retrained architecture $0.21\pm0.30$ points below the dense reference. On this backbone, reallocating at constant size does not improve on the standard widths.
-
-\paragraph{Discovery stability.} \Cref{tab:stability} compares the width vectors the three seeds export, as the cosine similarity of their per-group $\log_2(n/n_{\rm ref})$. ResNet-18 has two groups that are interchangeable at identical cost, the inner convolutions of the two identity blocks of stage 1, which have the same input stream, resolution and shape; a run that widens one and a run that widens the other spend the budget identically. The table therefore also reports the similarity with each such pair sorted, which is the largest similarity over swaps within the pair. VGG-16-BN has no such pairs.
-
-\begin{table}[h]
-\centering
-\caption{Discovery stability across seeds: mean (minimum) pairwise cosine similarity of the exported $\log_2$ width-ratio vectors over seeds 42--44. ``Modulo swaps'' sorts ResNet-18's one cost-identical pair before comparing.}
-\label{tab:stability}
-\footnotesize
-\setlength{\tabcolsep}{5.0pt}
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-& \multicolumn{2}{c}{ResNet-18} & VGG-16-BN \\
-\cmidrule(lr){2-3}
-Arm & raw & modulo swaps & raw \\
-\midrule
-(a) released & $0.364$ ($0.038$) & $0.993$ ($0.991$) & $0.994$ ($0.990$) \\
-(b) growth off & $0.984$ ($0.982$) & $0.984$ ($0.982$) & $0.939$ ($0.911$) \\
-(c) random site & $0.975$ ($0.963$) & $0.983$ ($0.979$) & $0.974$ ($0.965$) \\
-(e) measured births & $0.362$ ($0.046$) & $0.995$ ($0.994$) & $0.993$ ($0.990$) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-What moves is the same in every seed. VGG-16-BN widens its first convolution by $2.6$ to $3.8\times$ and narrows the same five late convolutions. ResNet-18 widens one stage-1 inner convolution by $2.5$ to $2.8\times$, narrows the stage-1 trunk by about $0.5$ in $\log_2$, and narrows layer 4; which of the two stage-1 blocks receives the growth changes with the seed, which is all that separates the raw similarity from the one taken modulo swaps.
-
-\paragraph{Sensitivity.} \Cref{tab:sensitivity} varies one setting at a time around the released values on ResNet-18, seed 42, online arm. The centre is the released arm of the growth ablation at that seed.
-
-\begin{table}[h]
-\centering
-\caption{Controller sensitivity, ResNet-18 on CIFAR-100, seed 42, online arm. $\Delta$ is the change in last-epoch top-1 from the centre; similarity is the cosine of the exported width vector with the centre's, modulo the swap of \cref{tab:stability}.}
-\label{tab:sensitivity}
-\footnotesize
-\setlength{\tabcolsep}{5.0pt}
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Setting & top-1 & $\Delta$ & births & similarity \\
-\midrule
-centre ($\widetilde H=1$, $k=4$, $K=100$, $\alpha=0.5$) & $77.40$ & & $261$ & $1.00$ \\
-$\widetilde H=0.1$ & $77.28$ & $-0.12$ & $250$ & $0.94$ \\
-$\widetilde H=10$ & $77.62$ & $+0.22$ & $199$ & $0.98$ \\
-$k=2$ & $77.59$ & $+0.19$ & $265$ & $0.99$ \\
-$k=8$ & $77.46$ & $+0.06$ & $257$ & $1.00$ \\
-$K=50$ & $77.55$ & $+0.15$ & $611$ & $1.00$ \\
-$K=200$ & $77.55$ & $+0.15$ & $0$ & $0.30$ \\
-$\alpha=0.3$ & $77.31$ & $-0.09$ & $271$ & $0.99$ \\
-$\alpha=0.7$ & $77.44$ & $+0.04$ & $223$ & $0.98$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Every setting lands within $-0.12$ to $+0.22$ points of the centre, the same size as the dense reference's own seed-to-seed standard deviation of $0.20$ points, and seven of the eight export essentially the centre's allocation. The exception is $K=200$. With a window of 200 steps no growth or exchange passed the cascade's acceptance test, so the run only removed, and it reached the same accuracy as the centre with a different allocation; this is the growth-off result of \cref{tab:ablation} again, at one seed.
 
 \section{Case studies: two discovery runs}
 \label{app:case-studies}
