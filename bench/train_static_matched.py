@@ -67,10 +67,12 @@ def main():
     args = ap.parse_args()
 
     ck = torch.load(args.tsrx_checkpoint, map_location="cpu", weights_only=False)
-    ck_args = ck.get("args", {})
-    arch = ck_args.get("arch", "resnet18")
-    dataset = ck_args.get("dataset", "cifar10")
-    cifar_stem = ck_args.get("cifar_stem", True)
+    # TSR checkpoints keep their run arguments under "args"; other discovery
+    # drivers (bench/train_oto.py) keep "settings" and top-level arch/dataset.
+    ck_args = ck.get("args") or ck.get("settings") or {}
+    arch = ck_args.get("arch") or ck.get("arch") or "resnet18"
+    dataset = ck_args.get("dataset") or ck.get("dataset") or "cifar10"
+    cifar_stem = ck_args.get("cifar_stem", ck.get("cifar_stem", True))
     # the converged architecture; best-val `discovered_widths` only for checkpoints
     # written before train_tsrx.py recorded `final_widths`
     widths = ck.get("final_widths") or ck.get("discovered_widths")
